@@ -19,6 +19,13 @@ of the move.
   iTerm2 (configs repo, `windows/terminal/`, `windows/zsh/`), so the TUI renders the same
   on both. tmux prefix is now Alt-a on both machines.
 
+## Update — same day, later session
+
+- Dang's design files are committed under `docs/design/` (his originals, byte-for-byte).
+- The implementation plan is written: `docs/superpowers/plans/2026-10-21-beacon.md`
+  (15 tasks). Waiting on Dang's review and his choice of subagent-driven or native
+  execution. Items 1 and 2 below are done.
+
 ## Next
 
 1. **Write the implementation plan** following superpowers:writing-plans
