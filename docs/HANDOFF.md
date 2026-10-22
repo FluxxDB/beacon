@@ -44,7 +44,7 @@ Beacon v1 is built, reviewed, merged into `main`, pushed to `FluxxDB/beacon`, an
    - **Both nodes need the new build.** Otherwise the old CLI rejects `join --all` and every dispatcher check fails loudly.
    - The help overlay is 14 rows, which is exactly what the board holds at 80×24. A guard test fails if a row is added: merge rows instead.
 
-6. **Dispatcher sessions** (added 2026-10-22, fixed after review the same day): on each device, `git pull` and `./beacon skill install all` first, so the device has the new command, scripts and skill. Then open a Claude Code session in the repo just for the dispatcher, in bypass permissions mode (or auto mode: workers are background subagents and get stuck on any permission prompt), ideally on Sonnet, and run `/loop 2m /dispatch` (`/loop 5m` is cheaper). Every device then always has an agent checking the board (README → "A dispatcher session per device").
+6. **Dispatcher sessions** (added 2026-10-22, fixed after review the same day): on each device, `git pull` and `./beacon skill install all` first, so the device has the new command, scripts and skill. Then open a Claude Code session in the repo just for the dispatcher, in bypass permissions mode (or auto mode: workers are background subagents and get stuck on any permission prompt), ideally on Sonnet, and run `/loop 2m /dispatch` (the loop backs off by itself to 5 and then 10 minutes when the board is quiet, and returns to 2 when there is work). Every device then always has an agent checking the board (README → "A dispatcher session per device").
 
 ## Decisions taken while Dang was away (check these)
 
