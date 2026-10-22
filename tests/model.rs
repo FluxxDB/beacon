@@ -64,6 +64,21 @@ fn exit_codes() {
 }
 
 #[test]
+fn an_outage_is_a_node_that_is_away() {
+    // Not there at all, or there and gone quiet: wait and watch wait it out.
+    assert!(Error::Unreachable("x".into()).is_outage());
+    assert!(Error::Interrupted("x".into()).is_outage());
+    // Everything else is an answer, and an answer is not an outage.
+    assert!(!Error::Usage("x".into()).is_outage());
+    assert!(!Error::NotFound("x".into()).is_outage());
+    assert!(!Error::Ambiguous(vec![]).is_outage());
+    assert!(!Error::Auth.is_outage());
+    assert!(!Error::Conflict("x".into()).is_outage());
+    assert!(!Error::Timeout.is_outage());
+    assert!(!Error::Internal(anyhow::anyhow!("boom")).is_outage());
+}
+
+#[test]
 fn day_labels() {
     let tz = TimeZone::get("America/New_York").unwrap();
     let at = |s: &str| -> i64 {
@@ -98,8 +113,9 @@ fn exit_codes_cover_every_variant() {
         Error::Conflict("c".into()).exit_code(),
         Error::Timeout.exit_code(),
         Error::Internal(anyhow::anyhow!("boom")).exit_code(),
+        Error::Interrupted("i".into()).exit_code(),
     ];
-    assert_eq!(codes, [1, 2, 5, 3, 4, 5, 6, 1]);
+    assert_eq!(codes, [1, 2, 5, 3, 4, 5, 6, 1, 3]);
     assert_eq!(
         Error::Ambiguous(vec!["aaaaaaaa".into(), "bbbbbbbb".into()]).to_string(),
         "ambiguous id, matches: aaaaaaaa, bbbbbbbb"

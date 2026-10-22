@@ -416,7 +416,7 @@ fn status_and_code(error: &Error) -> (StatusCode, &'static str) {
         Error::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
         Error::Ambiguous(_) | Error::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
         Error::Auth => (StatusCode::UNAUTHORIZED, "auth"),
-        Error::Unreachable(_) | Error::Timeout | Error::Internal(_) => {
+        Error::Unreachable(_) | Error::Interrupted(_) | Error::Timeout | Error::Internal(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "internal")
         }
     }
