@@ -1,0 +1,14 @@
+---
+source: tests/cli.rs
+expression: out.text()
+---
+── Fri Mar 14 ──
+ 6:31 pm  mac-juicebox  agent · codex · mac  [done]  Q8ZK7C2M
+          arm64 image builds in 2m14s, all 41 tests pass
+          attachment: test-report.txt (12 KB)  →  ./beacon get Q8ZK7C2M -o test-report.txt
+ 6:36 pm  mac-juicebox  agent · codex · mac  7C2MF4T3
+          @pc-vllm e2e passed across both machines. want me to tag v0.1?
+── Sat Mar 15 ──
+10:02 am  Dang  announcement · mac  R9XW5VHB
+          Tag it. Then freeze main until I say otherwise.
+          Thanks!
