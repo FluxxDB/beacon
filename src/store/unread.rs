@@ -12,15 +12,23 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{params, Connection};
 
-use super::{post_row, sql_limit, PostRow, Result, Store, POST_COLUMNS, SHOWN_POSTS};
+use super::{post_row, sql_limit, PostRow, Result, Store, POST_COLUMNS};
 use crate::model::{mentions_handle, normalize_channel};
 
-/// Conditions after [`SHOWN_POSTS`] for the posts that are new to handle `?1`:
-/// not its own (case-insensitive) and arrived after its cursor for the channel.
-const NEW_FROM_OTHERS: &str = "
-    AND lower(p.author) <> lower(?1)
+/// The shown posts (as in `SHOWN_POSTS`) that are new to handle `?1`: not its
+/// own (case-insensitive) and arrived after its cursor for the channel. Ends
+/// in a `WHERE` clause, so callers append `AND …`.
+///
+/// It goes channel by channel, and in each one reads only the posts past the
+/// cursor, from the index `posts_by_arrival (channel, arrival)`, so what it
+/// costs follows what is new, not the size of the board. `CROSS JOIN` keeps
+/// SQLite to that order; `unread_queries_read_only_what_is_new` checks the
+/// plans.
+const NEW_FROM_OTHERS: &str = "visible_channels AS v CROSS JOIN posts AS p ON p.channel = v.name
+    WHERE p.deleted = 0
     AND p.arrival > COALESCE(
-        (SELECT c.arrival FROM cursors AS c WHERE c.handle = ?1 AND c.channel = p.channel), 0)";
+        (SELECT c.arrival FROM cursors AS c WHERE c.handle = ?1 AND c.channel = v.name), 0)
+    AND lower(p.author) <> lower(?1)";
 
 /// Further conditions for the ones relevant to handle `?1`: the SQL twin of the
 /// rule in [`Store::is_relevant`] (its first clause, not own, is in
@@ -109,11 +117,7 @@ impl Store {
     /// group by `(ts, id)`. `remaining` counts the unread posts beyond them.
     /// Nothing is marked read; see [`Store::mark_read`].
     pub fn unread(&self, handle: &str, limit: usize) -> Result<Unread> {
-        let sql = format!(
-            "SELECT {POST_COLUMNS} FROM {SHOWN_POSTS}{NEW_FROM_OTHERS}{RELEVANT} \
-             ORDER BY p.arrival LIMIT ?2"
-        );
-        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let mut stmt = self.conn.prepare_cached(&unread_sql())?;
         let rows = stmt.query_map(params![handle, sql_limit(limit)], post_row)?;
         let mut posts = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
@@ -159,10 +163,7 @@ impl Store {
     /// post in a channel `handle` has not joined counts here. Channels with
     /// none are left out.
     pub fn unread_counts(&self, handle: &str) -> Result<BTreeMap<String, u32>> {
-        let sql = format!(
-            "SELECT p.channel, COUNT(*) FROM {SHOWN_POSTS}{NEW_FROM_OTHERS} GROUP BY p.channel"
-        );
-        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let mut stmt = self.conn.prepare_cached(&counts_sql())?;
         let rows = stmt.query_map([handle], |r| Ok((r.get(0)?, r.get::<_, i64>(1)?)))?;
         let mut counts = BTreeMap::new();
         for row in rows {
@@ -176,24 +177,40 @@ impl Store {
     /// shown posts) not by `handle` arrived after its cursor for their
     /// channel, across all channels.
     pub fn unread_announcements(&self, handle: &str) -> Result<u32> {
-        let sql = format!(
-            "SELECT COUNT(*) FROM {SHOWN_POSTS}{NEW_FROM_OTHERS} AND p.author_kind = 'human'"
-        );
         let n: i64 = self
             .conn
-            .prepare_cached(&sql)?
+            .prepare_cached(&announcements_sql())?
             .query_row([handle], |r| r.get(0))?;
         Ok(u32::try_from(n).unwrap_or(u32::MAX))
     }
 
     fn count_unread(&self, handle: &str) -> Result<usize> {
-        let sql = format!("SELECT COUNT(*) FROM {SHOWN_POSTS}{NEW_FROM_OTHERS}{RELEVANT}");
         let n: i64 = self
             .conn
-            .prepare_cached(&sql)?
+            .prepare_cached(&count_unread_sql())?
             .query_row([handle], |r| r.get(0))?;
         Ok(usize::try_from(n).unwrap_or(usize::MAX))
     }
+}
+
+/// [`Store::unread`]: `?1` the handle, `?2` the limit.
+fn unread_sql() -> String {
+    format!("SELECT {POST_COLUMNS} FROM {NEW_FROM_OTHERS}{RELEVANT} ORDER BY p.arrival LIMIT ?2")
+}
+
+/// How many [`Store::unread`] holds in all, for `?1`.
+fn count_unread_sql() -> String {
+    format!("SELECT COUNT(*) FROM {NEW_FROM_OTHERS}{RELEVANT}")
+}
+
+/// [`Store::unread_counts`], for `?1`.
+fn counts_sql() -> String {
+    format!("SELECT v.name, COUNT(*) FROM {NEW_FROM_OTHERS} GROUP BY v.name")
+}
+
+/// [`Store::unread_announcements`], for `?1`.
+fn announcements_sql() -> String {
+    format!("SELECT COUNT(*) FROM {NEW_FROM_OTHERS} AND p.author_kind = 'human'")
 }
 
 /// Raises the cursor to `arrival` (at least 0) if that is higher than it is.
@@ -205,4 +222,40 @@ fn upsert_cursor(conn: &Connection, handle: &str, channel: &str, arrival: i64) -
         params![handle, channel, arrival.max(0)],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every unread query reads posts through `posts_by_arrival`, past the
+    /// cursor, and never scans the whole table.
+    #[test]
+    fn unread_queries_read_only_what_is_new() {
+        let s = Store::open_in_memory("pc").unwrap();
+        for sql in [
+            unread_sql(),
+            count_unread_sql(),
+            counts_sql(),
+            announcements_sql(),
+        ] {
+            let mut stmt = s
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let args: [&dyn rusqlite::ToSql; 2] = [&"h", &50];
+            let args = &args[..stmt.parameter_count()];
+            let plan: Vec<String> = stmt
+                .query_map(args, |r| r.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let plan = plan.join("\n");
+            assert!(
+                plan.contains("SEARCH p USING INDEX posts_by_arrival (channel=? AND arrival>?)"),
+                "{sql}\n{plan}"
+            );
+            assert!(!plan.contains("SCAN p"), "{sql}\n{plan}");
+        }
+    }
 }

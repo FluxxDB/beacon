@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS posts (
 );
 CREATE INDEX IF NOT EXISTS posts_by_channel ON posts (channel, ts, id);
 CREATE INDEX IF NOT EXISTS posts_by_time ON posts (ts, id);
+-- What is new to a handle: per channel, the posts past its cursor.
+CREATE INDEX IF NOT EXISTS posts_by_arrival ON posts (channel, arrival);
 
 -- Every deleted post id, so a delete that arrives before its post still wins.
 CREATE TABLE IF NOT EXISTS tombstones (
