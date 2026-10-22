@@ -45,3 +45,10 @@ impl Error {
         }
     }
 }
+
+impl From<rusqlite::Error> for Error {
+    /// A database failure is never the user's doing.
+    fn from(e: rusqlite::Error) -> Self {
+        Error::Internal(e.into())
+    }
+}
