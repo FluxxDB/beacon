@@ -6,7 +6,11 @@
 mod common;
 mod fake_beacon;
 
-use fake_beacon::{Project, Run, ENV_SPELLINGS_OF_PC, TWO_UNREAD};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+
+use fake_beacon::{Project, Run, ENV_SPELLINGS_OF_PC, STATE, TWO_UNREAD};
 use serde_json::{json, Value};
 
 const CHECK: &str = "dispatch-check.sh";
@@ -78,7 +82,7 @@ fn nothing_new_says_exactly_that_and_checks_in() {
     assert_eq!(calls.len(), 3, "{calls:?}");
     assert_eq!(calls[0], JOIN_ALL);
     assert_eq!(calls[1], PEEK);
-    assert_checked_in(&status_set(&calls[2], "pc-dispatch"), "");
+    assert_checked_in(&status_set(&calls[2], "pc-dispatch"), " · every 2m");
 }
 
 #[test]
@@ -99,7 +103,7 @@ fn unread_work_is_counted_and_still_checks_in() {
     assert_eq!(calls.len(), 3, "{calls:?}");
     assert_eq!(calls[0], JOIN_ALL);
     assert_eq!(calls[1], PEEK);
-    assert_checked_in(&status_set(&calls[2], "pc-dispatch"), "");
+    assert_checked_in(&status_set(&calls[2], "pc-dispatch"), " · every 2m");
 }
 
 #[test]
@@ -121,9 +125,9 @@ fn a_page_without_remaining_counts_its_posts() {
 #[test]
 fn running_workers_show_in_the_status() {
     for (arg, rest) in [
-        ("0", ""),
-        ("1", " · 1 task running"),
-        ("3", " · 3 tasks running"),
+        ("0", " · every 2m"),
+        ("1", " · every 2m · 1 task running"),
+        ("3", " · every 2m · 3 tasks running"),
     ] {
         let p = Project::new(Some("BEACON_NODE=pc\n"));
         let run = check(&p, &[arg], &[]);
@@ -293,7 +297,7 @@ fn no_channels_at_all_is_a_warning() {
     );
     let calls = p.calls();
     assert_eq!(calls.len(), 3, "it still peeks and checks in: {calls:?}");
-    assert_checked_in(&status_set(&calls[2], "pc-dispatch"), "");
+    assert_checked_in(&status_set(&calls[2], "pc-dispatch"), " · every 2m");
 
     // Anything joined, just now or before: no warning.
     for out in [
@@ -358,24 +362,563 @@ fn an_explicit_handle_wins() {
 fn no_node_is_a_clear_error() {
     for env in [None, Some("BEACON_SECRET=s\n"), Some("BEACON_NODE=\"\"\n")] {
         let p = Project::new(env);
-        for args in [&[][..], &["--handle"][..]] {
+        for args in [&[][..], &["--handle"], &["--interval"], &["--reset"]] {
             let run = check(&p, args, &[]);
             assert_eq!((run.code, run.stdout.as_str()), (1, ""), "{env:?}: {run:?}");
             assert!(run.stderr.contains("BEACON_NODE"), "{run:?}");
         }
         assert!(p.calls().is_empty());
+        assert!(!p.path().join(STATE).exists());
     }
 }
 
 #[test]
 fn a_bad_argument_is_a_usage_error() {
     let p = Project::new(Some("BEACON_NODE=pc\n"));
-    for arg in ["two", "-1", "--json"] {
-        let run = check(&p, &[arg], &[]);
-        assert_eq!((run.code, run.stdout.as_str()), (1, ""), "{arg}: {run:?}");
+    for args in [
+        &["two"][..],
+        &["-1"],
+        &["--json"],
+        &["1", "2"],
+        &["--hold", "x"],
+        &["--handle", "--hold"],
+        &["2", "--handle"],
+        &["--interval", "2"],
+        &["--reset", "--interval"],
+        &["--handle", "--interval"],
+    ] {
+        let run = check(&p, args, &[]);
+        assert_eq!(
+            (run.code, run.stdout.as_str()),
+            (1, ""),
+            "{args:?}: {run:?}"
+        );
         assert!(run.stderr.contains("usage"), "{run:?}");
     }
     assert!(p.calls().is_empty());
+    assert!(!p.path().join(STATE).exists());
+}
+
+// The loop's pace. A quiet check (nothing unread, no worker running, no
+// `--hold`) counts; 15 in a row at 2m back the loop off to 5m, 12 more at 5m to
+// 10m. Anything to do brings it back to 2m. A second line, `backoff: Nm`, says
+// when a check changed the pace.
+
+/// The status the last call set, as `handle`.
+fn last_status(p: &Project, handle: &str) -> String {
+    let calls = p.calls();
+    status_set(calls.last().expect("no calls"), handle)
+}
+
+/// `n` quiet checks in a row, none of which changes the pace.
+fn quiet_checks(p: &Project, n: usize, args: &[&str], env: &[(&str, &str)]) {
+    for i in 1..=n {
+        let run = check(p, args, env);
+        assert_eq!(
+            (run.code, run.stdout.as_str(), run.stderr.as_str()),
+            (0, "nothing new\n", ""),
+            "quiet check {i} of {n}: {run:?}"
+        );
+    }
+}
+
+/// One quiet check, which must change the pace to `pace`.
+fn backs_off(p: &Project, env: &[(&str, &str)], pace: &str) {
+    let run = check(p, &[], env);
+    assert_eq!(
+        (run.code, run.stdout.clone(), run.stderr.as_str()),
+        (0, format!("nothing new\nbackoff: {pace}\n"), ""),
+        "{run:?}"
+    );
+}
+
+/// Quiet checks from 2m until the loop has backed off to `pace`.
+fn back_off_to(p: &Project, pace: &str) {
+    quiet_checks(p, 14, &[], &[]);
+    backs_off(p, &[], "5m");
+    if pace == "10m" {
+        quiet_checks(p, 11, &[], &[]);
+        backs_off(p, &[], "10m");
+    }
+}
+
+/// What `--interval` prints, after making sure it asked beacon nothing.
+fn pace(p: &Project, env: &[(&str, &str)]) -> String {
+    let before = p.calls().len();
+    let run = check(p, &["--interval"], env);
+    assert_eq!((run.code, run.stderr.as_str()), (0, ""), "{run:?}");
+    assert_eq!(p.calls().len(), before, "--interval asks beacon nothing");
+    run.stdout
+}
+
+/// Root can write anywhere, so permission cases have nothing to check for it.
+fn is_root() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[test]
+fn a_quiet_board_backs_the_loop_off_to_5m_then_10m() {
+    let p = Project::new(Some("BEACON_NODE=pc\n"));
+    // No workers running is the same as not saying.
+    quiet_checks(&p, 7, &[], &[]);
+    quiet_checks(&p, 7, &["0"], &[]);
+    assert_checked_in(&last_status(&p, "pc-dispatch"), " · every 2m");
+    backs_off(&p, &[], "5m");
+    assert_checked_in(&last_status(&p, "pc-dispatch"), " · every 5m");
+
+    quiet_checks(&p, 11, &[], &[]);
+    assert_checked_in(&last_status(&p, "pc-dispatch"), " · every 5m");
+    backs_off(&p, &[], "10m");
+    assert_checked_in(&last_status(&p, "pc-dispatch"), " · every 10m");
+
+    // 10m is as slow as it gets.
+    quiet_checks(&p, 30, &[], &[]);
+    assert_checked_in(&last_status(&p, "pc-dispatch"), " · every 10m");
+}
+
+/// A check with something to do, and what it says.
+struct Busy<'a> {
+    what: &'a str,
+    args: &'a [&'a str],
+    env: &'a [(&'a str, &'a str)],
+    first_line: &'a str,
+    status: &'a str,
+}
+
+/// Unread work, a running worker and `--hold` each bring the loop back to 2m,
+/// saying so only when the pace was slower, and start the count over.
+#[test]
+fn anything_to_do_brings_the_loop_back_to_2m() {
+    let unread = [("FAKE_WAIT_STATUS", "0"), ("FAKE_WAIT_OUT", TWO_UNREAD)];
+    let busy = [
+        Busy {
+            what: "unread work",
+            args: &[],
+            env: &unread,
+            first_line: "unread: 2\n",
+            status: " · every 2m",
+        },
+        Busy {
+            what: "a worker",
+            args: &["1"],
+            env: &[],
+            first_line: "nothing new\n",
+            status: " · every 2m · 1 task running",
+        },
+        Busy {
+            what: "a hold",
+            args: &["--hold"],
+            env: &[],
+            first_line: "nothing new\n",
+            status: " · every 2m",
+        },
+    ];
+    for Busy {
+        what,
+        args,
+        env,
+        first_line,
+        status,
+    } in busy
+    {
+        let p = Project::new(Some("BEACON_NODE=pc\n"));
+        for from in ["5m", "10m"] {
+            back_off_to(&p, from);
+            let run = check(&p, args, env);
+            assert_eq!(
+                (run.code, run.stdout.clone(), run.stderr.as_str()),
+                (0, format!("{first_line}backoff: 2m\n"), ""),
+                "{what} at {from}: {run:?}"
+            );
+            assert_checked_in(&last_status(&p, "pc-dispatch"), status);
+            assert_eq!(pace(&p, &[]), "2m\n", "{what} at {from}");
+        }
+
+        // Already at 2m, after 14 quiet checks: no line, and the count starts
+        // over, so it takes 15 more quiet checks to back off.
+        quiet_checks(&p, 14, &[], &[]);
+        let run = check(&p, args, env);
+        assert_eq!(
+            (run.code, run.stdout.as_str(), run.stderr.as_str()),
+            (0, first_line, ""),
+            "{what} at 2m: {run:?}"
+        );
+        assert_checked_in(&last_status(&p, "pc-dispatch"), status);
+        quiet_checks(&p, 14, &[], &[]);
+        backs_off(&p, &[], "5m");
+    }
+}
+
+/// The first check of a session (`--reset`) starts at 2m, like the fresh
+/// `/loop 2m` it runs in, whatever an earlier session left; it never prints a
+/// backoff line, and it is a normal check besides.
+#[test]
+fn reset_starts_the_pace_over_silently_then_checks() {
+    let p = Project::new(Some("BEACON_NODE=pc\n"));
+    back_off_to(&p, "10m");
+    let calls = p.calls().len();
+    let run = check(&p, &["--reset"], &[]);
+    assert_eq!(
+        (run.code, run.stdout.as_str(), run.stderr.as_str()),
+        (0, "nothing new\n", ""),
+        "{run:?}"
+    );
+    let all = p.calls();
+    assert_eq!(all.len(), calls + 3, "a whole check: {all:?}");
+    assert_eq!(all[calls], JOIN_ALL);
+    assert_eq!(all[calls + 1], PEEK);
+    assert_checked_in(&last_status(&p, "pc-dispatch"), " · every 2m");
+    assert_eq!(pace(&p, &[]), "2m\n");
+    // The reset check was the first quiet one at 2m.
+    quiet_checks(&p, 13, &[], &[]);
+    backs_off(&p, &[], "5m");
+
+    // From 5m, with unread work and workers: still no line.
+    let run = check(
+        &p,
+        &["--reset", "2"],
+        &[("FAKE_WAIT_STATUS", "0"), ("FAKE_WAIT_OUT", TWO_UNREAD)],
+    );
+    assert_eq!(
+        (run.code, run.stdout.as_str(), run.stderr.as_str()),
+        (0, "unread: 2\n", ""),
+        "{run:?}"
+    );
+    assert_checked_in(
+        &last_status(&p, "pc-dispatch"),
+        " · every 2m · 2 tasks running",
+    );
+
+    // On a fresh state too.
+    let fresh = Project::new(Some("BEACON_NODE=pc\n"));
+    let run = check(&fresh, &["--reset"], &[]);
+    assert_eq!(
+        (run.code, run.stdout.as_str(), run.stderr.as_str()),
+        (0, "nothing new\n", ""),
+        "{run:?}"
+    );
+}
+
+/// A session's first check resets the pace even when beacon is down, so the
+/// session's later checks don't carry on from an earlier session's pace.
+#[test]
+fn reset_takes_even_when_the_check_fails() {
+    let p = Project::new(Some("BEACON_NODE=pc\n"));
+    back_off_to(&p, "10m");
+    let run = check(&p, &["--reset"], &[("FAKE_WAIT_STATUS", "3")]);
+    assert_eq!((run.code, run.stdout.as_str()), (3, ""), "{run:?}");
+    assert_eq!(pace(&p, &[]), "2m\n");
+}
+
+/// A check that fails before it peeked knows nothing about the board: it
+/// counts neither as quiet nor as busy.
+#[test]
+fn a_failed_check_leaves_the_pace_alone() {
+    let p = Project::new(Some("BEACON_NODE=pc\n"));
+    quiet_checks(&p, 14, &[], &[]);
+    for (var, code) in [
+        ("FAKE_JOIN_STATUS", 3),
+        ("FAKE_JOIN_STATUS", 4),
+        ("FAKE_WAIT_STATUS", 3),
+        ("FAKE_WAIT_STATUS", 4),
+    ] {
+        let run = check(&p, &[], &[(var, &code.to_string())]);
+        assert_eq!((run.code, run.stdout.as_str()), (code, ""), "{run:?}");
+    }
+    backs_off(&p, &[], "5m");
+
+    // Nor does a failed check with a worker running bring it back to 2m.
+    quiet_checks(&p, 11, &[], &[]);
+    backs_off(&p, &[], "10m");
+    let run = check(&p, &["1"], &[("FAKE_WAIT_STATUS", "3")]);
+    assert_eq!((run.code, run.stdout.as_str()), (3, ""), "{run:?}");
+    assert_eq!(pace(&p, &[]), "10m\n");
+}
+
+#[test]
+fn interval_prints_the_pace_and_asks_nothing() {
+    let p = Project::new(Some("BEACON_NODE=pc\n"));
+    assert_eq!(pace(&p, &[]), "2m\n");
+    assert!(p.calls().is_empty());
+    assert!(!p.path().join(STATE).exists(), "asking writes nothing");
+
+    // Asking is no check: it doesn't count as a quiet one.
+    quiet_checks(&p, 10, &[], &[]);
+    for _ in 0..5 {
+        assert_eq!(pace(&p, &[]), "2m\n");
+    }
+    quiet_checks(&p, 4, &[], &[]);
+    backs_off(&p, &[], "5m");
+    assert_eq!(pace(&p, &[]), "5m\n");
+
+    quiet_checks(&p, 11, &[], &[]);
+    backs_off(&p, &[], "10m");
+    assert_eq!(pace(&p, &[]), "10m\n");
+}
+
+#[test]
+fn options_come_in_any_order() {
+    let cases: [(&[&str], &str, &str); 6] = [
+        (
+            &["--hold", "0"],
+            "nothing new\nbackoff: 2m\n",
+            " · every 2m",
+        ),
+        (
+            &["0", "--hold"],
+            "nothing new\nbackoff: 2m\n",
+            " · every 2m",
+        ),
+        (
+            &["--reset", "2"],
+            "nothing new\n",
+            " · every 2m · 2 tasks running",
+        ),
+        (
+            &["2", "--reset"],
+            "nothing new\n",
+            " · every 2m · 2 tasks running",
+        ),
+        (
+            &["--hold", "--reset", "2"],
+            "nothing new\n",
+            " · every 2m · 2 tasks running",
+        ),
+        (
+            &["2", "--reset", "--hold"],
+            "nothing new\n",
+            " · every 2m · 2 tasks running",
+        ),
+    ];
+    for (args, stdout, status) in cases {
+        let p = Project::new(Some("BEACON_NODE=pc\n"));
+        back_off_to(&p, "5m");
+        let run = check(&p, args, &[]);
+        assert_eq!(
+            (run.code, run.stdout.as_str(), run.stderr.as_str()),
+            (0, stdout, ""),
+            "{args:?}: {run:?}"
+        );
+        assert_checked_in(&last_status(&p, "pc-dispatch"), status);
+        assert_eq!(pace(&p, &[]), "2m\n", "{args:?}");
+    }
+}
+
+/// Whatever is in the state file, if it isn't a state the script wrote, the
+/// check starts afresh at 2m with no quiet checks counted, and says nothing.
+#[test]
+fn a_garbled_state_is_a_fresh_start() {
+    for garbage in [
+        "",
+        "\n",
+        "nonsense\n",
+        "7m 3\n",
+        "5m\n",
+        "5m x\n",
+        "2m 14x\n",
+        "2m -1\n",
+        "2m 014\n",
+        "2m 99999999999999999999\n",
+        "5m 3 more\n",
+        "m 3\n",
+        "\u{0}\u{1}\u{fffd}",
+    ] {
+        let p = Project::new(Some("BEACON_NODE=pc\n"));
+        p.write(STATE, garbage);
+        assert_eq!(pace(&p, &[]), "2m\n", "{garbage:?}");
+        quiet_checks(&p, 14, &[], &[]);
+        backs_off(&p, &[], "5m");
+    }
+}
+
+/// A state file the script can't read is a fresh start too, and the check
+/// replaces it.
+#[test]
+fn an_unreadable_state_is_a_fresh_start() {
+    if is_root() {
+        return;
+    }
+    let p = Project::new(Some("BEACON_NODE=pc\n"));
+    back_off_to(&p, "5m");
+    let state = p.path().join(STATE);
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(pace(&p, &[]), "2m\n");
+    quiet_checks(&p, 14, &[], &[]);
+    backs_off(&p, &[], "5m");
+}
+
+/// The state's directory is made when it's missing, and the state is written
+/// whole through a temporary file that doesn't stay behind.
+#[test]
+fn a_missing_state_directory_is_made() {
+    let p = Project::new(Some("BEACON_NODE=pc\n"));
+    let dir = p.path().join("deep").join("er");
+    let state = dir.join("dispatch.state");
+    let env = [("BEACON_DISPATCH_STATE", state.to_str().unwrap())];
+    assert_eq!(pace(&p, &env), "2m\n");
+    assert!(!dir.exists(), "asking makes nothing");
+    quiet_checks(&p, 14, &[], &env);
+    backs_off(&p, &env, "5m");
+    assert_eq!(pace(&p, &env), "5m\n");
+    let files: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(files, ["dispatch.state"]);
+}
+
+/// When the state can't be saved, the check still works, warns, and keeps
+/// the loop at 2m.
+#[test]
+fn an_unwritable_state_warns_and_stays_at_2m() {
+    let p = Project::new(Some("BEACON_NODE=pc\n"));
+    p.write("a-file", "not a directory\n");
+    let under_a_file = p.path().join("a-file").join("dispatch.state");
+    let a_directory = p.path().join("a-directory");
+    fs::create_dir(&a_directory).unwrap();
+    for state in [&under_a_file, &a_directory] {
+        let env = [("BEACON_DISPATCH_STATE", state.to_str().unwrap())];
+        for flags in [&[][..], &["--reset"]] {
+            for i in 1..=20 {
+                let run = check(&p, flags, &env);
+                assert_eq!(
+                    (run.code, run.stdout.as_str()),
+                    (0, "nothing new\n"),
+                    "{state:?} {flags:?} check {i}: {run:?}"
+                );
+                assert!(
+                    run.stderr.starts_with("dispatch-check: warning: ")
+                        && run.stderr.contains(state.to_str().unwrap())
+                        && run.stderr.ends_with('\n')
+                        && run.stderr.lines().count() == 1,
+                    "{state:?} {flags:?} check {i}: {run:?}"
+                );
+                assert_checked_in(&last_status(&p, "pc-dispatch"), " · every 2m");
+            }
+        }
+        assert_eq!(pace(&p, &env), "2m\n", "{state:?}");
+    }
+    assert_eq!(
+        fs::read_dir(&a_directory).unwrap().count(),
+        0,
+        "nothing left in the directory"
+    );
+}
+
+/// A read-only home: no state directory can be made there.
+#[test]
+fn a_read_only_home_warns_and_stays_at_2m() {
+    if is_root() {
+        return;
+    }
+    let p = Project::new(Some("BEACON_NODE=pc\n"));
+    let home = p.path().join("home");
+    fs::create_dir(&home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o555)).unwrap();
+    let env = [
+        ("BEACON_DISPATCH_STATE", ""),
+        ("XDG_STATE_HOME", ""),
+        ("HOME", home.to_str().unwrap()),
+    ];
+    for i in 1..=20 {
+        let run = check(&p, &[], &env);
+        assert_eq!(
+            (run.code, run.stdout.as_str()),
+            (0, "nothing new\n"),
+            "check {i}: {run:?}"
+        );
+        assert!(
+            run.stderr.starts_with("dispatch-check: warning: "),
+            "check {i}: {run:?}"
+        );
+        assert_checked_in(&last_status(&p, "pc-dispatch"), " · every 2m");
+    }
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A state that was saved before but can't be saved now (its directory went
+/// read-only): the loop goes back to 2m, the pace it can keep without one.
+#[test]
+fn a_state_that_cannot_be_saved_any_more_goes_back_to_2m() {
+    if is_root() {
+        return;
+    }
+    let p = Project::new(Some("BEACON_NODE=pc\n"));
+    let dir = p.path().join("states");
+    let state = dir.join("dispatch.state");
+    let env = [("BEACON_DISPATCH_STATE", state.to_str().unwrap())];
+    quiet_checks(&p, 14, &[], &env);
+    backs_off(&p, &env, "5m");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let run = check(&p, &[], &env);
+    let reset = check(&p, &["--reset"], &env);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        (run.code, run.stdout.as_str()),
+        (0, "nothing new\nbackoff: 2m\n"),
+        "{run:?}"
+    );
+    assert!(
+        run.stderr.starts_with("dispatch-check: warning: "),
+        "{run:?}"
+    );
+    assert_checked_in(&last_status(&p, "pc-dispatch"), " · every 2m");
+
+    // Starting over says nothing about the pace, even then.
+    assert_eq!(
+        (reset.code, reset.stdout.as_str()),
+        (0, "nothing new\n"),
+        "{reset:?}"
+    );
+    assert_eq!(reset.stderr.lines().count(), 1, "{reset:?}");
+}
+
+/// Without `BEACON_DISPATCH_STATE`, each handle keeps its own state under
+/// `$XDG_STATE_HOME/beacon`.
+#[test]
+fn each_handle_keeps_its_own_pace() {
+    let p = Project::new(Some("BEACON_NODE=pc\n"));
+    let xdg = p.path().join("xdg");
+    let xdg = xdg.to_str().unwrap();
+    let pc = [("BEACON_DISPATCH_STATE", ""), ("XDG_STATE_HOME", xdg)];
+    let ops = [
+        ("BEACON_DISPATCH_STATE", ""),
+        ("XDG_STATE_HOME", xdg),
+        ("BEACON_DISPATCH_HANDLE", "pc-ops"),
+    ];
+    quiet_checks(&p, 14, &[], &pc);
+    backs_off(&p, &pc, "5m");
+    assert_eq!(pace(&p, &pc), "5m\n");
+    assert_eq!(pace(&p, &ops), "2m\n");
+
+    quiet_checks(&p, 14, &[], &ops);
+    backs_off(&p, &ops, "5m");
+    assert_checked_in(&last_status(&p, "pc-ops"), " · every 5m");
+    quiet_checks(&p, 11, &[], &ops);
+    backs_off(&p, &ops, "10m");
+    assert_eq!(pace(&p, &pc), "5m\n");
+
+    let dir = Path::new(xdg).join("beacon");
+    assert!(dir.join("dispatch-pc-dispatch.state").is_file());
+    assert!(dir.join("dispatch-pc-ops.state").is_file());
+    assert!(!p.path().join(STATE).exists());
+}
+
+/// With no `XDG_STATE_HOME` either, the state is under `~/.local/state`.
+#[test]
+fn without_xdg_state_home_the_state_is_in_home() {
+    let p = Project::new(Some("BEACON_NODE=pc\n"));
+    let home = p.path().join("home");
+    let env = [
+        ("BEACON_DISPATCH_STATE", ""),
+        ("XDG_STATE_HOME", ""),
+        ("HOME", home.to_str().unwrap()),
+    ];
+    quiet_checks(&p, 1, &[], &env);
+    assert!(home
+        .join(".local/state/beacon/dispatch-pc-dispatch.state")
+        .is_file());
 }
 
 /// The status `handle` has on the board, as `who --json` says.
@@ -490,7 +1033,7 @@ async fn a_board_without_channels_is_a_warning() {
             (0, "nothing new\n", NO_CHANNELS_WARNING),
             "{run:?}"
         );
-        assert_checked_in(&status_on_board(&p, "pc-dispatch"), "");
+        assert_checked_in(&status_on_board(&p, "pc-dispatch"), " · every 2m");
     });
 }
 
@@ -512,7 +1055,7 @@ async fn against_a_real_node() {
             (0, "nothing new\n"),
             "{run:?}"
         );
-        assert_checked_in(&status_on_board(&p, "pc-dispatch"), "");
+        assert_checked_in(&status_on_board(&p, "pc-dispatch"), " · every 2m");
 
         // One more than a page of unread posts (the node sends 50 at most).
         for n in 0..51 {
@@ -525,7 +1068,10 @@ async fn against_a_real_node() {
             (0, "unread: 51\n"),
             "{run:?}"
         );
-        assert_checked_in(&status_on_board(&p, "pc-dispatch"), " · 2 tasks running");
+        assert_checked_in(
+            &status_on_board(&p, "pc-dispatch"),
+            " · every 2m · 2 tasks running",
+        );
 
         // Only peeked: all of it is still unread.
         let run = check(&p, &[], &[]);

@@ -203,14 +203,15 @@ always has one agent checking the board.
 1. Open a new Claude Code session in the beacon repo (`~/Projects/beacon`) on the device,
    just for this, in bypass permissions mode (or auto mode; see "Permission mode" below).
    Sonnet is enough for it (`/model sonnet`).
-2. Type `/loop 2m /dispatch`, or `/loop 5m /dispatch` to check less often and spend less.
+2. Type `/loop 2m /dispatch`. Always start at 2 minutes: the loop slows down by itself when
+   the board is quiet (see "Backoff" below).
 
-Every 2 minutes Claude Code re-runs `.claude/commands/dispatch.md` while the session is
-idle, so the checks don't depend on the agent remembering to keep waiting. Each run starts
+Claude Code re-runs `.claude/commands/dispatch.md` on that loop while the session is idle,
+so the checks don't depend on the agent remembering to keep waiting. Each run starts
 with `scripts/dispatch-check.sh`, one call that joins every channel (`join --all`, on every
 check, since a dispatcher is meant to see every request and channels come and go), peeks at
 the board without marking anything read and sets the dispatcher's status to
-`dispatcher · last check <time>`. When it prints `nothing new`, the run ends there.
+`dispatcher · last check <time> · every 2m`. When it prints `nothing new`, the run ends there.
 Otherwise the dispatcher, as `<BEACON_NODE>-dispatch` (`pc-dispatch`, `mac-dispatch`):
 
 - reads what's new;
@@ -219,10 +220,19 @@ Otherwise the dispatcher, as `<BEACON_NODE>-dispatch` (`pc-dispatch`, `mac-dispa
   @mentions that agent and gives it 10 minutes to claim the request first;
 - posts `done` (with the branch), `blocked` or `handoff` when the work ends;
 - on its first run in a session, picks up claims an earlier dispatcher session left
-  unfinished, and it recreates its `/loop` job if the job is gone.
+  unfinished, and it recreates its `/loop` job if the job is gone or at the wrong pace.
 
 The workers don't have to run on the dispatcher's model: it can give them a stronger one
 (the Agent tool's `model` parameter), so the session itself can stay on Sonnet.
+
+**Backoff.** Every check is a model turn, which costs tokens even when nothing is new, so the
+loop slows down while the board is quiet: to every 5 minutes after 30 quiet minutes, and to
+every 10 after another quiet hour. Any request, running worker or pending takeover (the 10
+minutes a project's own agent gets) brings it straight back to 2 minutes. The dispatcher
+re-arms its `/loop` job each time the pace changes, and its status shows the pace
+(`· every 10m`). The pace is kept per handle outside the repo, in
+`~/.local/state/beacon/dispatch-<handle>.state` (or under `$XDG_STATE_HOME`), and every new
+session starts over at 2 minutes.
 
 **Permission mode.** Workers are background subagents, and nobody is watching the
 dispatcher session to approve their tool calls, so a call that needs approval stops them.
@@ -240,10 +250,12 @@ It lets a second consecutive stop through, so it can never trap the session. Whe
 check (beacon unreachable, no `BEACON_NODE`, a failing command), it says so in the session.
 
 **Checking that it works:**
-- `./beacon who`, or the TUI sidebar, should show `● pc-dispatch` seen within the last few
-  minutes, with the last check time in its status. `○` with an age over about 5 minutes
-  (10 with `/loop 5m`) means it has stopped.
-- Post `@pc-dispatch ping` and expect a reply within one check interval.
+- `./beacon who`, or the TUI sidebar, should show `pc-dispatch` with
+  `dispatcher · last check <time> · every <N>m` as its status, the last check at most about
+  that pace ago. Much older means it has stopped. At the 10-minute pace it shows `○` between
+  checks (`●` is seen within 5 minutes), which is normal.
+- Post `@pc-dispatch ping` and expect a reply within one check interval, the
+  `every <N>m` in its status.
 
 **Limits:**
 - The session must stay open and the machine awake.
