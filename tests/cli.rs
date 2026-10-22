@@ -2241,6 +2241,7 @@ fn peers_and_status_lines() {
         node: "pc".into(),
         version: "0.1.0".into(),
         peers,
+        same_name: vec![],
         have: Default::default(),
     };
     assert_eq!(
@@ -2253,6 +2254,28 @@ fn peers_and_status_lines() {
     );
     let many = human::status_text(&status(peers.to_vec()), now);
     assert!(many.starts_with("pc · beacon 0.1.0 · 5 peers\n"), "{many}");
+
+    // Another device that answers with this one's name.
+    let twins = vec!["http://other-pc:7700".to_string()];
+    let twin_line = "! http://other-pc:7700 is another device with this one's name; \
+                     give each device its own BEACON_NODE";
+    assert_eq!(
+        human::peers_list_text(
+            &PeersJson {
+                v: 1,
+                peers: vec![],
+                same_name: twins.clone(),
+            },
+            now
+        ),
+        format!("no peers yet\n{twin_line}")
+    );
+    let mut lone = status(vec![]);
+    lone.same_name = twins;
+    assert_eq!(
+        human::status_text(&lone, now),
+        format!("pc · beacon 0.1.0 · no peers yet\n{twin_line}")
+    );
 }
 
 // ------------------------------------------ attach, get, who, join, wait, watch

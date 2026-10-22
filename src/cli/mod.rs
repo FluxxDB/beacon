@@ -653,7 +653,7 @@ async fn status(ctx: &Ctx) -> Result<(), Error> {
 async fn peers(ctx: &Ctx) -> Result<(), Error> {
     ctx.announce().await?;
     let peers = ctx.client.peers().await?;
-    ctx.show(&peers, || human::peers_text(&peers.peers, ctx.clock.now_ms))
+    ctx.show(&peers, || human::peers_list_text(&peers, ctx.clock.now_ms))
 }
 
 async fn channels(ctx: &Ctx) -> Result<(), Error> {

@@ -197,6 +197,9 @@ pub struct StatusJson {
     pub node: String,
     pub version: String,
     pub peers: Vec<PeerJson>,
+    /// See [`PeersJson::same_name`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub same_name: Vec<String>,
     pub have: VersionVector,
 }
 
@@ -240,6 +243,11 @@ pub struct WhoJson {
 pub struct PeersJson {
     pub v: u32,
     pub peers: Vec<PeerJson>,
+    /// Peer URLs that answered with this node's own name from another
+    /// process: another device with the same `BEACON_NODE`, which this one
+    /// cannot sync with. Left out when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub same_name: Vec<String>,
 }
 
 /// `POST /api/channels`.

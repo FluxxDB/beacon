@@ -568,6 +568,36 @@ async fn peer_list_dedupes_and_skips_self() {
     assert_eq!(peers(&n).await.len(), 1);
 }
 
+/// Two devices given the same `BEACON_NODE` cannot tell each other from
+/// themselves, so they never sync. Each answer carries the process that gave
+/// it, so a node tells "this is me under another address" from "this is
+/// another device with my name": the second is logged (WARN, once per URL)
+/// and listed in `peers` and `status`, with what to do.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_with_our_name_is_reported_not_taken_for_us() {
+    let (ra, rb) = (reserve(), reserve());
+    let ub = rb.url.clone();
+    // Its own address under another name stays quiet: that one is it.
+    let alias = ra.url.replace("127.0.0.1", "localhost");
+    let twin = rb.start("pc", &[], quick).await;
+    let a = ra.start("pc", &[alias.as_str(), ub.as_str()], quick).await;
+
+    eventually(10, "a to report the other pc", || async {
+        let body = ok_json(a.get("/api/peers").send().await.unwrap()).await;
+        body["same_name"] == json!([ub])
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let body = ok_json(a.get("/api/peers").send().await.unwrap()).await;
+    assert_eq!(body["same_name"], json!([ub]), "{body}");
+    assert_eq!(body["peers"], json!([]), "{body}");
+    let status = ok_json(a.get("/api/status").send().await.unwrap()).await;
+    assert_eq!(status["same_name"], json!([ub]), "{status}");
+    // The other one sees nothing: it has no peers.
+    let theirs = ok_json(twin.get("/api/peers").send().await.unwrap()).await;
+    assert!(theirs.get("same_name").is_none(), "{theirs}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn own_address_under_another_name_is_dropped_after_first_contact() {
     let (rn, rb) = (reserve(), reserve());

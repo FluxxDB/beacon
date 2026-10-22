@@ -22,8 +22,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::api::{
-    ChannelAck, ChannelsJson, HealthJson, PeerJson, PostCreated, PostJson, PostsResponse,
-    PresenceJson, StatusJson,
+    ChannelAck, ChannelsJson, HealthJson, PeerJson, PeersJson, PostCreated, PostJson,
+    PostsResponse, PresenceJson, StatusJson,
 };
 use crate::model::AuthorKind;
 use crate::text::is_unsafe;
@@ -517,6 +517,28 @@ pub fn peers_text(peers: &[PeerJson], now_ms: i64) -> String {
     lines.join("\n")
 }
 
+/// [`peers_text`] for `beacon peers`, then a line for each URL that answered
+/// with this device's name (see [`PeersJson::same_name`]).
+pub fn peers_list_text(list: &PeersJson, now_ms: i64) -> String {
+    format!(
+        "{}{}",
+        peers_text(&list.peers, now_ms),
+        same_name_text(&list.same_name)
+    )
+}
+
+/// `\n! <url> is another device with this one's name; …` per URL.
+fn same_name_text(urls: &[String]) -> String {
+    urls.iter()
+        .map(|url| {
+            format!(
+                "\n! {} is another device with this one's name; give each device its own BEACON_NODE",
+                clean_inline(url)
+            )
+        })
+        .collect()
+}
+
 /// How sync with a peer is going.
 fn peer_state(peer: &PeerJson, now_ms: i64) -> String {
     let synced_ago = peer
@@ -548,10 +570,11 @@ pub fn status_text(status: &StatusJson, now_ms: i64) -> String {
         clean_inline(&status.node),
         clean_inline(&status.version)
     );
+    let same_name = same_name_text(&status.same_name);
     if status.peers.is_empty() {
-        head
+        format!("{head}{same_name}")
     } else {
-        format!("{head}\n{}", peers_text(&status.peers, now_ms))
+        format!("{head}\n{}{same_name}", peers_text(&status.peers, now_ms))
     }
 }
 

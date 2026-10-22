@@ -154,6 +154,7 @@ async fn status(State(app): State<AppState>) -> ApiResult<StatusJson> {
         node: app.cfg.node.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         peers: app.sync.peers(),
+        same_name: app.sync.same_name(),
         have,
     }))
 }
@@ -163,6 +164,7 @@ async fn list_peers(State(app): State<AppState>) -> Json<PeersJson> {
     Json(PeersJson {
         v: V,
         peers: app.sync.peers(),
+        same_name: app.sync.same_name(),
     })
 }
 

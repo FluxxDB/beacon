@@ -109,6 +109,10 @@ const RENAME_GAP: Duration = Duration::from_secs(5);
 /// The header that carries a node's name: on our requests (who is asking),
 /// and on a peer's `/api/events` answers (who answered).
 pub const NODE_HEADER: &str = "x-beacon-node";
+/// The header on a node's `/api/events` answers that names this run of it
+/// (a ULID made at start), so a node that dials an address answering with
+/// its own name can tell itself from another device given the same name.
+pub const INSTANCE_HEADER: &str = "x-beacon-instance";
 
 // ------------------------------------------------------------------- urls
 
@@ -768,7 +772,7 @@ impl SyncHandle {
     /// running (see [`spawn`]). Fails if the secret, node name or proxy cannot
     /// be used in a request.
     pub fn new(cfg: Arc<Config>, store: Arc<Mutex<Store>>) -> Result<SyncHandle, Error> {
-        let client = PeerClient::new(&cfg)?;
+        let client = PeerClient::new(&cfg, &ulid::Ulid::generate().to_string())?;
         let (our_vv, opened_at) = {
             let store = lock(&store);
             (store.version_vector(), store.opened_at())
@@ -818,6 +822,17 @@ impl SyncHandle {
     /// A write was stored on this node: tell the pushers there is something to send.
     pub fn notify(&self) {
         self.inner.written.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// This run's id, sent on our `/api/events` answers ([`INSTANCE_HEADER`]).
+    pub fn instance(&self) -> &str {
+        self.inner.client.instance()
+    }
+
+    /// Peer URLs that answered with our name from another run: other devices
+    /// with the same `BEACON_NODE` (see [`crate::api::PeersJson::same_name`]).
+    pub fn same_name(&self) -> Vec<String> {
+        self.inner.client.same_name()
     }
 
     /// The store's version vector after a write; the server calls it under

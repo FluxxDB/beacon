@@ -7,6 +7,8 @@
 //! through tailscaled's SOCKS5 proxy. This is the same SOCKS client reqwest
 //! wraps, with a connector that dials it.
 
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
@@ -26,7 +28,7 @@ use reqwest::Url;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use super::NODE_HEADER;
+use super::{INSTANCE_HEADER, NODE_HEADER};
 use crate::config::Config;
 use crate::error::Error;
 use crate::model::validate_handle;
@@ -89,12 +91,19 @@ impl Pool {
 pub struct PeerClient {
     pool: Pool,
     headers: HeaderMap,
+    /// Our node name, and this run's id ([`INSTANCE_HEADER`]).
+    node: String,
+    instance: String,
+    /// URLs that answered with our name from another run: other devices
+    /// with the same `BEACON_NODE`, each warned about once.
+    same_name: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl PeerClient {
-    /// The client for `cfg`: through `cfg.proxy` when set. Fails if the
-    /// secret, the node name or the proxy cannot be used.
-    pub fn new(cfg: &Config) -> Result<PeerClient, Error> {
+    /// The client for `cfg`, for the run `instance`: through `cfg.proxy`
+    /// when set. Fails if the secret, the node name or the proxy cannot be
+    /// used.
+    pub fn new(cfg: &Config, instance: &str) -> Result<PeerClient, Error> {
         let mut headers = HeaderMap::new();
         let mut bearer =
             HeaderValue::from_str(&format!("Bearer {}", cfg.secret)).map_err(|_| {
@@ -127,7 +136,40 @@ impl PeerClient {
                 Pool::Socks(builder.build(SocksV5::new(proxy, dialer).local_dns(local_dns)))
             }
         };
-        Ok(PeerClient { pool, headers })
+        Ok(PeerClient {
+            pool,
+            headers,
+            node: cfg.node.clone(),
+            instance: instance.to_string(),
+            same_name: Arc::default(),
+        })
+    }
+
+    /// This run's id.
+    pub fn instance(&self) -> &str {
+        &self.instance
+    }
+
+    /// The URLs that answered with our name from another run, sorted.
+    pub fn same_name(&self) -> Vec<String> {
+        lock(&self.same_name).iter().cloned().collect()
+    }
+
+    /// The node that signed an answer from `base`. One with our name but
+    /// another run's id is another device given the same `BEACON_NODE`
+    /// (our own address under another name answers with our run's id):
+    /// warned about once per URL and remembered for `peers`. Either way the
+    /// name is returned, and sync never syncs with that URL, as it cannot
+    /// tell the two apart.
+    fn signed(&self, base: &str, node: String, instance: Option<String>) -> String {
+        let other_run = instance.is_some_and(|run| run != self.instance);
+        if node == self.node && other_run && lock(&self.same_name).insert(base.to_string()) {
+            tracing::warn!(
+                url = %base,
+                "another device is also named {node}; give each device its own BEACON_NODE"
+            );
+        }
+        node
     }
 
     async fn send(
@@ -156,11 +198,12 @@ impl PeerClient {
         timeout: Duration,
     ) -> anyhow::Result<(String, T)> {
         let uri = endpoint(base, path)?;
-        within(timeout, async {
+        let (node, run, answer) = within(timeout, async {
             let resp = self.send(Method::GET, uri, None).await?;
             read_json(resp).await
         })
-        .await
+        .await?;
+        Ok((self.signed(base, node, run), answer))
     }
 
     /// `POST {base}{path}` with `body` as JSON, answered with JSON signed by
@@ -174,11 +217,12 @@ impl PeerClient {
     ) -> anyhow::Result<(String, T)> {
         let uri = endpoint(base, path)?;
         let json = serde_json::to_vec(body)?;
-        within(timeout, async {
+        let (node, run, answer) = within(timeout, async {
             let resp = self.send(Method::POST, uri, Some(json)).await?;
             read_json(resp).await
         })
-        .await
+        .await?;
+        Ok((self.signed(base, node, run), answer))
     }
 
     /// `GET {base}{path}` as a stream of bytes: the answer must start within
@@ -247,8 +291,11 @@ async fn success(resp: Response<Incoming>) -> anyhow::Result<Response<Incoming>>
     bail!("HTTP {status}: {}", text.trim())
 }
 
-/// The node an answer is signed with, and its JSON body.
-async fn read_json<T: DeserializeOwned>(resp: Response<Incoming>) -> anyhow::Result<(String, T)> {
+/// The node an answer is signed with, the run of it that answered (if it
+/// says: an older build does not), and its JSON body.
+async fn read_json<T: DeserializeOwned>(
+    resp: Response<Incoming>,
+) -> anyhow::Result<(String, Option<String>, T)> {
     let resp = success(resp).await?;
     let node = resp
         .headers()
@@ -257,13 +304,23 @@ async fn read_json<T: DeserializeOwned>(resp: Response<Incoming>) -> anyhow::Res
         .to_str()
         .context("the node name in the answer is not text")?;
     let node = validate_handle(node).map_err(|e| anyhow!("the answer's node name: {e}"))?;
+    let run = resp
+        .headers()
+        .get(INSTANCE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let body = Limited::new(resp.into_body(), JSON_MAX)
         .collect()
         .await
         .map_err(|e| anyhow!("cannot read the answer: {e}"))?
         .to_bytes();
     let value = serde_json::from_slice(&body).context("a bad answer")?;
-    Ok((node, value))
+    Ok((node, run, value))
+}
+
+/// Lock a std mutex; a panic elsewhere leaves the data usable.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The body's chunks, failing if none comes for [`STALL`].

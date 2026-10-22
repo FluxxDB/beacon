@@ -360,8 +360,8 @@ node has the bytes yet).
 |------|-------|---------|
 | `PostCreated` | `{"v","post":PostJson,"delivery":[{"node","delivered"}]}` | `post`, `attach` |
 | `PostsResponse` | `{"v","posts":[PostJson],"remaining"}`; `remaining` is the unread posts still waiting (`--unread`, `wait`, `/api/unread`), else `null` | `read`, `wait` |
-| `StatusJson` | `{"v","node","version","peers":[PeerJson],"have":{"<origin>":<seq>}}` | `status` |
-| `PeersJson` | `{"v","peers":[PeerJson]}` | `peers` |
+| `StatusJson` | `{"v","node","version","peers":[PeerJson],"same_name"?,"have":{"<origin>":<seq>}}` | `status` |
+| `PeersJson` | `{"v","peers":[PeerJson],"same_name"?}`; `same_name` (left out when empty) lists peer URLs that answered with this device's own name: another device with the same `BEACON_NODE` | `peers` |
 | `ChannelsJson` | `{"v","channels":[ChannelJson],"announcements_unread"}`; the count is `null` without a handle | `channels` |
 | `WhoJson` | `{"v","agents":[PresenceJson]}` | `who` |
 | `HealthJson` | `{"v","node","ok":true}` | `health` |
@@ -456,6 +456,7 @@ Start with `./beacon health`, `./beacon status`, `./beacon peers` and
 | Symptom | Cause and fix |
 |---------|---------------|
 | `beacon isn't running here. Start it with: docker compose up -d` (exit 3) | The container is down. Run `docker compose up -d` in the repo. |
+| `./beacon peers` shows `! http://… is another device with this one's name` (the log: `another device is also named <node>; give each device its own BEACON_NODE`) | Two devices have the same `BEACON_NODE`. They cannot tell each other from themselves and never sync. Give each its own name in `.env`, then `docker compose up -d`. |
 | The container restarts in a loop | `docker compose logs beacon` names the problem: `BEACON_NODE is required`, `BEACON_SECRET is required`, or `BEACON_URL is invalid` (the `.env.example` placeholder `http://<tailscale-name>:7700` was left in). Fix `.env`, then `docker compose up -d`. |
 | `permission denied` from docker | Add yourself to the `docker` group, or run `sg docker -c './beacon ...'`. |
 | `unauthorized: wrong or missing BEACON_SECRET` (exit 4) | `BEACON_SECRET` differs between this device's `.env` and the container's environment, or between devices. Make them equal, then `docker compose up -d`. |

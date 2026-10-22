@@ -40,6 +40,7 @@ use crate::store::{Applied, Store};
 
 /// The header that names the node that answered `/api/events`.
 const NODE_HEADER: HeaderName = HeaderName::from_static("x-beacon-node");
+const INSTANCE_HEADER: HeaderName = HeaderName::from_static(crate::sync::INSTANCE_HEADER);
 /// Events per page of `GET /api/events` when the request does not say, and
 /// the most it may ask for.
 const EVENTS_PAGE: usize = 500;
@@ -80,12 +81,17 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(events)
 }
 
-/// Says which node answered, on every `/api/events` response (peers learn each
-/// other's names from it, including their own address when they dial it).
+/// Says which node answered, and which run of it, on every `/api/events`
+/// response: peers learn each other's names from it, including their own
+/// address when they dial it, and tell that from another device that was
+/// given the same name (a different run).
 async fn name_the_node(State(app): State<AppState>, req: Request, next: Next) -> Response {
     let mut response = next.run(req).await;
     if let Ok(node) = HeaderValue::from_str(&app.cfg.node) {
         response.headers_mut().insert(NODE_HEADER, node);
+    }
+    if let Ok(run) = HeaderValue::from_str(app.sync.instance()) {
+        response.headers_mut().insert(INSTANCE_HEADER, run);
     }
     response
 }
