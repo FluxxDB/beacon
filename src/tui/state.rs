@@ -21,6 +21,7 @@ use crate::api::{
     ChannelAck, ChannelsJson, PeerJson, PostCreated, PostJson, PostsResponse, StatusJson,
     StreamEvent, WhoJson, ACTIVE_WINDOW_MS,
 };
+use crate::error::Error;
 use crate::model::AuthorKind;
 use crate::tui::convert;
 use crate::tui::view::Layout;
@@ -37,6 +38,9 @@ pub const NAME_RULE: &str = "lowercase letters, digits and dashes";
 /// Longest channel name, as the server allows.
 pub const CHANNEL_NAME_MAX: usize = 32;
 /// How long an ordinary toast stays, and one that reports a failure.
+/// The toast after a send whose connection dropped: it may have been stored.
+pub const MAYBE_SENT: &str =
+    "Not sent? The connection dropped — check the channel before resending";
 const TOAST_MS: i64 = 5_000;
 const ERROR_TOAST_MS: i64 = 10_000;
 /// How often the TUI tells the node Dang is here, and asks how sync is going.
@@ -224,7 +228,7 @@ pub enum Msg {
     /// The live feed opened (`Up`) or broke (`Down`).
     Connection(Conn),
     /// A post (or an upload) went out, or did not.
-    Sent(Result<PostCreated, String>),
+    Sent(Result<PostCreated, SendFailed>),
     Created(Result<ChannelAck, String>),
     /// The post with this id was deleted, or was not.
     PostDeleted(Result<String, String>),
@@ -236,6 +240,25 @@ pub enum Msg {
     Notice(String),
     /// The node answered 401: this device's BEACON_SECRET is not the node's.
     SecretRejected,
+}
+
+/// Why a post (or an upload) did not go out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendFailed {
+    /// It was refused, or never reached the node: `Not sent: <why>`.
+    NotSent(String),
+    /// The connection dropped (or the node went quiet) mid-request, so the
+    /// node may have stored it: sending again could post it twice.
+    MaybeSent,
+}
+
+impl From<Error> for SendFailed {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::Interrupted(_) => SendFailed::MaybeSent,
+            e => SendFailed::NotSent(e.to_string()),
+        }
+    }
 }
 
 /// Merges what one batch of messages asked for: one `MarkRead` per channel,
@@ -993,13 +1016,18 @@ impl App {
 
     // ----------------------------------------------------------- results
 
-    fn on_sent(&mut self, result: Result<PostCreated, String>) -> Vec<Cmd> {
+    fn on_sent(&mut self, result: Result<PostCreated, SendFailed>) -> Vec<Cmd> {
         let body = self.sending.take();
         let created = match result {
             Ok(created) => created,
-            Err(e) => {
-                // The text stays in the composer, to send again.
+            // The text stays in the composer, to send again.
+            Err(SendFailed::NotSent(e)) => {
                 self.error(format!("Not sent: {e}"));
+                return Vec::new();
+            }
+            // If it was stored, the live feed brings it once it is back.
+            Err(SendFailed::MaybeSent) => {
+                self.error(MAYBE_SENT);
                 return Vec::new();
             }
         };

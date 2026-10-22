@@ -50,7 +50,8 @@ use crate::error::Error;
 use crate::model::{validate_handle, AuthorKind};
 use crate::server::now_ms;
 use crate::tui::state::{
-    coalesce, App, Cmd, Conn, ExchangeFile, Loaded, Msg, Selection, ANNOUNCEMENTS_LIMIT, PAGE,
+    coalesce, App, Cmd, Conn, ExchangeFile, Loaded, Msg, Selection, SendFailed,
+    ANNOUNCEMENTS_LIMIT, PAGE,
 };
 use crate::tui::theme::{ColorMode, Theme};
 use crate::tui::view;
@@ -496,7 +497,7 @@ impl Worker {
             }
             Cmd::SendPost { channel, body } => {
                 let sent = client.post(&channel, &self.post_request(body)).await;
-                Some(Msg::Sent(sent.map_err(|e| e.to_string())))
+                Some(Msg::Sent(sent.map_err(SendFailed::from)))
             }
             Cmd::Upload {
                 channel,
@@ -505,7 +506,7 @@ impl Worker {
             } => Some(Msg::Sent(
                 self.upload(&channel, &path, body)
                     .await
-                    .map_err(|e| e.to_string()),
+                    .map_err(SendFailed::from),
             )),
             Cmd::Save {
                 sha, size, name, ..

@@ -1108,10 +1108,13 @@ mod behaviour {
         AttachmentJson, ChannelAck, ChannelJson, ChannelsJson, Delivery, PeerJson, PostCreated,
         PostJson, PostsResponse, PresenceJson, StreamEvent, WhoJson,
     };
+    use beacon::error::Error;
     use beacon::model::{parse_mentions, AuthorKind};
     use beacon::tui::convert;
     use beacon::tui::keys::HELP;
-    use beacon::tui::state::{Cmd, ExchangeFile, Loaded, Msg, FILTER_MAX, NAME_RULE, PAGE};
+    use beacon::tui::state::{
+        Cmd, ExchangeFile, Loaded, Msg, SendFailed, FILTER_MAX, NAME_RULE, PAGE,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     const W: u16 = 104;
@@ -1293,15 +1296,43 @@ mod behaviour {
         // A failure keeps the text and says why.
         type_text(&mut app, "again");
         assert_eq!(app.update(key(KeyCode::Enter)).len(), 1);
-        app.update(Msg::Sent(Err(
+        app.update(Msg::Sent(Err(SendFailed::NotSent(
             "cannot reach http://127.0.0.1:7700 (connection refused)".to_string(),
-        )));
+        ))));
         assert_eq!(app.input, "again");
         assert_eq!(
             app.toast.as_deref(),
             Some("Not sent: cannot reach http://127.0.0.1:7700 (connection refused)")
         );
         assert!(screen_text(&app).contains("Not sent: cannot reach"));
+    }
+
+    /// A send whose connection dropped mid-request may have been stored (the
+    /// stream shows it once it is back): the toast says to look before
+    /// sending again, so the same post does not go out twice.
+    #[test]
+    fn an_interrupted_send_says_to_check_before_resending() {
+        let mut app = live_app();
+        type_text(&mut app, "maybe twice");
+        assert_eq!(app.update(key(KeyCode::Enter)).len(), 1);
+        let dropped = Error::Interrupted(
+            "lost the connection to http://127.0.0.1:7700 (reset); the post may have been stored"
+                .to_string(),
+        );
+        app.update(Msg::Sent(Err(SendFailed::from(dropped))));
+        assert_eq!(app.input, "maybe twice", "kept, to send if it was not");
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("Not sent? The connection dropped — check the channel before resending")
+        );
+        assert!(screen_text(&app).contains("Not sent? The connection dropped"));
+
+        // Any other failure is a plain "Not sent".
+        let refused = SendFailed::from(Error::Unreachable("cannot reach the node".to_string()));
+        assert_eq!(
+            refused,
+            SendFailed::NotSent("cannot reach the node".to_string())
+        );
     }
 
     #[test]
@@ -1644,7 +1675,7 @@ mod behaviour {
         assert!(app.dialog.is_none());
 
         // An empty folder says what to do; Announcements can't take a file.
-        app.update(Msg::Sent(Err("boom".to_string())));
+        app.update(Msg::Sent(Err(SendFailed::NotSent("boom".to_string()))));
         app.update(ch('a'));
         app.update(Msg::Loaded(Loaded::Files(Ok(Vec::new()))));
         assert!(pane_text(&screen(&app)).contains("No files in ./exchange yet."));
@@ -2845,7 +2876,9 @@ mod behaviour {
             toast_ink(&app, "Not saved: not synced"),
             rgb(palette::CORAL)
         );
-        app.update(Msg::Sent(Err("cannot reach the node".to_string())));
+        app.update(Msg::Sent(Err(SendFailed::NotSent(
+            "cannot reach the node".to_string(),
+        ))));
         assert_eq!(
             toast_ink(&app, "Not sent: cannot reach"),
             rgb(palette::CORAL)
