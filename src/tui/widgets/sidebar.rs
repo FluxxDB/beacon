@@ -19,7 +19,7 @@ const RIGHT_PAD: u16 = 2;
 
 /// One sidebar line.
 struct Row {
-    /// Lifted, with the lime edge rule: the view on screen.
+    /// Lifted, with the accent edge rule: the view on screen.
     selected: bool,
     /// Drawn at the glyph column, the name then starting at the name column.
     glyph: Option<Seg>,

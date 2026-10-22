@@ -1,4 +1,4 @@
-//! The composer: a rounded box with the key hint in its top border, the lime
+//! The composer: a rounded box with the key hint in its top border, the accent
 //! `›` prompt, the text being typed (wrapped, growing up to five lines) and a
 //! block caret after it.
 

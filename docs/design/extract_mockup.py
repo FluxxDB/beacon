@@ -15,22 +15,31 @@ For every screen this writes two fixtures into the output directory:
                     null when unset), bold is a boolean. Adjacent runs with
                     identical style are merged.
 
-Three committed fixtures carry one approved substitution that the mockup
-HTML does not: the ash metadata grey #62666d is #787d85 in
+Three committed fixtures carry two approved substitutions that the mockup
+HTML does not:
+
+  1. the ash metadata grey #62666d is #787d85 (lifted for contrast, Dang,
+     2026-10-22);
+  2. the acid lime accent #e4f222 is the blue #4099ff (Dang, 2026-10-22: "change
+     the highlight from this yellowish color to a fitting blue"), on the
+     active-channel edge, the input caret(s), an announcement's edge rule and
+     a dialog's primary action. Only the colour changed, not where it is used.
+
+The three fixtures are
 
   tests/fixtures/mockup/board.colors.json
   tests/fixtures/mockup/mac.colors.json
   tests/fixtures/mockup/modal.colors.json
 
-(lifted for contrast, Dang, 2026-10-22). Re-running this script writes the
-original #62666d back into them; swap it again in those three files, and only
-those, before committing:
+Re-running this script writes the original #62666d and #e4f222 back into them;
+swap both again in those three files, and only those, before committing:
 
   cd tests/fixtures/mockup
-  sed -i 's/#62666d/#787d85/g' board.colors.json mac.colors.json modal.colors.json
+  sed -i -e 's/#62666d/#787d85/g' -e 's/#e4f222/#4099ff/g' \
+    board.colors.json mac.colors.json modal.colors.json
 
 (on macOS: sed -i ''). tests/fixtures/mockup/cli.colors.json is not used by
-the TUI tests and keeps #62666d.
+the TUI tests and keeps #62666d (it has no accent cells).
 
 Usage (Python standard library only):
 
