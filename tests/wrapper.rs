@@ -49,7 +49,7 @@ case "$1 $2" in
     printf '%s\0' "$@" > "$dir/exec.argv"
     pwd -P > "$dir/exec.cwd"
     env > "$dir/exec.env"
-    cat > "$dir/exec.stdin"
+    [ -t 0 ] || cat > "$dir/exec.stdin"
     if [ -n "${FAKE_EXEC_STDOUT_FILE:-}" ]; then
         cat "$FAKE_EXEC_STDOUT_FILE"
     fi
@@ -232,10 +232,12 @@ fn open_pty() -> (OwnedFd, OwnedFd) {
     unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
 }
 
-/// Run `cmd` with its stdout on a terminal; returns exit code and stderr.
+/// Run `cmd` with its stdin and stdout on a terminal; returns exit code and stderr.
 fn run_on_tty(mut cmd: Command) -> (i32, String) {
     let (master, slave) = open_pty();
-    cmd.stdout(Stdio::from(slave)).stderr(Stdio::piped());
+    cmd.stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave))
+        .stderr(Stdio::piped());
     let child = cmd.spawn().unwrap();
     drop(cmd); // closes our copy of the slave end
     let out = child.wait_with_output().unwrap();
@@ -597,9 +599,8 @@ fn not_running_exits_3() {
         "nothing is exec'd when the service is down"
     );
 
-    // The TUI and the stream-carrying commands get the same answer.
+    // The stream-carrying commands get the same answer.
     for args in [
-        &[][..],
         &["attach", "general", "Cargo.toml"][..],
         &["get", "x", "-o", "/tmp/never"][..],
     ] {
@@ -610,6 +611,15 @@ fn not_running_exits_3() {
         assert_eq!(run.code, 3, "args {args:?}");
         assert!(!sb.called("exec"));
     }
+
+    // So does the TUI, started from a terminal.
+    let sb = Sandbox::new();
+    let mut cmd = sb.command(&[]);
+    cmd.env("FAKE_NOT_RUNNING", "1");
+    let (code, stderr) = run_on_tty(cmd);
+    assert_eq!(code, 3);
+    assert!(stderr.contains("docker compose up -d"), "{stderr}");
+    assert!(!sb.called("exec"));
 }
 
 #[test]
@@ -836,4 +846,342 @@ fn other_skill_subcommands_run_in_the_container() {
     let run = sb.run(sb.command(&["skill", "show"]));
     assert_eq!(run.code, 0, "{}", run.stderr);
     assert_eq!(sb.argv("exec"), exec_argv(&["skill", "show"]));
+}
+
+#[test]
+fn global_flags_before_attach_and_get() {
+    let sb = Sandbox::new();
+    let script = repo().join("beacon");
+    fs::write(sb.work.join("f.txt"), b"file bytes").unwrap();
+    let blob: &[u8] = b"\x00saved bytes\xff";
+    let source = sb.root.join("blob");
+    fs::write(&source, blob).unwrap();
+
+    // get: the file is still written on the host, and the CLI still gets the
+    // global flags (right after the subcommand).
+    let get_cases: &[(&[&str], &str, &[&str])] = &[
+        (
+            &["--json", "get", "01ABC", "-o", "out1.bin"],
+            "out1.bin",
+            &["get", "--json", "01ABC"],
+        ),
+        (
+            &[
+                "--as",
+                "me",
+                "--client",
+                "codex",
+                "get",
+                "01ABC",
+                "--output=out2.bin",
+            ],
+            "out2.bin",
+            &["get", "--as", "me", "--client", "codex", "01ABC"],
+        ),
+        (
+            &["--as=me", "--strict", "get", "-o", "out3.bin", "01ABC"],
+            "out3.bin",
+            &["get", "--as=me", "--strict", "01ABC"],
+        ),
+    ];
+    for (args, out, expected) in get_cases {
+        let mut cmd = sb.command_for(&script, &sb.work);
+        cmd.args(*args).env("FAKE_EXEC_STDOUT_FILE", &source);
+        let run = sb.run(cmd);
+        assert_eq!(run.code, 0, "{args:?}: {}", run.stderr);
+        assert_eq!(run.stdout, b"", "{args:?}: bytes go to the file");
+        assert_eq!(fs::read(sb.work.join(out)).unwrap(), blob, "{args:?}");
+        assert!(!repo().join(out).exists(), "{args:?}: written in the repo");
+        assert_eq!(sb.argv("exec"), exec_argv(expected), "{args:?}");
+    }
+
+    // attach: the file is streamed from the host, whatever comes first.
+    let attach_cases: &[(&[&str], &[&str])] = &[
+        (
+            &["--as", "me", "attach", "general", "f.txt", "hi"],
+            &[
+                "attach", "--as", "me", "general", "-", "--name", "f.txt", "hi",
+            ],
+        ),
+        (
+            &["--json", "--strict", "attach", "general", "./f.txt"],
+            &[
+                "attach", "--json", "--strict", "general", "-", "--name", "f.txt",
+            ],
+        ),
+        (
+            &[
+                "--client=codex",
+                "attach",
+                "general",
+                "f.txt",
+                "--tag",
+                "done",
+            ],
+            &[
+                "attach",
+                "--client=codex",
+                "general",
+                "-",
+                "--name",
+                "f.txt",
+                "--tag",
+                "done",
+            ],
+        ),
+    ];
+    for (args, expected) in attach_cases {
+        let mut cmd = sb.command_for(&script, &sb.work);
+        cmd.args(*args);
+        let run = sb.run(cmd);
+        assert_eq!(run.code, 0, "{args:?}: {}", run.stderr);
+        assert_eq!(sb.exec_stdin(), b"file bytes", "{args:?}");
+        assert_eq!(sb.argv("exec"), exec_argv(expected), "{args:?}");
+    }
+
+    // Only global flags, or global flags before a command the wrapper does not
+    // handle itself: handed over exactly as typed.
+    for args in [&["--json"][..], &["--json", "read", "general"][..]] {
+        let run = sb.run(sb.command(args));
+        assert_eq!(run.code, 0, "{args:?}: {}", run.stderr);
+        assert_eq!(sb.argv("exec"), exec_argv(args), "{args:?}");
+    }
+}
+
+#[test]
+fn attach_with_tag_before_and_between_positionals() {
+    let sb = Sandbox::new();
+    let script = repo().join("beacon");
+    fs::write(sb.work.join("f.txt"), b"file bytes").unwrap();
+
+    // (arguments after `attach`, argv the CLI must receive, file streamed?)
+    let cases: &[(&[&str], &[&str], bool)] = &[
+        (
+            &["--tag", "done", "general", "f.txt", "hi"],
+            &[
+                "attach", "--tag", "done", "general", "-", "--name", "f.txt", "hi",
+            ],
+            true,
+        ),
+        (
+            &["general", "--tag", "done", "f.txt"],
+            &["attach", "general", "--tag", "done", "-", "--name", "f.txt"],
+            true,
+        ),
+        (
+            &["--tag=done", "general", "f.txt", "msg", "--tag", "fyi"],
+            &[
+                "attach",
+                "--tag=done",
+                "general",
+                "-",
+                "--name",
+                "f.txt",
+                "msg",
+                "--tag",
+                "fyi",
+            ],
+            true,
+        ),
+        // A name the user chose wins; the wrapper adds none of its own.
+        (
+            &["general", "f.txt", "--name", "custom.txt"],
+            &["attach", "general", "-", "--name", "custom.txt"],
+            true,
+        ),
+        (
+            &["--name=custom.txt", "general", "f.txt"],
+            &["attach", "--name=custom.txt", "general", "-"],
+            true,
+        ),
+        // A message that looks like a flag, after `--`, is left alone.
+        (
+            &["general", "f.txt", "--", "-dash message"],
+            &[
+                "attach",
+                "general",
+                "-",
+                "--name",
+                "f.txt",
+                "--",
+                "-dash message",
+            ],
+            true,
+        ),
+        // Help is the CLI's business, wherever it is asked for.
+        (&["--help"], &["attach", "--help"], false),
+        (
+            &["general", "--help"],
+            &["attach", "general", "--help"],
+            false,
+        ),
+        (
+            &["general", "f.txt", "--help"],
+            &["attach", "general", "f.txt", "--help"],
+            false,
+        ),
+    ];
+    for (args, expected, streamed) in cases {
+        let mut cmd = sb.command_for(&script, &sb.work);
+        cmd.arg("attach").args(*args);
+        let run = sb.run(cmd);
+        assert_eq!(run.code, 0, "{args:?}: {}", run.stderr);
+        assert_eq!(sb.argv("exec"), exec_argv(expected), "{args:?}");
+        if *streamed {
+            assert_eq!(sb.exec_stdin(), b"file bytes", "{args:?}");
+        }
+    }
+
+    // The path is the second non-option argument even when options come first.
+    let run = sb.run(sb.command(&["attach", "--tag", "done", "general", "no-such.txt"]));
+    assert_eq!(run.code, 2);
+    assert_eq!(run.stderr, "no such file: no-such.txt\n");
+}
+
+#[test]
+fn get_output_flag_spellings() {
+    let sb = Sandbox::new();
+    let script = repo().join("beacon");
+    let blob: &[u8] = b"spelling \x00 bytes";
+    let source = sb.root.join("blob");
+    fs::write(&source, blob).unwrap();
+    let cases: &[(&[&str], &str)] = &[
+        (&["get", "01ABC", "-ojoined.bin"], "joined.bin"),
+        (&["get", "01ABC", "-o=equals.bin"], "equals.bin"),
+        (&["get", "01ABC", "--output=long.bin"], "long.bin"),
+        (&["get", "01ABC", "--output", "spaced.bin"], "spaced.bin"),
+        (&["get", "-o", "first.bin", "01ABC"], "first.bin"),
+    ];
+    for (args, out) in cases {
+        let mut cmd = sb.command_for(&script, &sb.work);
+        cmd.args(*args).env("FAKE_EXEC_STDOUT_FILE", &source);
+        let run = sb.run(cmd);
+        assert_eq!(run.code, 0, "{args:?}: {}", run.stderr);
+        assert_eq!(run.stdout, b"");
+        assert_eq!(fs::read(sb.work.join(out)).unwrap(), blob, "{args:?}");
+        assert_eq!(sb.argv("exec"), exec_argv(&["get", "01ABC"]), "{args:?}");
+    }
+}
+
+#[test]
+fn get_empty_output_path_is_a_usage_error() {
+    for args in [
+        &["get", "01ABC", "-o", ""][..],
+        &["get", "01ABC", "--output", ""][..],
+        &["get", "01ABC", "--output="][..],
+        &["get", "01ABC", "-o="][..],
+        &["get", "01ABC", "-o"][..],
+    ] {
+        let sb = Sandbox::new();
+        let source = sb.root.join("blob");
+        fs::write(&source, b"must never reach the terminal").unwrap();
+        let mut cmd = sb.command(args);
+        cmd.env("FAKE_EXEC_STDOUT_FILE", &source);
+        let run = sb.run(cmd);
+        assert_eq!(run.code, 1, "{args:?}");
+        assert_eq!(run.stdout, b"", "{args:?}");
+        assert_eq!(
+            run.stderr, "usage: ./beacon get <post-id> [-o path]\n",
+            "{args:?}"
+        );
+        assert!(!sb.called("exec"), "{args:?}");
+    }
+}
+
+#[test]
+fn get_dash_o_unwritable_directory_exits_1() {
+    // Root can write anywhere, so there is nothing to check for it.
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let sb = Sandbox::new();
+    let dir = sb.work.join("readonly");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let out = dir.join("x.bin");
+    let run = sb.run(sb.command(&["get", "01ABC", "-o", out.to_str().unwrap()]));
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(run.code, 1);
+    assert_eq!(run.stderr, format!("can't write to {}\n", dir.display()));
+    assert!(!sb.called("exec"));
+}
+
+#[test]
+fn get_dash_o_writes_straight_to_special_files() {
+    let sb = Sandbox::new();
+    let blob: &[u8] = b"through a fifo \x00\xff";
+    let source = sb.root.join("blob");
+    fs::write(&source, blob).unwrap();
+
+    // /dev/null: no rename is possible (or wanted).
+    let mut cmd = sb.command(&["get", "01ABC", "-o", "/dev/null"]);
+    cmd.env("FAKE_EXEC_STDOUT_FILE", &source);
+    let run = sb.run(cmd);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.stderr, "");
+    assert_eq!(sb.argv("exec"), exec_argv(&["get", "01ABC"]));
+
+    // A FIFO gets the bytes as they are written.
+    let fifo = sb.work.join("pipe");
+    let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: c_path is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let reader = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || fs::read(fifo).unwrap())
+    };
+    let mut cmd = sb.command(&["get", "01ABC", "-o", fifo.to_str().unwrap()]);
+    cmd.env("FAKE_EXEC_STDOUT_FILE", &source);
+    let run = sb.run(cmd);
+    // If the wrapper never opened the FIFO the reader would wait forever: open
+    // a writer ourselves (non-blocking, so it fails once the reader is gone).
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _unblock = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo);
+    }
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(reader.join().unwrap(), blob);
+    assert!(fs::read_dir(&sb.work).unwrap().all(|e| !e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".beacon")));
+}
+
+#[test]
+fn get_dash_o_does_not_claim_a_terminal() {
+    // With -o the CLI's stdout is a file, so BEACON_TTY must not be set even
+    // though the wrapper itself is on a terminal.
+    let sb = Sandbox::new();
+    let out = sb.work.join("saved.bin");
+    let (code, stderr) = run_on_tty(sb.command(&["get", "01ABC", "-o", out.to_str().unwrap()]));
+    assert_eq!((code, stderr.as_str()), (0, ""));
+    assert_eq!(sb.exec_env().get("BEACON_TTY"), None);
+
+    // `-o -` goes to the terminal, which is a terminal.
+    let (code, _) = run_on_tty(sb.command(&["get", "01ABC", "-o", "-"]));
+    assert_eq!(code, 0);
+    assert_eq!(
+        sb.exec_env().get("BEACON_TTY").map(String::as_str),
+        Some("1")
+    );
+}
+
+#[test]
+fn tui_without_a_terminal_explains_itself() {
+    for args in [&[][..], &["tui"][..]] {
+        let sb = Sandbox::new();
+        let run = sb.run(sb.command(args));
+        assert_eq!(run.code, 1, "args {args:?}");
+        assert_eq!(
+            run.stderr,
+            "the TUI needs a terminal; agents use ./beacon <command> (see ./beacon skill show)\n"
+        );
+        assert_eq!(run.stdout, b"");
+        assert!(!sb.called("ps") && !sb.called("exec"), "args {args:?}");
+    }
 }

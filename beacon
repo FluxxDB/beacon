@@ -111,7 +111,7 @@ skill_install() {
         if ! mkdir -p "$dest" || ! cp "$src" "$dest/SKILL.md"; then
             die 1 "could not install the skill into $dest"
         fi
-        echo "installed $dest/SKILL.md"
+        printf '%s\n' "installed $dest/SKILL.md"
     done
     cat <<TEXT
 
@@ -129,13 +129,71 @@ TEXT
 }
 
 # --- ./beacon attach <channel> <path> [message…] -----------------------------
-# The file lives on the host, so stream it in on stdin: the CLI gets "-" plus
-# --name. Only called when the arguments have that shape; anything else (a flag
-# up front, "-" for stdin) is left to the CLI to interpret.
+# The file lives on the host, so stream it in on stdin: the CLI gets "-" for the
+# path plus --name (unless the user gave one). Channel and path are the first
+# two arguments that are not options, wherever the options are.
+
+# attach_scan <args after "attach">: sets path_at (1-based position of the path
+# argument, 0 if there is none or help was asked for), path_val and have_name
+# (the user passed --name anywhere).
+attach_scan() {
+    path_at=0
+    path_val=
+    have_name=0
+    pos=0
+    npos=0
+    skip=0
+    opts_done=0
+    for arg in "$@"; do
+        pos=$((pos + 1))
+        if [ "$skip" -eq 1 ]; then
+            skip=0
+            continue
+        fi
+        if [ "$opts_done" -eq 0 ]; then
+            case $arg in
+            --) opts_done=1 ;;
+            --help | -h) path_at=0; return 0 ;;
+            --name) have_name=1; skip=1 ;;
+            --name=*) have_name=1 ;;
+            --tag | --as | --client) skip=1 ;;
+            --tag=* | --as=* | --client=*) ;;
+            -) npos=$((npos + 1)) ;;
+            -*) ;;
+            *) npos=$((npos + 1)) ;;
+            esac
+        else
+            npos=$((npos + 1))
+        fi
+        if [ "$npos" -eq 2 ] && [ "$path_at" -eq 0 ]; then
+            path_at=$pos
+            path_val=$arg
+        fi
+    done
+}
+
+# $1 is "attach". Returns (leaving the arguments to the CLI) unless the file
+# argument is a real path.
 host_attach() {
-    channel=$2
-    given=$3
-    shift 3
+    shift
+    attach_scan "$@"
+    [ "$path_at" -gt 0 ] || return 0
+    [ "$path_val" != - ] || return 0
+    given=$path_val
+    n=$#
+    pos=0
+    while [ "$n" -gt 0 ]; do
+        arg=$1
+        shift
+        n=$((n - 1))
+        pos=$((pos + 1))
+        if [ "$pos" -eq "$path_at" ]; then
+            set -- "$@" -
+            [ "$have_name" -eq 1 ] || set -- "$@" --name "${given##*/}"
+        else
+            set -- "$@" "$arg"
+        fi
+    done
     case $given in
     /*) path=$given ;;
     *) path=$orig/$given ;;
@@ -143,14 +201,16 @@ host_attach() {
     [ -e "$path" ] || die 2 "no such file: $given"
     [ -f "$path" ] && [ -r "$path" ] || die 1 "not a readable file: $given"
     preflight
-    beacon_exec pipe attach "$channel" - --name "${given##*/}" "$@" <"$path"
+    beacon_exec pipe attach "$@" <"$path"
 }
 
 # --- ./beacon get <id> [-o <path>] -------------------------------------------
 # The CLI writes the bytes to stdout. With -o the file is made here, on the
-# host, and only appears once the CLI has succeeded.
+# host, and only appears once the CLI has succeeded. $1 is "get".
 host_get() {
+    shift
     out=
+    have_out=0
     n=$#
     while [ "$n" -gt 0 ]; do
         arg=$1
@@ -159,15 +219,30 @@ host_get() {
         case $arg in
         -o | --output)
             [ "$n" -gt 0 ] || die 1 "usage: ./beacon get <post-id> [-o path]"
+            have_out=1
             out=$1
             shift
             n=$((n - 1))
             ;;
-        --output=*) out=${arg#--output=} ;;
+        --output=*)
+            have_out=1
+            out=${arg#--output=}
+            ;;
+        -o=*)
+            have_out=1
+            out=${arg#-o=}
+            ;;
+        -o?*)
+            have_out=1
+            out=${arg#-o}
+            ;;
         *) set -- "$@" "$arg" ;;
         esac
     done
-    if [ -z "$out" ] || [ "$out" = - ]; then
+    if [ "$have_out" -eq 1 ] && [ -z "$out" ]; then
+        die 1 "usage: ./beacon get <post-id> [-o path]"
+    fi
+    if [ "$have_out" -eq 0 ] || [ "$out" = - ]; then
         preflight
         beacon_exec pipe get "$@"
     fi
@@ -177,8 +252,17 @@ host_get() {
     *) out=$orig/$given ;;
     esac
     [ ! -d "$out" ] || die 1 "is a directory: $given"
+    # The CLI's stdout is a file from here on, not the terminal.
+    unset BEACON_TTY
+    if [ -e "$out" ] && [ ! -f "$out" ]; then
+        # /dev/null, a FIFO, …: nothing to rename over, so write straight to it.
+        preflight
+        (beacon_exec pipe get "$@") >"$out"
+        exit $?
+    fi
     dir=${out%/*}
     [ -d "${dir:-/}" ] || die 1 "no such directory: ${dir:-/}"
+    [ -w "${dir:-/}" ] || die 1 "can't write to ${dir:-/}"
     tmp=${dir%/}/.beacon-get.$$
     preflight
     trap 'rm -f "$tmp"; exit 1' HUP INT TERM
@@ -191,32 +275,71 @@ host_get() {
     exit "$code"
 }
 
-# --- dispatch ----------------------------------------------------------------
-case ${1-} in
-'')
-    preflight
-    beacon_exec tty tui
-    ;;
-tui)
+# The TUI is for people: without a terminal on stdin docker would only fail.
+start_tui() {
+    [ -t 0 ] ||
+        die 1 "the TUI needs a terminal; agents use ./beacon <command> (see ./beacon skill show)"
     preflight
     beacon_exec tty "$@"
-    ;;
+}
+
+# --- dispatch ----------------------------------------------------------------
+# Global flags (--as X, --client X, --as=X, --client=X, --json, --strict) may
+# come before the subcommand. For attach and get, which the wrapper handles
+# itself, move them behind it: `--json get x -o f` becomes `get --json x -o f`.
+nglob=0
+skip=0
+for arg in "$@"; do
+    if [ "$skip" -eq 1 ]; then
+        skip=0
+    else
+        case $arg in
+        --as | --client) skip=1 ;;
+        --as=* | --client=* | --json | --strict) ;;
+        *) break ;;
+        esac
+    fi
+    nglob=$((nglob + 1))
+done
+if [ "$nglob" -gt 0 ] && [ "$nglob" -lt $# ]; then
+    pos=0
+    for arg in "$@"; do
+        pos=$((pos + 1))
+        [ "$pos" -gt "$nglob" ] && break
+    done
+    case $arg in
+    attach | get)
+        i=0
+        while [ "$i" -lt "$nglob" ]; do
+            set -- "$@" "$1"
+            shift
+            i=$((i + 1))
+        done
+        sub=$1
+        shift
+        rest=$(($# - nglob))
+        i=0
+        while [ "$i" -lt "$rest" ]; do
+            set -- "$@" "$1"
+            shift
+            i=$((i + 1))
+        done
+        set -- "$sub" "$@"
+        ;;
+    esac
+fi
+
+case ${1-} in
+'') start_tui tui ;;
+tui) start_tui "$@" ;;
 skill)
     if [ "${2-}" = install ]; then
         shift 2
         skill_install "$@"
     fi
     ;;
-attach)
-    # A flag in the channel or path position is left to the CLI.
-    if [ $# -ge 3 ] && [ "${2#-}" = "$2" ] && [ "${3#-}" = "$3" ]; then
-        host_attach "$@"
-    fi
-    ;;
-get)
-    shift
-    host_get "$@"
-    ;;
+attach) host_attach "$@" ;;
+get) host_get "$@" ;;
 esac
 
 preflight
