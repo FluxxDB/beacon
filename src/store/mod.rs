@@ -6,7 +6,10 @@
 //! and relayed but changes no derived state. The derived state depends only
 //! on the set of events stored, never on the order they arrived in, so nodes
 //! that hold the same events show the same board. See `schema.sql` for the
-//! tables and the visibility rule.
+//! tables and the visibility rule. What each handle has read and joined lives
+//! beside the log, local to the node; see [`unread`].
+
+mod unread;
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,6 +18,8 @@ use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, Type, V
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, ToSql};
 use serde::de::DeserializeOwned;
 use ulid::{Generator, Ulid};
+
+pub use unread::Unread;
 
 use crate::error::Error;
 use crate::model::{

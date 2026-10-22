@@ -897,3 +897,478 @@ fn seq_out_of_range() {
     assert!(a.apply(&remote(0, hello())).unwrap().is_some());
     assert!(a.posts(&PostQuery::default()).unwrap().is_empty());
 }
+
+// ---- unread, relevance, cursors, joins ----
+
+/// Posts `body` in `channel` as `author` (a human when `kind` says so), with
+/// the mentions parsed from the body.
+fn post_by(
+    s: &mut Store,
+    author: &str,
+    kind: AuthorKind,
+    channel: &str,
+    body: &str,
+    ts: i64,
+) -> Event {
+    let mut p = new_post("pc", channel, body);
+    p.author = author.into();
+    p.author_kind = kind;
+    if kind == AuthorKind::Human {
+        p.client = None;
+    }
+    local(s, EventKind::PostCreated(p), ts)
+}
+
+fn agent_post(s: &mut Store, author: &str, channel: &str, body: &str, ts: i64) -> Event {
+    post_by(s, author, AuthorKind::Agent, channel, body, ts)
+}
+
+/// An announcement: Dang's post.
+fn dang_post(s: &mut Store, channel: &str, body: &str, ts: i64) -> Event {
+    post_by(s, "dang", AuthorKind::Human, channel, body, ts)
+}
+
+fn strings(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
+fn unread_bodies(s: &Store, handle: &str, limit: usize) -> Vec<String> {
+    let unread = s.unread(handle, limit).unwrap();
+    unread.posts.into_iter().map(|p| p.body).collect()
+}
+
+/// Every shown post, in display order.
+fn every_post(s: &Store) -> Vec<PostRow> {
+    s.posts(&PostQuery {
+        limit: 1_000,
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+#[test]
+fn unread_relevance() {
+    let (mut a, _) = pair();
+    let me = "pc-configs";
+    a.set_joins(me, &strings(&["beacon"])).unwrap();
+    agent_post(&mut a, "mac-agent", "beacon", "agent in beacon", 1_000);
+    agent_post(&mut a, "mac-agent", "vllm", "agent in vllm", 2_000);
+    dang_post(&mut a, "vllm", "dang in vllm", 3_000);
+    agent_post(&mut a, "mac-agent", "vllm", "psst @pc-configs", 4_000);
+    agent_post(&mut a, me, "beacon", "my own post", 5_000);
+    agent_post(&mut a, "mac-agent", "configs", "@all heads up", 6_000);
+
+    let unread = a.unread(me, 50).unwrap();
+    let bodies: Vec<&str> = unread.posts.iter().map(|p| p.body.as_str()).collect();
+    assert_eq!(
+        bodies,
+        [
+            "dang in vllm",
+            "agent in beacon",
+            "psst @pc-configs",
+            "@all heads up"
+        ]
+    );
+    assert_eq!(unread.remaining, 0);
+
+    // Another handle has its own joins: no `beacon`, no mention.
+    assert_eq!(
+        unread_bodies(&a, "someone", 50),
+        ["dang in vllm", "@all heads up"]
+    );
+    // The announcement's author never gets his own post back.
+    assert_eq!(unread_bodies(&a, "dang", 50), ["@all heads up"]);
+}
+
+#[test]
+fn relevance_ignores_handle_case() {
+    let (mut a, _) = pair();
+    a.set_joins("PC-Configs", &strings(&["beacon"])).unwrap();
+    agent_post(
+        &mut a,
+        "pc-configs",
+        "beacon",
+        "own post, other case",
+        1_000,
+    );
+    agent_post(&mut a, "mac-agent", "beacon", "joined", 2_000);
+    agent_post(&mut a, "mac-agent", "vllm", "hi @Pc-Configs", 3_000);
+    for handle in ["pc-configs", "PC-CONFIGS", "Pc-Configs"] {
+        assert_eq!(
+            unread_bodies(&a, handle, 50),
+            ["joined", "hi @Pc-Configs"],
+            "{handle}"
+        );
+    }
+
+    // One handle, one cursor, whichever way it is spelled.
+    let shown = a.unread("pc-configs", 50).unwrap().posts;
+    a.mark_read("pc-configs", &shown).unwrap();
+    assert!(a.unread("PC-CONFIGS", 50).unwrap().posts.is_empty());
+    assert_eq!(a.cursors("Pc-Configs").unwrap().len(), 2);
+}
+
+/// `unread` selects in SQL; `is_relevant` is the rule it must agree with.
+#[test]
+fn unread_agrees_with_is_relevant() {
+    let (mut a, _) = pair();
+    let mut ts = 0;
+    for author in ["pc-configs", "PC-CONFIGS", "mac-agent"] {
+        for channel in ["beacon", "vllm"] {
+            for body in ["plain", "to @pc-configs", "to @all", "to @someone-else"] {
+                ts += 1;
+                agent_post(&mut a, author, channel, body, ts);
+            }
+        }
+    }
+    for channel in ["beacon", "vllm"] {
+        for body in ["plain", "to @pc-configs", "to @all"] {
+            ts += 1;
+            dang_post(&mut a, channel, body, ts);
+        }
+    }
+    let every = every_post(&a);
+
+    let cases: [(&str, &[&str]); 5] = [
+        ("pc-configs", &["beacon"]),
+        ("dang", &["vllm"]),
+        ("mac-agent", &["beacon", "vllm"]),
+        ("PC-Configs", &[]),
+        ("nobody", &["general"]),
+    ];
+    for (handle, joined) in cases {
+        a.set_joins(handle, &strings(joined)).unwrap();
+        let joins = a.joins(handle).unwrap();
+        let want: Vec<&PostRow> = every
+            .iter()
+            .filter(|p| a.is_relevant(p, handle, &joins))
+            .collect();
+        assert!(
+            !want.is_empty() && want.len() < every.len(),
+            "{handle}: the cases should split the posts"
+        );
+
+        let mut want_ids: Vec<&str> = want.iter().map(|p| p.id.as_str()).collect();
+        let unread = a.unread(handle, 1_000).unwrap();
+        let mut got_ids: Vec<&str> = unread.posts.iter().map(|p| p.id.as_str()).collect();
+        want_ids.sort_unstable();
+        got_ids.sort_unstable();
+        assert_eq!(got_ids, want_ids, "{handle}");
+
+        let mut want_counts = std::collections::BTreeMap::new();
+        for p in &want {
+            *want_counts.entry(p.channel.clone()).or_insert(0u32) += 1;
+        }
+        assert_eq!(a.unread_counts(handle).unwrap(), want_counts, "{handle}");
+    }
+}
+
+#[test]
+fn mark_read_advances_and_limits() {
+    let (mut a, _) = pair();
+    let me = "pc-configs";
+    a.set_joins(me, &strings(&["beacon"])).unwrap();
+    agent_post(&mut a, "mac-agent", "beacon", "b1", 1_000);
+    agent_post(&mut a, "mac-agent", "vllm", "v1 @pc-configs", 2_000);
+    agent_post(&mut a, "mac-agent", "beacon", "b2", 3_000);
+    agent_post(&mut a, "mac-agent", "vllm", "v2 @pc-configs", 4_000);
+    agent_post(&mut a, "mac-agent", "beacon", "b3", 5_000);
+    let counts =
+        |s: &Store| -> Vec<(String, u32)> { s.unread_counts(me).unwrap().into_iter().collect() };
+    assert_eq!(counts(&a), [("beacon".into(), 3), ("vllm".into(), 2)]);
+
+    let first = a.unread(me, 2).unwrap();
+    let bodies: Vec<&str> = first.posts.iter().map(|p| p.body.as_str()).collect();
+    assert_eq!(bodies, ["b1", "v1 @pc-configs"]);
+    assert_eq!(first.remaining, 3);
+    // Asking again without reading changes nothing.
+    assert_eq!(a.unread(me, 2).unwrap(), first);
+
+    a.mark_read(me, &first.posts).unwrap();
+    let cursors = a.cursors(me).unwrap();
+    assert_eq!(cursors["beacon"], first.posts[0].arrival);
+    assert_eq!(cursors["vllm"], first.posts[1].arrival);
+    assert_eq!(counts(&a), [("beacon".into(), 2), ("vllm".into(), 1)]);
+
+    let rest = a.unread(me, 50).unwrap();
+    let bodies: Vec<&str> = rest.posts.iter().map(|p| p.body.as_str()).collect();
+    assert_eq!(bodies, ["b2", "v2 @pc-configs", "b3"]);
+    assert_eq!(rest.remaining, 0);
+    a.mark_read(me, &rest.posts).unwrap();
+    assert!(a.unread(me, 50).unwrap().posts.is_empty());
+    assert!(a.unread_counts(me).unwrap().is_empty());
+
+    // Nothing shown, nothing to do.
+    a.mark_read(me, &[]).unwrap();
+}
+
+#[test]
+fn reading_one_channel_leaves_the_others_unread() {
+    let (mut a, _) = pair();
+    let me = "reader";
+    a.set_joins(me, &strings(&["beacon", "vllm"])).unwrap();
+    agent_post(&mut a, "mac-agent", "beacon", "in beacon", 1_000);
+    agent_post(&mut a, "mac-agent", "vllm", "in vllm", 2_000);
+    let both = a.unread(me, 50).unwrap().posts;
+
+    a.mark_read(me, &both[..1]).unwrap();
+    assert_eq!(
+        a.cursors(me).unwrap().keys().collect::<Vec<_>>(),
+        ["beacon"]
+    );
+    assert_eq!(unread_bodies(&a, me, 50), ["in vllm"]);
+    // Other handles keep their own cursors.
+    assert_eq!(unread_bodies(&a, "someone-else", 50), Vec::<String>::new());
+    a.set_joins("someone-else", &strings(&["beacon"])).unwrap();
+    assert_eq!(unread_bodies(&a, "someone-else", 50), ["in beacon"]);
+}
+
+#[test]
+fn unread_limit_edges() {
+    let (mut a, _) = pair();
+    a.set_joins("h", &strings(&["beacon"])).unwrap();
+    for n in 1..=3 {
+        agent_post(&mut a, "mac-agent", "beacon", &format!("p{n}"), n * 1_000);
+    }
+    let shape = |limit| {
+        let u = a.unread("h", limit).unwrap();
+        (u.posts.len(), u.remaining)
+    };
+    assert_eq!(shape(0), (0, 3));
+    assert_eq!(shape(1), (1, 2));
+    assert_eq!(shape(2), (2, 1));
+    assert_eq!(shape(3), (3, 0));
+    assert_eq!(shape(4), (3, 0));
+    assert_eq!(shape(usize::MAX), (3, 0));
+}
+
+#[test]
+fn unread_takes_lowest_arrivals_then_orders_announcements_first() {
+    let (mut a, _) = pair();
+    let me = "reader";
+    a.set_joins(me, &strings(&["beacon"])).unwrap();
+    // Arrival order is p1 p2 p3 p4; ts order is p2 p3 p1 p4.
+    agent_post(&mut a, "mac-agent", "beacon", "p1", 300);
+    agent_post(&mut a, "mac-agent", "beacon", "p2", 100);
+    dang_post(&mut a, "vllm", "announcement", 200);
+    agent_post(&mut a, "mac-agent", "beacon", "p4", 400);
+
+    // The two lowest arrivals are p1 and p2: shown by ts, and the
+    // announcement (third to arrive) waits for the next page.
+    let page = a.unread(me, 2).unwrap();
+    let bodies: Vec<&str> = page.posts.iter().map(|p| p.body.as_str()).collect();
+    assert_eq!(bodies, ["p2", "p1"]);
+    assert_eq!(page.remaining, 2);
+
+    // Three: announcements first, then the rest by ts.
+    let page = a.unread(me, 3).unwrap();
+    let bodies: Vec<&str> = page.posts.iter().map(|p| p.body.as_str()).collect();
+    assert_eq!(bodies, ["announcement", "p2", "p1"]);
+    assert_eq!(page.remaining, 1);
+
+    assert_eq!(
+        unread_bodies(&a, me, 50),
+        ["announcement", "p2", "p1", "p4"]
+    );
+}
+
+#[test]
+fn unread_ties_on_ts_break_by_id() {
+    let (mut a, _) = pair();
+    a.set_joins("reader", &strings(&["beacon"])).unwrap();
+    // Same ts and same origin; the higher id arrives first.
+    for (seq, id) in [
+        (1, "01JDB7K4TR0000000000000002"),
+        (2, "01JDB7K4TR0000000000000001"),
+    ] {
+        let mut p = new_post("evil", "beacon", id);
+        p.post_id = id.into();
+        let ev = Event {
+            origin: "evil~abcdefgh".into(),
+            seq,
+            id: id.into(),
+            ts: 700,
+            kind: EventKind::PostCreated(p),
+        };
+        assert!(a.apply(&ev).unwrap().is_some());
+    }
+    let posts = a.unread("reader", 50).unwrap().posts;
+    assert!(
+        posts[0].arrival > posts[1].arrival,
+        "arrival order is the reverse"
+    );
+    let ids: Vec<&str> = posts.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["01JDB7K4TR0000000000000001", "01JDB7K4TR0000000000000002"]
+    );
+}
+
+#[test]
+fn unread_includes_late_arriving_old_post() {
+    let (mut a, mut b) = pair();
+    let me = "reader";
+    a.set_joins(me, &strings(&["beacon"])).unwrap();
+    agent_post(&mut a, "pc-agent", "beacon", "first", 10_000);
+    agent_post(&mut a, "pc-agent", "beacon", "second", 11_000);
+    let seen = a.unread(me, 50).unwrap();
+    assert_eq!(seen.posts.len(), 2);
+    a.mark_read(me, &seen.posts).unwrap();
+    assert!(a.unread(me, 50).unwrap().posts.is_empty());
+
+    // The mac wrote this offline, hours before everything above, and syncs now.
+    post(&mut b, "mac", "beacon", "written offline", 5_000);
+    sync(&mut a, &mut b);
+
+    let late = a.unread(me, 50).unwrap();
+    let bodies: Vec<&str> = late.posts.iter().map(|p| p.body.as_str()).collect();
+    assert_eq!(bodies, ["written offline"]);
+    assert!(
+        late.posts[0].ts < seen.posts[0].ts,
+        "its ts is older than all"
+    );
+    assert_eq!(late.remaining, 0);
+    assert_eq!(a.unread_counts(me).unwrap()["beacon"], 1);
+
+    a.mark_read(me, &late.posts).unwrap();
+    assert!(a.unread(me, 50).unwrap().posts.is_empty());
+}
+
+#[test]
+fn unread_skips_deleted_posts_and_hidden_channels() {
+    let (mut a, _) = pair();
+    let me = "reader";
+    a.set_joins(me, &strings(&["beacon", "vllm"])).unwrap();
+    let gone = agent_post(&mut a, "mac-agent", "beacon", "deleted", 1_000);
+    agent_post(&mut a, "mac-agent", "beacon", "kept", 2_000);
+    agent_post(
+        &mut a,
+        "mac-agent",
+        "vllm",
+        "hidden with its channel",
+        3_000,
+    );
+    dang_post(&mut a, "vllm", "so is the announcement", 4_000);
+    delete_post(&mut a, &gone, 5_000);
+    delete_channel(&mut a, "vllm", 6_000);
+
+    assert_eq!(unread_bodies(&a, me, 50), ["kept"]);
+    assert_eq!(a.unread(me, 50).unwrap().remaining, 0);
+    assert_eq!(
+        a.unread_counts(me).unwrap().into_iter().collect::<Vec<_>>(),
+        [("beacon".to_string(), 1)]
+    );
+}
+
+#[test]
+fn cursor_never_moves_backwards() {
+    let (mut a, _) = pair();
+    let me = "reader";
+    a.set_cursor(me, "beacon", 10).unwrap();
+    a.set_cursor(me, "beacon", 4).unwrap();
+    assert_eq!(a.cursors(me).unwrap()["beacon"], 10);
+    a.set_cursor(me, "beacon", 10).unwrap();
+    a.set_cursor(me, "beacon", 12).unwrap();
+    assert_eq!(a.cursors(me).unwrap()["beacon"], 12);
+    // A cursor is an arrival: 0 is the floor, the same as having none.
+    a.set_cursor(me, "vllm", -3).unwrap();
+    assert_eq!(a.cursors(me).unwrap()["vllm"], 0);
+    // Channels and handles are independent; a `#` or capital is normalized.
+    a.set_cursor(me, "#Beacon", 5).unwrap();
+    a.set_cursor("other", "beacon", 1).unwrap();
+    assert_eq!(
+        a.cursors(me).unwrap(),
+        [("beacon".to_string(), 12), ("vllm".to_string(), 0)].into()
+    );
+    assert_eq!(
+        a.cursors("other").unwrap(),
+        [("beacon".to_string(), 1)].into()
+    );
+    assert!(matches!(
+        a.set_cursor(me, "not a channel", 1),
+        Err(Error::Usage(_))
+    ));
+
+    // Reading older posts later does not bring newer ones back.
+    a.set_joins("h", &strings(&["beacon"])).unwrap();
+    agent_post(&mut a, "mac-agent", "beacon", "older", 1_000);
+    agent_post(&mut a, "mac-agent", "beacon", "newer", 2_000);
+    let both = a.unread("h", 50).unwrap().posts;
+    a.mark_read("h", &both[1..]).unwrap();
+    a.mark_read("h", &both[..1]).unwrap();
+    assert_eq!(a.cursors("h").unwrap()["beacon"], both[1].arrival);
+    assert!(a.unread("h", 50).unwrap().posts.is_empty());
+    a.set_cursor("h", "beacon", 0).unwrap();
+    assert!(a.unread("h", 50).unwrap().posts.is_empty());
+}
+
+#[test]
+fn joins_roundtrip() {
+    let (mut a, _) = pair();
+    assert_eq!(a.joins("h").unwrap(), Vec::<String>::new());
+
+    // A set, listed by name.
+    a.set_joins("h", &strings(&["vllm", "beacon", "vllm"]))
+        .unwrap();
+    assert_eq!(a.joins("h").unwrap(), ["beacon", "vllm"]);
+    // Per handle, and a handle's case does not matter.
+    assert_eq!(a.joins("other").unwrap(), Vec::<String>::new());
+    assert_eq!(a.joins("H").unwrap(), ["beacon", "vllm"]);
+
+    // Replaces the whole list; names are normalized like any channel name.
+    a.set_joins("h", &strings(&["#Configs"])).unwrap();
+    assert_eq!(a.joins("h").unwrap(), ["configs"]);
+
+    // A bad name is refused and changes nothing.
+    assert!(matches!(
+        a.set_joins("h", &strings(&["beacon", "not a channel"])),
+        Err(Error::Usage(_))
+    ));
+    assert_eq!(a.joins("h").unwrap(), ["configs"]);
+
+    // A channel can be joined before it exists.
+    assert!(a.channel("configs").unwrap().is_none());
+
+    a.set_joins("h", &[]).unwrap();
+    assert_eq!(a.joins("h").unwrap(), Vec::<String>::new());
+}
+
+#[test]
+fn cursors_and_joins_are_local_only() {
+    let (mut a, mut b) = pair();
+    agent_post(&mut b, "mac-agent", "beacon", "hello", 1_000);
+    sync(&mut a, &mut b);
+    let head = a.arrival_head();
+    let have = a.version_vector();
+
+    a.set_joins("h", &strings(&["beacon"])).unwrap();
+    let shown = a.unread("h", 50).unwrap().posts;
+    assert_eq!(shown.len(), 1);
+    a.mark_read("h", &shown).unwrap();
+    a.set_cursor("h", "vllm", 3).unwrap();
+
+    // No event was made, so there is nothing to sync.
+    assert_eq!(a.arrival_head(), head);
+    assert_eq!(a.version_vector(), have);
+    sync(&mut a, &mut b);
+    assert!(b.joins("h").unwrap().is_empty());
+    assert!(b.cursors("h").unwrap().is_empty());
+}
+
+#[test]
+fn cursors_and_joins_persist_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("beacon.db");
+    let mut a = Store::open(&path, "pc").unwrap();
+    a.set_joins("h", &strings(&["beacon"])).unwrap();
+    agent_post(&mut a, "mac-agent", "beacon", "one", 1_000);
+    agent_post(&mut a, "mac-agent", "beacon", "two", 2_000);
+    let first = a.unread("h", 1).unwrap();
+    assert_eq!(first.remaining, 1);
+    a.mark_read("h", &first.posts).unwrap();
+    drop(a);
+
+    let a = Store::open(&path, "pc").unwrap();
+    assert_eq!(a.joins("h").unwrap(), ["beacon"]);
+    assert_eq!(unread_bodies(&a, "h", 50), ["two"]);
+}

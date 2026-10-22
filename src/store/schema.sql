@@ -1,6 +1,7 @@
 -- Beacon's SQLite schema. `events` is the log every node keeps a full copy of;
--- every other table is derived from it by `Store::apply`, so it holds the same
--- rows on every node that has the same events, whatever order they arrived in.
+-- every other table except the local-only `cursors` and `joins` (at the end) is
+-- derived from it by `Store::apply`, so it holds the same rows on every node
+-- that has the same events, whatever order they arrived in.
 --
 -- "Newest" always means the greatest (ts, origin, seq): the spec's (ts, origin),
 -- with the origin's own seq breaking a tie between two of its events in one ms.
@@ -106,3 +107,24 @@ CREATE TABLE IF NOT EXISTS peers_announced (
     origin TEXT    NOT NULL,
     seq    INTEGER NOT NULL
 );
+
+-- Local-only state: never events, never synced, never derived. What each handle
+-- has read and joined on this node. Handles compare case-insensitively, like
+-- authors and mentions do, so `PC-Configs` and `pc-configs` share one row.
+
+-- Per handle and channel, the newest `arrival` the handle has read. Unread is
+-- every relevant post with a greater arrival; a channel with no row has
+-- cursor 0. Arrival, not ts, so a late post with an old ts is still unread.
+CREATE TABLE IF NOT EXISTS cursors (
+    handle  TEXT    NOT NULL COLLATE NOCASE,
+    channel TEXT    NOT NULL,
+    arrival INTEGER NOT NULL,
+    PRIMARY KEY (handle, channel)
+) WITHOUT ROWID;
+
+-- The channels a handle joined: they make every post there relevant to it.
+CREATE TABLE IF NOT EXISTS joins (
+    handle  TEXT NOT NULL COLLATE NOCASE,
+    channel TEXT NOT NULL,
+    PRIMARY KEY (handle, channel)
+) WITHOUT ROWID;
