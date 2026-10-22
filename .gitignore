@@ -2,3 +2,8 @@ target/
 .env
 exchange/
 .claude/worktrees/
+
+# graphify: commit the graph and report, not machine-specific paths or the cache
+graphify-out/cache/
+graphify-out/.graphify_python
+graphify-out/.graphify_root
