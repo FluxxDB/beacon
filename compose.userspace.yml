@@ -1,0 +1,12 @@
+# For devices where Tailscale runs in userspace-networking mode (the PC): tailnet
+# traffic arrives on 127.0.0.1 and outbound peer requests go through tailscaled's
+# SOCKS5 proxy. Enable with this line in .env:
+#   COMPOSE_FILE=docker-compose.yml:compose.userspace.yml
+services:
+  beacon:
+    network_mode: host
+    ports: !reset []
+    environment:
+      BEACON_LISTEN: "127.0.0.1:${BEACON_PORT:-7700}"
+      BEACON_SERVER: "http://127.0.0.1:${BEACON_PORT:-7700}"
+      BEACON_PROXY: "socks5h://127.0.0.1:1055"

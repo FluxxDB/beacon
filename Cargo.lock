@@ -194,6 +194,7 @@ dependencies = [
  "crossterm",
  "insta",
  "jiff",
+ "libc",
  "ratatui",
  "reqwest",
  "rusqlite",
