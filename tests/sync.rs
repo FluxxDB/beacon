@@ -5,12 +5,20 @@
 mod common;
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use beacon::api::{Delivery, PeerJson, PostCreated, StatusJson, StreamEvent};
+use axum::extract::{Query, State};
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::Json;
+use beacon::api::{
+    Delivery, EventsResponse, PeerJson, PostCreated, PushRequest, PushResponse, StatusJson,
+    StreamEvent,
+};
 use beacon::config::Config;
-use beacon::model::{AuthorKind, EventKind, NewPost, VersionVector};
+use beacon::model::{parse_vv, AuthorKind, Event, EventKind, NewPost, VersionVector};
 use beacon::sync::normalize_peer_url;
 use common::*;
 use reqwest::multipart::{Form, Part};
@@ -851,6 +859,348 @@ async fn every_peer_request_goes_through_the_proxy() {
     assert!(!seen.is_empty());
     let want = format!("name:beacon-b.invalid:{port}");
     assert!(seen.iter().all(|s| *s == want), "{seen:?}");
+}
+
+// --------------------------------------------------------- a scripted peer
+
+/// A peer whose answers a test controls, to put a node in states real peers
+/// reach only by accident (a wiped database, a URL that changes hands, a
+/// slow link).
+#[derive(Default)]
+struct Fake {
+    /// The name it answers with.
+    node: String,
+    /// Its own events, served to pulls above the caller's `after`.
+    own: Vec<Event>,
+    /// What it holds of the events pushed to it, gap-free per origin.
+    held: VersionVector,
+    /// If set, pulls answer this as its `have` instead of the truth.
+    claimed: Option<VersionVector>,
+    /// If set, a push stores at most this many events.
+    take_per_push: Option<usize>,
+    /// How long a push takes to answer.
+    push_delay: Duration,
+    /// Every push it got: the (origin, seq) of each event.
+    pushes: Vec<Vec<(String, u64)>>,
+}
+
+impl Fake {
+    fn named(node: &str) -> Fake {
+        Fake {
+            node: node.into(),
+            ..Fake::default()
+        }
+    }
+
+    fn have(&self) -> VersionVector {
+        let mut have = self.held.clone();
+        if let Some(first) = self.own.first() {
+            have.insert(first.origin.clone(), self.own.len() as u64);
+        }
+        have
+    }
+}
+
+type Script = Arc<Mutex<Fake>>;
+
+/// Serves `fake` as a peer; returns its URL and the handle to script it.
+async fn fake_peer(fake: Fake) -> (String, Script) {
+    let script = Arc::new(Mutex::new(fake));
+    let app = axum::Router::new()
+        .route("/api/events", get(fake_pull).post(fake_push))
+        .with_state(Arc::clone(&script));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (url, script)
+}
+
+#[derive(serde::Deserialize)]
+struct PullParams {
+    after: Option<String>,
+}
+
+async fn fake_pull(State(script): State<Script>, Query(q): Query<PullParams>) -> impl IntoResponse {
+    // A short long poll, so the node's puller does not spin.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after = parse_vv(q.after.as_deref().unwrap_or("")).unwrap();
+    let fake = script.lock().unwrap();
+    let events: Vec<Event> = fake
+        .own
+        .iter()
+        .filter(|e| e.seq > after.get(&e.origin).copied().unwrap_or(0))
+        .cloned()
+        .collect();
+    let page = EventsResponse {
+        v: 1,
+        events,
+        have: fake.claimed.clone().unwrap_or_else(|| fake.have()),
+        head: 1,
+        more: false,
+    };
+    ([("x-beacon-node", fake.node.clone())], Json(page))
+}
+
+async fn fake_push(
+    State(script): State<Script>,
+    Json(req): Json<PushRequest>,
+) -> impl IntoResponse {
+    let delay = script.lock().unwrap().push_delay;
+    tokio::time::sleep(delay).await;
+    let mut fake = script.lock().unwrap();
+    fake.pushes.push(
+        req.events
+            .iter()
+            .map(|e| (e.origin.clone(), e.seq))
+            .collect(),
+    );
+    let limit = fake.take_per_push.unwrap_or(usize::MAX);
+    let mut applied = 0;
+    for e in &req.events {
+        if applied >= limit {
+            break;
+        }
+        let held = fake.held.get(&e.origin).copied().unwrap_or(0);
+        if e.seq == held + 1 {
+            fake.held.insert(e.origin.clone(), e.seq);
+            applied += 1;
+        }
+    }
+    let answer = PushResponse {
+        v: 1,
+        applied: applied as u64,
+        have: fake.have(),
+    };
+    ([("x-beacon-node", fake.node.clone())], Json(answer))
+}
+
+/// How many pushes `script` has received.
+fn pushes(script: &Script) -> usize {
+    script.lock().unwrap().pushes.len()
+}
+
+/// The origin of `node`'s own events (its database).
+async fn own_origin(node: &TestNode) -> String {
+    let have = version_vector(node).await;
+    let prefix = format!("{}~", node.name);
+    have.into_keys().find(|o| o.starts_with(&prefix)).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_now_trusts_the_peers_own_answer() {
+    // A peer whose pulls claim more than it holds (as a peer whose database
+    // was wiped can, until we notice): it says it has our first event, takes
+    // no pushes yet, and in fact holds nothing.
+    let mut fake = Fake::named("fake");
+    fake.take_per_push = Some(0);
+    let (url, script) = fake_peer(fake).await;
+    let a = spawn_node_with("a", &[url.as_str()], quick).await;
+    let origin = own_origin(&a).await;
+    script.lock().unwrap().claimed = Some([(origin.clone(), 1)].into());
+    eventually(5, "a to believe the claim", || async {
+        peer(&a, "fake")
+            .await
+            .is_some_and(|p| p.reachable && p.queued == 0)
+    })
+    .await;
+    assert_eq!(script.lock().unwrap().held, VersionVector::new());
+
+    // Now it takes pushes, but our view of it is ahead of the truth.
+    script.lock().unwrap().take_per_push = None;
+    let before = pushes(&script);
+    let started = Instant::now();
+    let created = post(&a, "beacon", "is it there").await;
+    let took = started.elapsed();
+    assert_eq!(
+        created.delivery,
+        [Delivery {
+            node: "fake".into(),
+            delivered: true
+        }],
+        "{took:?}"
+    );
+    assert!(took < Duration::from_secs(1), "{took:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let sent = pushes(&script) - before;
+    assert!(sent <= 8, "{sent} pushes for one post");
+    assert!(peer(&a, "fake").await.unwrap().reachable);
+    let held = script.lock().unwrap().held.get(&origin).copied();
+    assert_eq!(held, version_vector(&a).await.get(&origin).copied());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_url_that_answers_as_another_node_starts_over() {
+    let (url, script) = fake_peer(Fake::named("x")).await;
+    let a = spawn_node_with("a", &[url.as_str()], quick).await;
+    let origin = own_origin(&a).await;
+    eventually(5, "x to hold a's events", || async {
+        let held = script.lock().unwrap().held.get(&origin).copied();
+        held == Some(1) && peer(&a, "x").await.is_some_and(|p| p.queued == 0)
+    })
+    .await;
+
+    // Another node, with an empty database, takes over the address.
+    {
+        let mut fake = script.lock().unwrap();
+        fake.node = "y".into();
+        fake.held = VersionVector::new();
+    }
+    // What a knew of x says nothing about y: y is sent everything.
+    eventually(5, "y to be sent a's events", || async {
+        let held = script.lock().unwrap().held.get(&origin).copied();
+        let list = peers(&a).await;
+        held == Some(1)
+            && list.len() == 1
+            && list[0].node.as_deref() == Some("y")
+            && list[0].queued == 0
+    })
+    .await;
+
+    let before = pushes(&script);
+    let created = post(&a, "beacon", "hello y").await;
+    assert_eq!(
+        created.delivery,
+        [Delivery {
+            node: "y".into(),
+            delivered: true
+        }]
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let sent = pushes(&script) - before;
+    assert!(sent <= 8, "{sent} pushes for one post");
+    assert!(peer(&a, "y").await.unwrap().reachable);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pulled_events_are_not_pushed_back() {
+    let (url, script) = fake_peer(Fake::named("fakeb")).await;
+    let a = spawn_node_with("a", &[url.as_str()], quick).await;
+    eventually(5, "a to reach fakeb", || async {
+        reaches(&a, "fakeb").await
+    })
+    .await;
+
+    // fakeb writes a burst, which a pulls.
+    let origin = "fakeb~bbbbbbbb";
+    let burst: Vec<Event> = (1..=20)
+        .map(|seq| {
+            let mut ev = foreign(seq, &format!("burst {seq}"));
+            ev.origin = origin.into();
+            if let EventKind::PostCreated(post) = &mut ev.kind {
+                post.node = "fakeb".into();
+            }
+            ev
+        })
+        .collect();
+    script.lock().unwrap().own = burst;
+    eventually(5, "a to pull the burst", || async {
+        version_vector(&a).await.get(origin) == Some(&20)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let echoed: Vec<(String, u64)> = script
+        .lock()
+        .unwrap()
+        .pushes
+        .iter()
+        .flatten()
+        .filter(|(o, _)| o == origin)
+        .cloned()
+        .collect();
+    assert!(echoed.is_empty(), "pushed back to fakeb: {echoed:?}");
+}
+
+/// A peer that takes connections and, once told to, never answers them.
+async fn black_hole() -> (String, Arc<AtomicBool>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let silent = Arc::new(AtomicBool::new(false));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (quiet, count) = (Arc::clone(&silent), Arc::clone(&accepted));
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            count.fetch_add(1, Ordering::SeqCst);
+            if quiet.load(Ordering::SeqCst) {
+                held.push(socket); // never answered
+            } // else dropped: the request fails at once
+        }
+    });
+    (url, silent, accepted)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_now_skips_a_peer_that_is_backing_off() {
+    let (url, silent, accepted) = black_hole().await;
+    let a = spawn_node_with("a", &[url.as_str()], |cfg| {
+        quick(cfg);
+        // Long enough that the peer is still being waited out when we post.
+        cfg.sync_base_backoff = Duration::from_secs(30);
+    })
+    .await;
+    // Its first answers fail at once, which starts the wait...
+    eventually(5, "a to try the peer", || async {
+        accepted.load(Ordering::SeqCst) >= 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // ...and from now on dialling it would hang until the 2 s budget runs out.
+    silent.store(true, Ordering::SeqCst);
+
+    let started = Instant::now();
+    let created = post(&a, "beacon", "not now").await;
+    let took = started.elapsed();
+    assert_eq!(
+        created.delivery,
+        [Delivery {
+            node: url.clone(),
+            delivered: false
+        }]
+    );
+    assert!(took < Duration::from_millis(500), "{took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_push_that_progresses_keeps_the_peer_reachable() {
+    let mut fake = Fake::named("slow");
+    fake.take_per_push = Some(0);
+    let (url, script) = fake_peer(fake).await;
+    let a = spawn_node_with("a", &[url.as_str()], |cfg| {
+        quick(cfg);
+        // A failure would leave it unreachable for the rest of the test.
+        cfg.sync_base_backoff = Duration::from_secs(30);
+    })
+    .await;
+    eventually(5, "a to reach slow", || async { reaches(&a, "slow").await }).await;
+    // A backlog it takes one event of per push, 600 ms each: more than 2 s.
+    for i in 0..5 {
+        let kind = EventKind::ChannelCreated {
+            name: format!("backlog-{i}"),
+            topic: None,
+        };
+        a.state().commit(kind).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    {
+        let mut fake = script.lock().unwrap();
+        fake.take_per_push = Some(1);
+        fake.push_delay = Duration::from_millis(600);
+    }
+
+    let created = post(&a, "backlog-0", "at the back").await;
+    assert_eq!(
+        created.delivery,
+        [Delivery {
+            node: "slow".into(),
+            delivered: false
+        }]
+    );
+    let took_some = script.lock().unwrap().held.values().sum::<u64>();
+    assert!(took_some >= 2, "it took {took_some}");
+    // Not done within 2 s, but answering all along: still reachable.
+    assert!(peer(&a, "slow").await.unwrap().reachable);
 }
 
 // ------------------------------------------------------------------- urls

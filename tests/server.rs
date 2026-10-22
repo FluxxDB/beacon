@@ -2711,6 +2711,21 @@ async fn push_rejects_what_it_cannot_store() {
         .unwrap();
     expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
 
+    // So is an origin that is not `{node}~{db id}` (R26): it would break the
+    // `after=origin:seq,...` of every later pull.
+    for origin in ["mac,evil~abcd1234", "mac:1~abcd1234", "mac"] {
+        let bad = remote_event(origin, 1, EventKind::ChannelDeleted { name: "x".into() });
+        let resp = node
+            .post("/api/events")
+            .json(&json!({ "events": [bad] }))
+            .send()
+            .await
+            .unwrap();
+        expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+    }
+    let status = ok(node.get("/api/status").send().await.unwrap()).await;
+    assert_eq!(status["have"].as_object().unwrap().len(), 1, "{status}");
+
     // An event that breaks the rules is stored (so sync stays gap-free) and
     // counted as applied, but derives nothing and is not announced.
     let mut rx = node.state().arrivals.subscribe();

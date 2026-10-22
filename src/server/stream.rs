@@ -218,8 +218,9 @@ fn events_wait(asked: Option<u64>) -> Duration {
 
 /// Events a peer pushes. Each one goes through [`AppState::ingest`], which
 /// stores it, announces it if it is valid and wakes sync (so a post relays
-/// onward). One that cannot be stored at all (a seq SQLite cannot hold)
-/// fails the request; those before it stay applied, and sending the batch
+/// onward). One that cannot be stored at all (a seq SQLite cannot hold, an
+/// origin that is not `{node}~{db_id}`) fails the request with 400; those
+/// before it stay applied, and sending the batch
 /// again is harmless. Sync is told the sender holds them, so they are not
 /// pushed straight back to it.
 async fn push_events(

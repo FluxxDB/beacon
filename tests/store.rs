@@ -177,6 +177,32 @@ fn apply_is_atomic() {
 }
 
 #[test]
+fn apply_refuses_a_malformed_origin() {
+    let mut a = Store::open_in_memory("pc").unwrap();
+    let mut b = Store::open_in_memory("mac").unwrap();
+    let good = post(&mut b, "mac", "general", "hello", 10);
+    let before = (a.version_vector(), a.arrival_head());
+    // A `,` or `:` would break `origin:seq,origin:seq`; the rest is not the
+    // `{node}~{8 base32}` a store makes.
+    for origin in [
+        "mac,x~abcd1234",
+        "mac:1~abcd1234",
+        "mac",
+        "mac~ABCD1234",
+        "",
+    ] {
+        let mut ev = good.clone();
+        ev.origin = origin.into();
+        match a.apply(&ev) {
+            Err(Error::Usage(_)) => {}
+            other => panic!("origin {origin:?}: expected a usage error, got {other:?}"),
+        }
+    }
+    assert_eq!((a.version_vector(), a.arrival_head()), before);
+    assert!(a.apply(&good).unwrap().is_some());
+}
+
+#[test]
 fn order_independent() {
     let (mut a, mut b) = pair();
     create(&mut a, "builds", Some("ci"), 10);

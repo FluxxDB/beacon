@@ -37,7 +37,8 @@ pub use unread::Unread;
 
 use crate::error::Error;
 use crate::model::{
-    validate_event, Attachment, AuthorKind, Event, EventKind, NewPost, Presence, VersionVector,
+    validate_event, validate_origin, Attachment, AuthorKind, Event, EventKind, NewPost, Presence,
+    VersionVector,
 };
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -277,7 +278,10 @@ impl Store {
     /// An event whose payload breaks [`validate_event`] is still stored (so
     /// version vectors stay gap-free and it relays) and returned, but changes
     /// no derived state; code that renders events should read derived state or
-    /// check it too. A seq above `i64::MAX` cannot be stored: [`Error::Usage`].
+    /// check it too. Two things make an event impossible to store at all, and
+    /// are [`Error::Usage`] with nothing stored: a seq above `i64::MAX`, and an
+    /// origin that is not `{node}~{db_id}` ([`validate_origin`]), which would
+    /// break every version vector it appeared in.
     pub fn apply(&mut self, ev: &Event) -> Result<Option<Applied>> {
         if i64::try_from(ev.seq).is_err() {
             return Err(Error::Usage(format!(
@@ -285,6 +289,7 @@ impl Store {
                 ev.origin, ev.seq
             )));
         }
+        validate_origin(&ev.origin)?;
         let invalid = validate_event(ev).err();
         let json = serde_json::to_string(ev).map_err(anyhow::Error::from)?;
         let tx = self.conn.transaction()?;

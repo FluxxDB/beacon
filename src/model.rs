@@ -293,7 +293,7 @@ pub fn format_vv(vv: &VersionVector) -> String {
 
 /// Checks an event against the rules local input is held to: `seq` from 1 to
 /// `i64::MAX`; an origin shaped like the ones stores make (see
-/// [`check_origin`]); channel names already normalized; handles (authors,
+/// [`validate_origin`]); channel names already normalized; handles (authors,
 /// node names, tags, lowercase mentions) valid; at most [`TAGS_MAX`] tags; a
 /// body of at most [`BODY_MAX`] bytes; an attachment name of 1 to
 /// [`ATTACHMENT_NAME_MAX`] bytes, a size SQLite can store and a hash that is 64
@@ -312,7 +312,7 @@ pub fn validate_event(ev: &Event) -> Result<(), Error> {
             i64::MAX
         )));
     }
-    check_origin(&ev.origin)?;
+    validate_origin(&ev.origin)?;
     match &ev.kind {
         EventKind::ChannelCreated { name, topic } => {
             check_channel(name)?;
@@ -340,10 +340,12 @@ pub fn validate_event(ev: &Event) -> Result<(), Error> {
     }
 }
 
-/// An origin is `{node}~{db_id}`: a handle, then the 8 characters a store
-/// takes from the end of a ULID, lowercased (Crockford base32: digits and
-/// lowercase letters except `i`, `l`, `o` and `u`).
-fn check_origin(origin: &str) -> Result<(), Error> {
+/// Checks an event origin: `{node}~{db_id}`, a handle, then the 8
+/// characters a store takes from the end of a ULID, lowercased (Crockford
+/// base32: digits and lowercase letters except `i`, `l`, `o` and `u`). Nothing
+/// else may be stored: an origin holding `,` or `:` would break the
+/// `origin:seq,origin:seq` version vectors every pull sends.
+pub fn validate_origin(origin: &str) -> Result<(), Error> {
     let bad = || {
         Error::Usage(format!(
             "event origin {origin:?} is not {{node}}~{{{DB_ID_LEN}-character database id}}"

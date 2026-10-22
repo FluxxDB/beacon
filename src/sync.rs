@@ -18,7 +18,8 @@
 //! and sends the peer what its last known version vector lacks, in batches of
 //! 500 (`POST /api/events`). A post also goes out at once to every peer from
 //! the request that made it ([`SyncHandle::push_now`]), which is what reports
-//! delivery. Everything is idempotent, so all of these may overlap.
+//! delivery; a peer we are waiting out (below) is reported undelivered without
+//! being dialled. Everything is idempotent, so all of these may overlap.
 //!
 //! **When a peer is away.** A failed request marks the peer unreachable, and
 //! both of its tasks wait before the next try: 5 s, doubling, at most 2 min.
@@ -125,6 +126,28 @@ fn merge_vv(a: &mut VersionVector, b: &VersionVector) {
     for (origin, &seq) in b {
         let held = a.entry(origin.clone()).or_insert(0);
         *held = (*held).max(seq);
+    }
+}
+
+/// Raises `have` (what a peer holds, gap-free per origin) by `events`, which
+/// it is known to hold: each origin's seqs that continue it without a gap.
+fn raise_by(have: &mut VersionVector, events: &[Event]) {
+    let mut by_origin: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+    for ev in events {
+        by_origin.entry(&ev.origin).or_default().push(ev.seq);
+    }
+    for (origin, mut seqs) in by_origin {
+        seqs.sort_unstable();
+        let start = have.get(origin).copied().unwrap_or(0);
+        let mut held = start;
+        for seq in seqs {
+            if seq == held + 1 {
+                held = seq;
+            }
+        }
+        if held > start {
+            have.insert(origin.to_string(), held);
+        }
     }
 }
 
@@ -476,10 +499,18 @@ impl Table {
             .iter()
             .position(|p| p.id != id && p.node.as_deref() == Some(node));
         let Some(_) = other else {
-            if let Some(old) = &self.peers[i].node {
+            let peer = &mut self.peers[i];
+            if let Some(old) = &peer.node {
+                // Another node took over the address: what we knew of the
+                // old one says nothing about this one.
                 tracing::info!(%url, "sync: {url} answers as {node}, not {old}");
+                peer.their_have = None;
+                peer.their_head = None;
+                peer.since = 0;
+                peer.push_mark = None;
+                peer.wake();
             }
-            self.peers[i].node = Some(node.to_string());
+            peer.node = Some(node.to_string());
             return Learned::Same;
         };
         // Another peer already is that node: it takes these URLs, and uses
@@ -697,36 +728,22 @@ impl SyncHandle {
     /// version vector without a gap, that is what it has now, so the pusher
     /// does not send them back.
     pub fn received_from(&self, node: &str, events: &[Event]) {
-        let mut by_origin: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
-        for ev in events {
-            by_origin.entry(&ev.origin).or_default().push(ev.seq);
-        }
         let mut table = self.table();
-        let Some(peer) = table
+        let known = table
             .peers
             .iter_mut()
             .find(|p| p.node.as_deref() == Some(node))
-        else {
-            return;
-        };
-        let Some(have) = peer.their_have.as_mut() else {
-            return;
-        };
-        for (origin, mut seqs) in by_origin {
-            seqs.sort_unstable();
-            let held = have.entry(origin.to_string()).or_insert(0);
-            for seq in seqs {
-                if seq == *held + 1 {
-                    *held = seq;
-                }
-            }
+            .and_then(|p| p.their_have.as_mut());
+        if let Some(have) = known {
+            raise_by(have, events);
         }
     }
 
     /// Pushes the events each peer lacks, up to and including `ev` (just
     /// written here), to every peer at once, and reports who confirmed they
-    /// hold `ev`. Each peer gets 2 s; one that fails or does not answer in
-    /// time is marked unreachable, and `ev` stays queued for it.
+    /// hold `ev`. Each peer gets 2 s; one that fails, or does not answer at
+    /// all in that time, is marked unreachable, and `ev` stays queued for it.
+    /// A peer in a backoff wait is not dialled: undelivered at once (R25).
     pub async fn push_now(&self, ev: &Event) -> Vec<Delivery> {
         let targets: Vec<(PeerId, Arc<AsyncMutex<()>>)> = self
             .table()
@@ -748,13 +765,21 @@ impl SyncHandle {
         push_lock: Arc<AsyncMutex<()>>,
         ev: &Event,
     ) -> Option<Delivery> {
-        let deadline = tokio::time::Instant::now() + PUSH_NOW_TIMEOUT;
         let report = |delivered: bool| {
             self.with_peer(id, |p| Delivery {
                 node: p.label(),
                 delivered,
             })
         };
+        // A peer we are waiting out is not dialled (R25): the post would wait
+        // its whole 2 s on a machine that is most likely off. Its pusher,
+        // woken by this write, sends the post when the wait is over.
+        let waiting = self.with_peer(id, |p| !p.backoff.wait(Instant::now()).is_zero())?;
+        if waiting {
+            return report(false);
+        }
+        let started_ms = now_ms();
+        let deadline = tokio::time::Instant::now() + PUSH_NOW_TIMEOUT;
         // The pusher is sending to it: whatever it sends, we see after.
         let Ok(_turn) = tokio::time::timeout_at(deadline, push_lock.lock_owned()).await else {
             return report(false);
@@ -768,35 +793,58 @@ impl SyncHandle {
                 report(false)
             }
             Err(_) => {
-                self.failed(id, &url, &anyhow!("no answer within {PUSH_NOW_TIMEOUT:?}"));
+                // Out of time. A peer that has answered since we started
+                // (taking pages, or answering the pusher) is slow, not gone.
+                let answered = self
+                    .with_peer(id, |p| p.last_sync_ms.is_some_and(|ms| ms >= started_ms))
+                    .unwrap_or(false);
+                if !answered {
+                    self.failed(id, &url, &anyhow!("no answer within {PUSH_NOW_TIMEOUT:?}"));
+                }
                 report(false)
             }
         }
     }
 
     /// Sends peer `id` what it lacks until it holds `ev`. `Some(true)` when it
-    /// does, `Some(false)` when it stopped taking any more, `None` when it
-    /// is not a peer after all.
+    /// says it does, `Some(false)` when an answer showed no progress, `None`
+    /// when it is not a peer after all.
+    ///
+    /// The first batch is chosen from what we know of the peer (R13); every
+    /// later one from what the peer itself last answered. Our view of a peer
+    /// is only ever raised, so it can run ahead of the truth (a wiped database
+    /// not noticed yet): a batch chosen from it may lack what the peer needs,
+    /// and only the peer's own answer says what that is.
     async fn deliver(
         &self,
         id: PeerId,
         ev: &Event,
     ) -> Result<Option<bool>, (String, anyhow::Error)> {
+        // The peer's own last answer, in this delivery.
+        let mut told: Option<VersionVector> = None;
         loop {
-            let Some((url, have)) =
+            let Some((url, known)) =
                 self.with_peer(id, |p| (p.url().to_string(), p.their_have.clone()))
             else {
                 return Ok(None);
             };
-            let have = match have {
-                Some(have) => have,
-                None => {
+            let have = match (&told, known) {
+                (Some(told), _) => told.clone(),
+                // The pusher may have delivered it already.
+                (None, Some(known)) if covers(&known, &ev.origin, ev.seq) => {
+                    return Ok(Some(true));
+                }
+                (None, Some(known)) => known,
+                (None, None) => {
                     // Never heard from it: ask what it has before sending.
                     let (node, answer) = push(&self.inner.client, &url, &[], PUSH_NOW_TIMEOUT)
                         .await
                         .map_err(|e| (url.clone(), e))?;
                     match self.learned(id, &url, &node) {
-                        Learned::Same => self.pushed(id, &answer.have),
+                        Learned::Same => {
+                            self.pushed(id, &answer.have);
+                            told = Some(answer.have);
+                        }
                         Learned::Retry => {}
                         Learned::Gone => return Ok(None),
                     }
@@ -822,16 +870,25 @@ impl SyncHandle {
                 .map_err(|e| (url.clone(), e))?;
             match self.learned(id, &url, &node) {
                 Learned::Same => {}
-                Learned::Retry => continue,
+                Learned::Retry => {
+                    told = None;
+                    continue;
+                }
                 Learned::Gone => return Ok(None),
             }
             self.pushed(id, &answer.have);
             if covers(&answer.have, &ev.origin, ev.seq) {
                 return Ok(Some(true));
             }
-            if answer.have == have {
+            // Stop when its own word shows no progress since its last answer.
+            let total = |vv: &VersionVector| vv.values().fold(0u64, |t, &s| t.saturating_add(s));
+            if told
+                .as_ref()
+                .is_some_and(|t| total(&answer.have) <= total(t))
+            {
                 return Ok(Some(false));
             }
+            told = Some(answer.have);
         }
     }
 
@@ -876,9 +933,11 @@ impl SyncHandle {
         }
     }
 
-    /// A pull from peer `id` answered with its version vector `have` and
-    /// head `head`.
-    fn pulled(&self, id: PeerId, have: VersionVector, head: i64) {
+    /// A pull from peer `id` answered with `events`, its version vector
+    /// `have` and its head `head`. Called before the events are stored: it
+    /// holds them, so the pusher, woken by each one stored, must not send
+    /// them straight back.
+    fn pulled(&self, id: PeerId, events: &[Event], have: VersionVector, head: i64) {
         let back = {
             let mut table = self.table();
             let back = table.answered(id);
@@ -889,11 +948,15 @@ impl SyncHandle {
                     tracing::info!("sync: {} has a new database", peer.label());
                     peer.their_have = Some(have);
                     peer.push_mark = None;
+                    peer.wake();
                 } else {
                     match &mut peer.their_have {
                         Some(known) => merge_vv(known, &have),
                         slot => *slot = Some(have),
                     }
+                }
+                if let Some(known) = peer.their_have.as_mut() {
+                    raise_by(known, events);
                 }
                 peer.their_head = Some(head);
                 peer.since = head;
@@ -1150,6 +1213,7 @@ async fn pull_loop(state: AppState, id: PeerId) {
             }
             Learned::Gone => return,
         }
+        sync.pulled(id, &page.events, page.have, page.head);
         let mut newly = 0usize;
         let mut broken = None;
         for event in page.events {
@@ -1169,7 +1233,6 @@ async fn pull_loop(state: AppState, id: PeerId) {
                 }
             }
         }
-        sync.pulled(id, page.have, page.head);
         if let Some(e) = broken {
             // Our own store failed, not the peer: wait, then pull again.
             tracing::error!("sync: cannot store events from {url}: {e}");
@@ -1236,6 +1299,9 @@ async fn push_loop(state: AppState, id: PeerId) {
         }
         tokio::select! {
             _ = written.changed() => {}
+            // What we knew of the peer changed (it was replaced, or came
+            // back): look again now.
+            _ = task.retry.changed() => {}
             () = tokio::time::sleep(PUSH_TICK) => {}
             () = task.cancel.cancelled() => return,
             () = shutdown.triggered() => return,
@@ -1642,6 +1708,31 @@ mod tests {
             ["http://mac-configured:7700", "http://newest-mac:7700"]
         );
         assert!(t.get(id).is_some());
+    }
+
+    #[test]
+    fn a_url_answering_as_another_node_forgets_what_the_old_one_had() {
+        let mut t = table("pc", None);
+        let id = t.add_configured("http://mac:7700").unwrap();
+        assert_eq!(t.learned(id, "http://mac:7700", "mac"), Learned::Same);
+        {
+            let peer = t.get_mut(id).unwrap();
+            peer.their_have = Some([("pc~00000000".to_string(), 9)].into());
+            peer.their_head = Some(40);
+            peer.since = 40;
+            peer.push_mark = Some((12, VersionVector::new()));
+        }
+        let mut woken = t.get(id).unwrap().retry.subscribe();
+        woken.borrow_and_update();
+        assert_eq!(t.learned(id, "http://mac:7700", "mac-mini"), Learned::Same);
+        let peer = t.get(id).unwrap();
+        assert_eq!(peer.node.as_deref(), Some("mac-mini"));
+        assert_eq!(peer.their_have, None);
+        assert_eq!(peer.their_head, None);
+        assert_eq!(peer.since, 0);
+        assert_eq!(peer.push_mark, None);
+        // Its tasks hear of it, so the pusher starts over at once.
+        assert!(woken.has_changed().unwrap());
     }
 
     #[test]
