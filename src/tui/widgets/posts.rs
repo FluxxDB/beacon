@@ -6,10 +6,14 @@
 //! Columns of a post, from the pane's left edge:
 //!
 //! ```text
+//!            ╭─ pc-beacon in #general  start of the post it answers…
 //! ▍ 6:07 pm  Dang                                   announcement
 //! 0 1      9 11 author  client · node               badge ends at width - 3
 //!            body, wrapped to end by width - 4
 //! ```
+//!
+//! Only a reply has the first row ([`crate::tui::reply`]): what it answers,
+//! in dim ink, cut where body text ends.
 
 use jiff::Timestamp;
 use ratatui::layout::Rect;
@@ -17,6 +21,7 @@ use ratatui::layout::Rect;
 use crate::model::{mentions_handle, validate_handle};
 use crate::text::is_unsafe;
 use crate::timefmt::{clock_12h, day_label};
+use crate::tui::reply::{self, Resolved};
 use crate::tui::state::{view_name, App, Conn, Focus, PostItem, Selection};
 use crate::tui::theme::{palette, role, Ink, Rgb};
 use crate::tui::view::Layout;
@@ -33,6 +38,11 @@ const INDENT: u16 = 11;
 /// Badges end this many cells before the pane's right edge; body text one more.
 const BADGE_MARGIN: u16 = 3;
 const BODY_MARGIN: u16 = 4;
+
+/// Starts a reply's line, over the author's name.
+const ELBOW: &str = "╭─";
+/// A reply's line when the post it names is not on this node.
+const NOT_HERE: &str = "reply to a post that isn't here";
 
 const SERVER_DOWN: &str =
     "Can't reach the beacon server. Start it with docker compose up -d. Retrying…";
@@ -351,7 +361,8 @@ fn server_down(app: &App, width: u16) -> Vec<Line> {
     lines
 }
 
-/// A post's rows: the header, the wrapped body, then its attachment.
+/// A post's rows: a reply's line, the header, the wrapped body, then its
+/// attachment.
 fn post_lines(post: &PostItem, app: &App, width: u16) -> Vec<Line> {
     let mention = !post.announcement && mentions_handle(&post.mentions, &app.me);
     let band = (post.announcement || mention).then_some(role::LIFTED);
@@ -373,7 +384,19 @@ fn post_lines(post: &PostItem, app: &App, width: u16) -> Vec<Line> {
         Line { band, segs }
     };
 
-    let mut lines = vec![row(header(post, app, width, bg, selected))];
+    // An id without a digit may be just a word (`re branches:`): its line
+    // waits until the post is found.
+    let reply = reply::parse(&post.body)
+        .map(|r| {
+            let target = app.reply_target(&r.id);
+            (r, target)
+        })
+        .filter(|(r, target)| r.has_digit() || matches!(target, Resolved::Found(_)));
+    let mut lines = Vec::new();
+    if let Some((_, target)) = &reply {
+        lines.push(row(reply_line(target, post, width, bg)));
+    }
+    lines.push(row(header(post, app, width, bg, selected)));
 
     let body_ink = ink(if post.announcement {
         role::STRONG
@@ -381,9 +404,14 @@ fn post_lines(post: &PostItem, app: &App, width: u16) -> Vec<Line> {
         role::TEXT
     });
     let body_w = width.saturating_sub(INDENT + BODY_MARGIN);
+    // Once the line above says what it answers, `re <id>:` is left out.
+    let written = match &reply {
+        Some((reply, Resolved::Found(_))) => reply.rest,
+        _ => &post.body,
+    };
     // Trailing whitespace is never shown: a final newline, or a space that
     // would land just past a full line, must not add a blank row.
-    let body = clean(&post.body);
+    let body = clean(written);
     let body = body.trim_end();
     if !body.is_empty() {
         for text in wrap(body, body_w) {
@@ -404,6 +432,40 @@ fn post_lines(post: &PostItem, app: &App, width: u16) -> Vec<Line> {
         ]));
     }
     lines
+}
+
+/// `╭─ {author} in #{channel}  {start of its first line}` from the body
+/// column, over the reply's own name: the author in fog, the rest in ash,
+/// cut where body text ends. ` in #channel` only when the post it answers
+/// is in another channel; `…` while that post is on its way.
+fn reply_line(target: &Resolved, post: &PostItem, width: u16, bg: Rgb) -> Vec<(u16, Seg)> {
+    let quiet = Ink::new(role::QUIET, bg);
+    let end = width.saturating_sub(BODY_MARGIN);
+    let mut segs: Vec<(u16, Seg)> = Vec::new();
+    let mut put = |x: &mut u16, text: &str, ink: Ink| {
+        let text = truncate(text, end.saturating_sub(*x));
+        if !text.is_empty() {
+            let w = display_width(&text);
+            segs.push((*x, (text, ink)));
+            *x += w;
+        }
+    };
+    let mut x = INDENT;
+    put(&mut x, ELBOW, quiet);
+    x += 1;
+    match target {
+        Resolved::Pending => put(&mut x, "…", quiet),
+        Resolved::Missing => put(&mut x, NOT_HERE, quiet),
+        Resolved::Found(quote) => {
+            put(&mut x, &quote.author, Ink::new(role::META, bg));
+            if quote.channel != post.channel {
+                put(&mut x, &format!(" in #{}", quote.channel), quiet);
+            }
+            x += 2;
+            put(&mut x, &quote.text, quiet);
+        }
+    }
+    segs
 }
 
 /// `{time}  {author}  {client} · {node}`, with the badges right-aligned.
@@ -509,7 +571,7 @@ fn mention_len(word: &str) -> usize {
 /// The body as it may reach the terminal: tabs as spaces, no other control
 /// characters (an escape sequence in a post must never be drawn) and no bidi
 /// overrides (see [`is_unsafe`]).
-fn clean(body: &str) -> String {
+pub(crate) fn clean(body: &str) -> String {
     body.chars()
         .filter_map(|c| match c {
             '\t' => Some(' '),

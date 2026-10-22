@@ -554,6 +554,15 @@ impl Worker {
                     _ => None,
                 }
             }
+            Cmd::LoadPost(id) => {
+                let post = match client.post_by_id(&id).await {
+                    Ok(post) => Ok(Some(Box::new(post))),
+                    // The node's answer: no post by that id, or several.
+                    Err(Error::NotFound(_) | Error::Ambiguous(_) | Error::Usage(_)) => Ok(None),
+                    Err(e) => Err(e.to_string()),
+                };
+                Some(Msg::Loaded(Loaded::Post { id, post }))
+            }
             Cmd::Quit => None,
         }
     }

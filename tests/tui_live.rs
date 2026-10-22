@@ -592,6 +592,49 @@ async fn a_wrong_secret_shows_the_rejected_band() {
     .expect("test timed out");
 }
 
+/// A `re <id>` post shows what it answers: a post in another channel, which
+/// the TUI fetches from the node by its short id, and an id the node does
+/// not know.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reply_shows_the_post_it_answers() {
+    tokio::time::timeout(DEADLINE, async {
+        let node = spawn_node("pc", &[]).await;
+        let exchange = tempfile::tempdir().unwrap();
+        let created = node
+            .post("/api/channels")
+            .json(&json!({ "name": "beacon" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(created.status().is_success(), "{}", created.status());
+        let asked = post_as(&node, "beacon", "pc-configs", "arm64 image builds in 2m14s").await;
+        let short = asked["post"]["short_id"].as_str().unwrap().to_string();
+        post_as(
+            &node,
+            "general",
+            "mac-juicebox",
+            &format!("re {short}: thanks, tagging v0.1"),
+        )
+        .await;
+        // An id no post here ends in (40 random bits would have to be zero).
+        post_as(&node, "general", "pc-vllm", "re 00000000: still open?").await;
+
+        let mut tui = Tui::start(&node.url, exchange.path());
+        let screen = tui
+            .until(Duration::from_secs(5), "both reply lines", |s| {
+                s.contains("╭─ pc-configs in #beacon  arm64 image builds in 2m14s")
+                    && s.contains("╭─ reply to a post that isn't here")
+            })
+            .await;
+        assert!(screen.contains("thanks, tagging v0.1"), "{screen}");
+        assert!(!screen.contains(&format!("re {short}")), "{screen}");
+        assert!(screen.contains("re 00000000: still open?"), "{screen}");
+        tui.quit().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
 // ------------------------------------------------- the real binary on a pty
 
 mod pty {
