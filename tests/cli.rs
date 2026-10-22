@@ -3269,6 +3269,30 @@ async fn skill_show_prints_the_embedded_skill() {
     assert_eq!(out.code, 1, "{out:?}");
 }
 
+/// `beacon skill show` prints `skills/beacon/SKILL.md` as it is on disk now
+/// (the binary embeds it when it is built), and the file is one both Claude
+/// Code and Codex load: front matter with a `name` and a `description` only.
+#[tokio::test(flavor = "multi_thread")]
+async fn skill_show_matches_file() {
+    let node = spawn_node("pc", &[]).await;
+    let out = beacon(&node, &["skill", "show"]).ok().await;
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/skills/beacon/SKILL.md");
+    let file = String::from_utf8(std::fs::read(path).expect("the skill file")).unwrap();
+    assert_eq!(out.stdout, file);
+
+    let front = file
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n"))
+        .expect("front matter")
+        .0;
+    let keys: Vec<&str> = front
+        .lines()
+        .map(|line| line.split(':').next().unwrap())
+        .collect();
+    assert_eq!(keys, ["name", "description"]);
+    assert!(front.starts_with("name: beacon\n"), "{front}");
+}
+
 // ------------------------------------------- failures: what is said, and when
 
 /// The `docker compose up -d` hint is for a node that is not there. A node
