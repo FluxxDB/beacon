@@ -24,6 +24,7 @@ use crate::api::{
 use crate::error::Error;
 use crate::model::AuthorKind;
 use crate::tui::convert;
+use crate::tui::mention::Mention;
 use crate::tui::view::Layout;
 use crate::tui::widgets::posts;
 
@@ -79,6 +80,8 @@ pub struct App {
     pub me: String,
     /// The composer's text.
     pub input: String,
+    /// What the keys did to the `@handle` being typed (its ghost).
+    pub mention: Option<Mention>,
     pub focus: Focus,
     pub dialog: Option<Dialog>,
     pub connection: Conn,
@@ -153,6 +156,7 @@ impl App {
             last_sync_ms: None,
             me: me.into(),
             input: String::new(),
+            mention: None,
             focus: Focus::Composer,
             dialog: None,
             connection: Conn::Up,
@@ -493,6 +497,7 @@ impl App {
         let scrolled = self.scroll > 0;
         let filtered = !posts::shows_all(self);
         let mut cmds = self.apply(msg);
+        self.sync_mention();
         // Back down at the newest (by a key, a resize, a deletion or a sent
         // post), or the filter gone: what was out of sight is seen now.
         if self.scroll == 0 && (scrolled || (filtered && posts::shows_all(self))) {

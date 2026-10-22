@@ -124,7 +124,7 @@ pub const PEER_URL_MAX: usize = 512;
 /// Length of the database id at the end of an origin.
 const DB_ID_LEN: usize = 8;
 
-fn is_handle_char(c: char) -> bool {
+pub(crate) fn is_handle_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
 }
 
