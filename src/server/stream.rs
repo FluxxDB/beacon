@@ -52,15 +52,15 @@ const PUSH_BODY_MAX: usize = 64 * 1024 * 1024;
 /// longest it may be asked to.
 const WAIT_DEFAULT: Duration = Duration::from_secs(60);
 const WAIT_MAX: Duration = Duration::from_secs(3600);
-/// A comment goes out on a stream that has been silent this long, so proxies
-/// and clients can tell a quiet board from a dead connection.
-const KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// How often a stream looks at the peer list for a reachability change.
 const PEERS_POLL: Duration = Duration::from_secs(1);
 /// Events a stream reads from the store at a time.
 const CATCH_UP_PAGE: usize = 256;
 /// How long a stream waits before it tries again after the store failed it.
 const RETRY_PAUSE: Duration = Duration::from_secs(1);
+/// A stream that fails this many times in a row to read the store ends, so
+/// its client reconnects instead of waiting on a stream that is dead.
+const MAX_STORE_FAILURES: u32 = 10;
 
 pub fn router(state: &AppState) -> Router<AppState> {
     let events = Router::new()
@@ -68,6 +68,9 @@ pub fn router(state: &AppState) -> Router<AppState> {
             "/api/events",
             get(pull_events)
                 .post(push_events)
+                // The route answers other methods itself, so the layer below
+                // names the node on that answer too.
+                .fallback(super::method_not_allowed)
                 .layer(DefaultBodyLimit::max(PUSH_BODY_MAX)),
         )
         .layer(middleware::from_fn_with_state(state.clone(), name_the_node));
@@ -118,7 +121,9 @@ struct PullQuery {
     wait: Option<u64>,
     /// How many events at most (default and maximum 500).
     limit: Option<u32>,
-    /// The `head` of the caller's previous answer from this server.
+    /// The `head` of the answer to the caller's last pull that applied
+    /// nothing new (default 0). Not for paging through a backlog: see
+    /// [`pull_events`].
     since: Option<i64>,
 }
 
@@ -147,9 +152,16 @@ async fn select_page(app: &AppState, after: &VersionVector, limit: usize) -> Res
 /// holding a gap in its version vector is re-sent what lies above the gap
 /// even though it has it. So a non-empty selection is not news. The request
 /// waits, up to `wait`, unless some selected event arrived here after
-/// `since` (the head the caller was last given), and wakes when anything
-/// is stored. Without a `since` everything stored is news, and so is
-/// everything for a `since` beyond our head.
+/// `since`, and wakes when anything is stored. Without a `since` everything
+/// stored is news, and so is everything for a `since` beyond our head.
+///
+/// `head` in the answer is the node's head *now*, so how a puller uses the
+/// pair matters (R22): while its pages keep advancing its version vector (at
+/// least one event newly applied) it follows `more` at once with `wait=0`;
+/// when a page applied nothing new it long-polls with `since=<that page's
+/// head>`. Passing `since=head` after a cut page would hold the request for
+/// the whole `wait` with events still owed, because all of them have already
+/// arrived by `head`.
 async fn pull_events(
     State(app): State<AppState>,
     ApiQuery(q): ApiQuery<PullQuery>,
@@ -299,9 +311,10 @@ struct StreamQuery {
 
 /// The live feed: a `post`, `post_deleted`, `channel` or `presence` event for
 /// everything stored from now on that changes what is shown, and `peers` when a
-/// peer's reachability changes. With `relevant=1`, only the posts that matter to
-/// `handle` (see `Store::is_relevant`, checked against its joins when the
-/// event is sent); other events are not filtered.
+/// peer's reachability changes. With `relevant=1` it carries `post` events
+/// and nothing else, and only the posts that matter to `handle` (see
+/// `Store::is_relevant`, checked against its joins when the event is sent):
+/// that is what `wait` and `watch` listen to.
 async fn stream_events(
     State(app): State<AppState>,
     ApiQuery(q): ApiQuery<StreamQuery>,
@@ -320,18 +333,20 @@ async fn stream_events(
     let last = app.with_store(|s| Ok(s.arrival_head())).await?;
     let mut ticker = tokio::time::interval_at(Instant::now() + PEERS_POLL, PEERS_POLL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let keep_alive = app.cfg.sse_keep_alive;
     let feed = Feed {
         peers_seen: peers_signature(&app.sync.peers()),
         app,
         bell,
         last,
         stale: false,
+        failures: 0,
         relevant_to,
         ticker,
         out: VecDeque::new(),
     };
     let events = stream::unfold(feed, Feed::next);
-    Ok(Sse::new(events).keep_alive(KeepAlive::new().interval(KEEP_ALIVE).text("keep-alive")))
+    Ok(Sse::new(events).keep_alive(KeepAlive::new().interval(keep_alive).text("keep-alive")))
 }
 
 /// One open stream.
@@ -342,8 +357,11 @@ struct Feed {
     last: i64,
     /// The store may hold events after `last` that were not read yet.
     stale: bool,
+    /// How many times in a row reading the store has failed.
+    failures: u32,
+    /// `Some` on a relevant stream, which carries only that handle's posts.
     relevant_to: Option<String>,
-    /// Paces the look at the peer list.
+    /// Paces the look at the peer list (a relevant stream does not look).
     ticker: tokio::time::Interval,
     peers_seen: Vec<(String, Option<String>, bool)>,
     /// Events ready to send, oldest first.
@@ -371,11 +389,22 @@ impl Feed {
     async fn fill(&mut self) -> bool {
         loop {
             if self.stale {
-                if let Err(e) = self.catch_up().await {
-                    tracing::warn!("stream: cannot read new events, trying again: {e}");
-                    tokio::select! {
-                        () = tokio::time::sleep(RETRY_PAUSE) => {}
-                        () = self.app.shutdown.triggered() => return false,
+                match self.catch_up().await {
+                    Ok(()) => self.failures = 0,
+                    Err(e) => {
+                        self.failures += 1;
+                        if self.failures >= MAX_STORE_FAILURES {
+                            tracing::error!(
+                                "stream: ending after {} failures to read new events: {e}",
+                                self.failures
+                            );
+                            return false;
+                        }
+                        tracing::warn!("stream: cannot read new events, trying again: {e}");
+                        tokio::select! {
+                            () = tokio::time::sleep(RETRY_PAUSE) => {}
+                            () = self.app.shutdown.triggered() => return false,
+                        }
                     }
                 }
                 if !self.out.is_empty() {
@@ -394,7 +423,7 @@ impl Feed {
                     }
                     self.stale = true;
                 }
-                _ = self.ticker.tick() => {
+                _ = self.ticker.tick(), if self.relevant_to.is_none() => {
                     let peers = self.app.sync.peers();
                     if let Some(event) = self.peers_changed(peers) {
                         self.out.push_back(event);
@@ -453,7 +482,8 @@ fn peers_signature(peers: &[PeerJson]) -> Vec<(String, Option<String>, bool)> {
 /// now. An event that broke the rules was stored without deriving anything
 /// (and never announced), and one that changed nothing that is shown (a post
 /// that was deleted first, a second post with the same id, a delete older
-/// than what keeps a channel alive) says nothing.
+/// than what keeps a channel alive) says nothing. With `relevant_to` set, only
+/// the posts that matter to that handle are described.
 fn describe(
     store: &Store,
     page: &[Applied],
@@ -469,6 +499,10 @@ fn describe(
     let mut out = Vec::new();
     for applied in page {
         let event = &applied.event;
+        // A relevant stream carries posts only.
+        if relevant_to.is_some() && !matches!(event.kind, EventKind::PostCreated(_)) {
+            continue;
+        }
         if validate_event(event).is_err() {
             continue;
         }
