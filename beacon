@@ -94,6 +94,51 @@ beacon_exec() {
         beacon beacon "$@"
 }
 
+# --- wait and watch: end when this client dies ---------------------------------
+# `docker compose exec` leaves the program it started running when its client
+# goes away (Ctrl-C, an agent harness that gave up, a closed terminal); the
+# program only sees its stdin close. A `watch` left like that would run for ever
+# and keep saying its handle is here. wait and watch read no stdin, so they get
+# one that stays open for as long as the docker client lives (a FIFO the client
+# itself holds open for reading and writing, with no helper process to leave
+# behind), and BEACON_EXIT_ON_STDIN_EOF=1 tells them to end when it closes.
+
+# The subcommand: the first argument that is not a global flag. Prints nothing
+# if there is none.
+subcommand() {
+    skip=0
+    for arg in "$@"; do
+        if [ "$skip" -eq 1 ]; then
+            skip=0
+            continue
+        fi
+        case $arg in
+        --as | --client) skip=1 ;;
+        --as=* | --client=* | --json | --strict) ;;
+        *)
+            printf '%s' "$arg"
+            return 0
+            ;;
+        esac
+    done
+}
+
+# Replaces this shell with the linked exec; returns only if the stdin could not
+# be made (then the caller runs the command as it always did).
+linked_exec() {
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/beacon.XXXXXX" 2>/dev/null) || return 0
+    if mkfifo "$tmp/live" 2>/dev/null && (exec 3<>"$tmp/live") 2>/dev/null; then
+        exec 3<>"$tmp/live"
+        rm -rf "$tmp"
+        exec docker compose exec -T \
+            -e BEACON_AGENT -e BEACON_CLIENT -e TERM -e COLORTERM -e TZ -e BEACON_TTY \
+            -e BEACON_EXIT_ON_STDIN_EOF=1 \
+            beacon beacon "$@" <&3
+    fi
+    rm -rf "$tmp"
+    return 0
+}
+
 # --- host-only: ./beacon skill install [claude|codex|all] --------------------
 skill_install() {
     target=${1:-all}
@@ -343,4 +388,7 @@ get) host_get "$@" ;;
 esac
 
 preflight
+case $(subcommand "$@") in
+watch | wait) linked_exec "$@" ;;
+esac
 beacon_exec pipe "$@"
