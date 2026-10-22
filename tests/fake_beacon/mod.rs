@@ -14,6 +14,10 @@
 //!
 //! [`Project::real`] puts the real CLI there instead, pointed at a test node.
 //!
+//! The dispatcher's backoff state lives in the project too: at [`STATE`]
+//! (`BEACON_DISPATCH_STATE`), or under `xdg-state/` for a test that blanks that
+//! variable, so no test touches the real `~/.local/state`.
+//!
 //! Each test binary uses a different subset, hence `allow(dead_code)`.
 #![allow(dead_code)]
 
@@ -56,6 +60,9 @@ esac
 echo "fake beacon: unexpected command ${1-}" >&2
 exit 1
 "#;
+
+/// Where [`Project::run`] points `BEACON_DISPATCH_STATE`, in the project.
+pub const STATE: &str = "dispatch.state";
 
 /// Two unread posts and nothing beyond them, as `wait --json` prints them.
 pub const TWO_UNREAD: &str = r#"{"v":1,"posts":[{"v":1,"id":"01AAAAAAAAAAAAAAAAAAAAAAAA","short_id":"AAAAAAAA","body":"do x"},{"v":1,"id":"01BBBBBBBBBBBBBBBBBBBBBBBB","short_id":"BBBBBBBB","body":"do y"}],"remaining":0}"#;
@@ -138,13 +145,30 @@ impl Project {
     }
 
     /// Runs `scripts/<script>` with `sh`, these arguments and stdin, for this
-    /// project, with the `FAKE_*` and handle variables cleared before `env`.
+    /// project, with the `FAKE_*` and handle variables cleared and the backoff
+    /// state kept in the project (see [`STATE`]) before `env`.
     pub fn run(&self, script: &str, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Run {
         let mut cmd = Command::new("sh");
         cmd.arg(Path::new(REPO).join("scripts").join(script))
-            .args(args)
-            .env("CLAUDE_PROJECT_DIR", self.dir.path())
+            .args(args);
+        self.finish(cmd, stdin, env)
+    }
+
+    /// [`Project::run`] with stderr merged into stdout, the way a terminal or a
+    /// tool call shows them: `stdout` holds both, in the order they came.
+    pub fn run_merged(&self, script: &str, args: &[&str], env: &[(&str, &str)]) -> Run {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exec sh \"$@\" 2>&1", "sh"])
+            .arg(Path::new(REPO).join("scripts").join(script))
+            .args(args);
+        self.finish(cmd, "", env)
+    }
+
+    fn finish(&self, mut cmd: Command, stdin: &str, env: &[(&str, &str)]) -> Run {
+        cmd.env("CLAUDE_PROJECT_DIR", self.dir.path())
             .env_remove("BEACON_DISPATCH_HANDLE")
+            .env("BEACON_DISPATCH_STATE", self.dir.path().join(STATE))
+            .env("XDG_STATE_HOME", self.dir.path().join("xdg-state"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

@@ -1,10 +1,12 @@
 #!/bin/sh
 # Claude Code Stop hook for beacon dispatcher sessions.
 #
-# A dispatcher is a Claude Code session opened just to run `/loop 2m /dispatch`.
-# This hook keeps it from going idle while beacon still holds work for it: when
-# the session tries to end a turn and the dispatcher's handle has relevant
-# unread posts, it blocks the stop and tells the agent to handle them first.
+# A dispatcher is a Claude Code session opened just to run `/loop 2m /dispatch`,
+# a loop that starts at 2 minutes and backs off to 10 while the board is quiet
+# (dispatch-check.sh paces it). This hook keeps it from going idle while beacon
+# still holds work for it: when the session tries to end a turn and the
+# dispatcher's handle has relevant unread posts, it blocks the stop and tells
+# the agent to handle them first.
 #
 # Only a session whose own prompts carry the marker below is a dispatcher: the
 # /dispatch command's text, which Claude Code records as a user-role text

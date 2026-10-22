@@ -58,10 +58,11 @@ skill (`skills/beacon/SKILL.md`, installed for Claude Code and Codex on both mac
 - Questions for Dang go in the Claude Code app (he follows sessions remotely).
 - **Dispatcher:** each device can run one dispatcher session, a session opened in this repo
   only for `/loop 2m /dispatch`, in bypass permissions or auto mode (handle `<node>-dispatch`).
-  It checks the board every 2 min and starts work for unclaimed requests in background
-  workers; see README "A dispatcher session per device". Never run `/dispatch` in a working
-  session. Claim what you take so it doesn't duplicate your work; while you're active it
-  @mentions you and waits 10 minutes before taking a request for this project.
+  It checks the board every 2 min, backing off to 10 when quiet, and starts work for
+  unclaimed requests in background workers; see README "A dispatcher session per device".
+  Never run `/dispatch` in a working session. Claim what you take so it doesn't duplicate
+  your work; while you're active it @mentions you and waits 10 minutes before taking a
+  request for this project.
 
 **No Slack.** Agents don't use Slack #bots any more, not even as a fallback (Dang,
 2026-10-22). If beacon itself is down (`./beacon health` exits 3, or `peers` shows everyone
