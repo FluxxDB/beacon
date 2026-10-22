@@ -10,7 +10,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use fake_beacon::{Project, Run, ENV_SPELLINGS_OF_PC, STATE, TWO_UNREAD};
+use fake_beacon::{Project, Run, ENV_SPELLINGS_OF_PC, REPO, STATE, TWO_UNREAD};
 use serde_json::{json, Value};
 
 const CHECK: &str = "dispatch-check.sh";
@@ -192,6 +192,27 @@ fn a_failed_check_in_is_an_error() {
     assert_eq!(run.stdout, "nothing new\n");
     assert!(run.stderr.contains("could not set the status"), "{run:?}");
     assert!(run.stderr.contains("beacon: gone"), "{run:?}");
+}
+
+/// The pace is saved before the check-in, so the status can show it; a
+/// check-in that then fails still says the new pace for the dispatcher to
+/// re-arm at, and keeps it.
+#[test]
+fn a_pace_change_is_said_and_kept_when_the_check_in_fails() {
+    let p = Project::new(Some("BEACON_NODE=pc\n"));
+    quiet_checks(&p, 14, &[], &[]);
+    let run = check(
+        &p,
+        &[],
+        &[("FAKE_WHO_STATUS", "3"), ("FAKE_WHO_ERR", "beacon: gone")],
+    );
+    assert_eq!(
+        (run.code, run.stdout.as_str()),
+        (3, "nothing new\nbackoff: 5m\n"),
+        "{run:?}"
+    );
+    assert!(run.stderr.contains("could not set the status"), "{run:?}");
+    assert_eq!(pace(&p, &[]), "5m\n");
 }
 
 #[test]
@@ -850,10 +871,23 @@ fn a_state_that_cannot_be_saved_any_more_goes_back_to_2m() {
     let env = [("BEACON_DISPATCH_STATE", state.to_str().unwrap())];
     quiet_checks(&p, 14, &[], &env);
     backs_off(&p, &env, "5m");
+    assert_eq!(pace(&p, &env), "5m\n");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let interval = check(&p, &["--interval"], &env);
     let run = check(&p, &[], &env);
     let reset = check(&p, &["--reset"], &env);
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // `--interval` agrees with the checks: a pace that can't be saved is 2m.
+    assert_eq!(
+        (
+            interval.code,
+            interval.stdout.as_str(),
+            interval.stderr.as_str()
+        ),
+        (0, "2m\n", ""),
+        "{interval:?}"
+    );
     assert_eq!(
         (run.code, run.stdout.as_str()),
         (0, "nothing new\nbackoff: 2m\n"),
@@ -919,6 +953,88 @@ fn without_xdg_state_home_the_state_is_in_home() {
     assert!(home
         .join(".local/state/beacon/dispatch-pc-dispatch.state")
         .is_file());
+}
+
+/// Warnings go to stderr after the check's lines, so whoever reads the two
+/// merged (a tool call's output) still finds `nothing new` or `unread: N` on
+/// the first line and `backoff:` on the second.
+#[test]
+fn warnings_come_after_the_checks_lines() {
+    let p = Project::new(Some("BEACON_NODE=pc\n"));
+    p.write("a-file", "not a directory\n");
+    let unsaveable = p.path().join("a-file").join("dispatch.state");
+    let unsaveable = ("BEACON_DISPATCH_STATE", unsaveable.to_str().unwrap());
+    let no_channels = (
+        "FAKE_JOIN_OUT",
+        r#"{"v":1,"ok":true,"added":[],"joined":[]}"#,
+    );
+    type Env<'a> = [(&'a str, &'a str)];
+    let cases: [(&[&str], &Env, usize); 4] = [
+        (&[], &[unsaveable], 1),
+        // `--reset` saves before it asks beacon anything.
+        (&["--reset"], &[unsaveable], 1),
+        (&[], &[no_channels], 1),
+        (&["--reset"], &[unsaveable, no_channels], 2),
+    ];
+    for (flags, env, warnings) in cases {
+        let run = p.run_merged(CHECK, flags, env);
+        let lines: Vec<&str> = run.stdout.lines().collect();
+        assert_eq!(run.code, 0, "{flags:?} {env:?}: {run:?}");
+        assert_eq!(lines.len(), 1 + warnings, "{flags:?} {env:?}: {run:?}");
+        assert_eq!(lines[0], "nothing new", "{flags:?} {env:?}: {run:?}");
+        for line in &lines[1..] {
+            assert!(
+                line.starts_with("dispatch-check: warning: "),
+                "{flags:?} {env:?}: {run:?}"
+            );
+        }
+    }
+
+    // A failing check still passes on the warning it buffered.
+    let run = p.run_merged(
+        CHECK,
+        &["--reset"],
+        &[unsaveable, ("FAKE_WAIT_STATUS", "3")],
+    );
+    assert_eq!(run.code, 3, "{run:?}");
+    assert!(
+        run.stdout
+            .contains("dispatch-check: warning: could not save"),
+        "{run:?}"
+    );
+    assert!(run.stdout.contains("beacon is unreachable"), "{run:?}");
+
+    // A pace change, then the warning.
+    if !is_root() {
+        let p = Project::new(Some("BEACON_NODE=pc\n"));
+        back_off_to(&p, "5m");
+        fs::set_permissions(p.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let run = p.run_merged(CHECK, &[], &[]);
+        fs::set_permissions(p.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let lines: Vec<&str> = run.stdout.lines().collect();
+        assert_eq!(lines.len(), 3, "{run:?}");
+        assert_eq!(lines[..2], ["nothing new", "backoff: 2m"], "{run:?}");
+        assert!(lines[2].starts_with("dispatch-check: warning: "), "{run:?}");
+    }
+}
+
+/// dispatch.md paces the loop by what this script says: a session starts with
+/// `--reset`, a pending follow-up holds with `--hold`, a `backoff:` line
+/// re-arms the job, and the self-heal uses `--interval`; no fixed pace.
+#[test]
+fn the_dispatch_command_follows_the_checks_pace() {
+    let command = fs::read_to_string(Path::new(REPO).join(".claude/commands/dispatch.md")).unwrap();
+    for needed in [
+        "dispatch-check.sh --reset",
+        "--interval",
+        "--hold",
+        "backoff:",
+    ] {
+        assert!(command.contains(needed), "{needed:?} missing");
+    }
+    for fixed in ["*/2", "*/5", "loop 5m"] {
+        assert!(!command.contains(fixed), "{fixed:?} is a fixed pace");
+    }
 }
 
 /// The status `handle` has on the board, as `who --json` says.

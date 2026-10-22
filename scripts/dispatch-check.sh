@@ -36,7 +36,9 @@
 # ${XDG_STATE_HOME:-~/.local/state}/beacon/dispatch-<handle>.state). It is
 # written whole (a temporary file in its directory, then mv). A missing,
 # unreadable or garbled state is a fresh one (2m, none); one that can't be saved
-# is a warning on stderr, and the loop stays at 2m.
+# is a warning, and the loop stays at 2m (--interval says 2m too when the
+# state's directory isn't writable). Warnings go to stderr after the check's
+# stdout lines, which come first even when the two are read merged.
 #
 # Env: CLAUDE_PROJECT_DIR (the beacon repo; default: the repo this script is
 #      in), BEACON_DISPATCH_HANDLE (default "<BEACON_NODE from .env>-dispatch"),
@@ -47,9 +49,22 @@
 
 USAGE="usage: scripts/dispatch-check.sh [--reset] [--hold] [RUNNING] | --handle | --interval   (RUNNING: how many workers are still going)"
 
+# Warnings wait until the check's lines are out (or it fails), so that output
+# read with stderr merged still starts with them.
+warnings=
+warn() {
+    warnings="${warnings}dispatch-check: warning: $*
+"
+}
+flush_warnings() {
+    printf '%s' "$warnings" >&2
+    warnings=
+}
+
 die() {
     code=$1
     shift
+    flush_warnings
     printf 'dispatch-check: %s\n' "$*" >&2
     exit "$code"
 }
@@ -162,14 +177,15 @@ save_state() {
         rm -f "$tmp"
     fi
     [ -n "$unsaved" ] ||
-        printf 'dispatch-check: warning: could not save the backoff state in %s, so the loop stays at 2m\n' \
-            "$state" >&2
+        warn "could not save the backoff state in $state, so the loop stays at 2m"
     unsaved=1
     return 1
 }
 
 if [ "$mode" = interval ]; then
     load_state
+    # Where nothing can be saved, checks run at 2m whatever the file says.
+    [ -w "$state_dir" ] || pace=2
     printf '%sm\n' "$pace"
     exit 0
 fi
@@ -194,8 +210,7 @@ case $status in
 esac
 case $out in
 *'"joined":[]'*)
-    printf 'dispatch-check: warning: %s has joined no channels, so only @mentions, announcements and replies to its posts reach it\n' \
-        "$handle" >&2
+    warn "$handle has joined no channels, so only @mentions, announcements and replies to its posts reach it"
     ;;
 esac
 
@@ -234,6 +249,7 @@ else
     printf 'nothing new\n'
 fi
 [ "$pace" = "$was" ] || printf 'backoff: %sm\n' "$pace"
+flush_warnings
 
 # The 12-hour clock beacon prints times in: 1:05 pm.
 now=$(LC_ALL=C date '+%I:%M %p' | tr 'APM' 'apm')

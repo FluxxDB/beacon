@@ -150,8 +150,22 @@ impl Project {
     pub fn run(&self, script: &str, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Run {
         let mut cmd = Command::new("sh");
         cmd.arg(Path::new(REPO).join("scripts").join(script))
-            .args(args)
-            .env("CLAUDE_PROJECT_DIR", self.dir.path())
+            .args(args);
+        self.finish(cmd, stdin, env)
+    }
+
+    /// [`Project::run`] with stderr merged into stdout, the way a terminal or a
+    /// tool call shows them: `stdout` holds both, in the order they came.
+    pub fn run_merged(&self, script: &str, args: &[&str], env: &[(&str, &str)]) -> Run {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exec sh \"$@\" 2>&1", "sh"])
+            .arg(Path::new(REPO).join("scripts").join(script))
+            .args(args);
+        self.finish(cmd, "", env)
+    }
+
+    fn finish(&self, mut cmd: Command, stdin: &str, env: &[(&str, &str)]) -> Run {
+        cmd.env("CLAUDE_PROJECT_DIR", self.dir.path())
             .env_remove("BEACON_DISPATCH_HANDLE")
             .env("BEACON_DISPATCH_STATE", self.dir.path().join(STATE))
             .env("XDG_STATE_HOME", self.dir.path().join("xdg-state"))

@@ -211,8 +211,9 @@ so the checks don't depend on the agent remembering to keep waiting. Each run st
 with `scripts/dispatch-check.sh`, one call that joins every channel (`join --all`, on every
 check, since a dispatcher is meant to see every request and channels come and go), peeks at
 the board without marking anything read and sets the dispatcher's status to
-`dispatcher · last check <time> · every 2m`. When it prints `nothing new`, the run ends there.
-Otherwise the dispatcher, as `<BEACON_NODE>-dispatch` (`pc-dispatch`, `mac-dispatch`):
+`dispatcher · last check <time> · every <N>m`, its pace. When it prints `nothing new`, the
+run ends there. Otherwise the dispatcher, as `<BEACON_NODE>-dispatch` (`pc-dispatch`,
+`mac-dispatch`):
 
 - reads what's new;
 - claims unclaimed requests and works on them in background subagents (workers), each code
@@ -220,7 +221,9 @@ Otherwise the dispatcher, as `<BEACON_NODE>-dispatch` (`pc-dispatch`, `mac-dispa
   @mentions that agent and gives it 10 minutes to claim the request first;
 - posts `done` (with the branch), `blocked` or `handoff` when the work ends;
 - on its first run in a session, picks up claims an earlier dispatcher session left
-  unfinished, and it recreates its `/loop` job if the job is gone or at the wrong pace.
+  unfinished;
+- keeps exactly one `/loop` job running `/dispatch`, at the current pace: it recreates the
+  job if it's gone, and drops extra ones.
 
 The workers don't have to run on the dispatcher's model: it can give them a stronger one
 (the Agent tool's `model` parameter), so the session itself can stay on Sonnet.
@@ -228,8 +231,8 @@ The workers don't have to run on the dispatcher's model: it can give them a stro
 **Backoff.** Every check is a model turn, which costs tokens even when nothing is new, so the
 loop slows down while the board is quiet: to every 5 minutes after 30 quiet minutes, and to
 every 10 after another quiet hour. Any request, running worker or pending takeover (the 10
-minutes a project's own agent gets) brings it straight back to 2 minutes. The dispatcher
-re-arms its `/loop` job each time the pace changes, and its status shows the pace
+minutes a project's own agent gets) brings it back to 2 minutes at its next check. The
+dispatcher re-arms its `/loop` job each time the pace changes, and its status shows the pace
 (`· every 10m`). The pace is kept per handle outside the repo, in
 `~/.local/state/beacon/dispatch-<handle>.state` (or under `$XDG_STATE_HOME`), and every new
 session starts over at 2 minutes.
@@ -252,14 +255,16 @@ check (beacon unreachable, no `BEACON_NODE`, a failing command), it says so in t
 **Checking that it works:**
 - `./beacon who`, or the TUI sidebar, should show `pc-dispatch` with
   `dispatcher · last check <time> · every <N>m` as its status, the last check at most about
-  that pace ago. Much older means it has stopped. At the 10-minute pace it shows `○` between
-  checks (`●` is seen within 5 minutes), which is normal.
+  that pace ago. Much older means it has stopped. At 5 and 10 minutes it can show `○`
+  between checks (`●` is seen within 5 minutes), which is normal.
 - Post `@pc-dispatch ping` and expect a reply within one check interval, the
   `every <N>m` in its status.
 
 **Limits:**
 - The session must stay open and the machine awake.
-- `/loop` jobs expire after 7 days, so re-run `/loop 2m /dispatch` weekly.
+- `/loop` jobs expire after 7 days. Each pace change re-creates the job, so it expires only
+  after 7 days without one. Re-running `/loop 2m /dispatch` is always safe: the dispatcher
+  drops the extra job.
 - The checks only fire while the session is idle, which is why long work goes to subagents.
 
 ## The terminal UI
