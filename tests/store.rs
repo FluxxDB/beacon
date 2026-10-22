@@ -1088,7 +1088,8 @@ fn unread_agrees_with_is_relevant() {
     }
     // Replies, in `vllm`, to a post by each author: by short id, whole id or
     // either in lowercase, then one that only says `re <id>` past its start.
-    // One more answers a deleted post, one a post that is not here.
+    // One more answers a deleted post, one a post that is not here, and one
+    // a whole id that is not here but ends in pc-configs's post's short id.
     let mut targets: Vec<String> = Vec::new();
     for author in ["pc-configs", "mac-agent"] {
         ts += 1;
@@ -1102,6 +1103,8 @@ fn unread_agrees_with_is_relevant() {
     delete_post(&mut a, &gone, ts);
     targets.push(post_id(&gone));
     targets.push("01JDB7K4TR00000000000ZZZZZ".into());
+    let phantom = format!("7ZZZZZZZZZZZZZZZZZ{}", short_id(&targets[0]));
+    targets.push(phantom.clone());
     for author in ["pc-configs", "mac-agent"] {
         for id in &targets {
             let short = short_id(id);
@@ -1186,6 +1189,20 @@ fn unread_agrees_with_is_relevant() {
         only_as_replies > 0,
         "some posts should be relevant only as replies"
     );
+
+    // The phantom whole id answers nothing; shortened, it names pc-configs's
+    // post. (The loop above checked that the SQL says the same.)
+    let joins = a.joins("pc-configs").unwrap();
+    let relevant = |body: String| {
+        let p = every
+            .iter()
+            .find(|p| p.author == "mac-agent" && p.body == body)
+            .unwrap();
+        a.is_relevant(p, "pc-configs", &joins).unwrap()
+    };
+    assert!(!relevant(format!("Re {phantom}, yes")));
+    assert!(!relevant(format!("RE  {}", phantom.to_ascii_lowercase())));
+    assert!(relevant(format!("re {}: yes", short_id(&phantom))));
 }
 
 // ---- a reply wakes the author of the post it answers ----
@@ -1283,6 +1300,18 @@ fn a_reply_to_a_deleted_post_still_counts() {
     // The reply itself follows the rules every post does: deleted, it is gone.
     delete_post(&mut a, &answer, 4_000);
     assert!(unread_bodies(&a, me, 50).is_empty());
+
+    // A question in a channel deleted since still counts as answered; a
+    // reply in that channel is hidden with it. (Posted before the delete: a
+    // post written into a deleted channel would bring it back.)
+    let (mut a, _) = pair();
+    let question = agent_post(&mut a, me, "old", "question", 1_000);
+    let id = short_id(&post_id(&question)).to_string();
+    let (hidden, shown) = (format!("re {id}: in old"), format!("re {id}: in beacon"));
+    agent_post(&mut a, "pc-beacon", "old", &hidden, 2_000);
+    delete_channel(&mut a, "old", 3_000);
+    agent_post(&mut a, "pc-beacon", "beacon", &shown, 4_000);
+    assert_eq!(unread_bodies(&a, me, 50), [shown]);
 }
 
 /// Sync is order-independent, so a reply can arrive before the post it
@@ -1290,7 +1319,7 @@ fn a_reply_to_a_deleted_post_still_counts() {
 /// that post is here, if the handle has not read past it in its channel by
 /// then: a cursor never moves back. So `read --unread`, the channel counts
 /// and `wait` (which a new post wakes to look again) find it then; `watch`
-/// judges each post as it arrives, so it never prints this one.
+/// judges each post when it reads it, so it may miss this one.
 #[test]
 fn a_reply_that_arrives_before_its_post_counts_once_the_post_does() {
     let (mut a, mut b) = pair();

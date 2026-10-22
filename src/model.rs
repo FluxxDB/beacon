@@ -281,17 +281,17 @@ pub fn mentions_handle(mentions: &[String], handle: &str) -> bool {
         .any(|m| m.eq_ignore_ascii_case("all") || m.eq_ignore_ascii_case(handle))
 }
 
+/// Length of a short id, and of a whole ULID.
+const SHORT_ID_LEN: usize = 8;
+const ULID_LEN: usize = 26;
+
 /// The last 8 characters of an id (all of it when shorter).
 pub fn short_id(id: &str) -> &str {
-    match id.char_indices().rev().nth(7) {
+    match id.char_indices().rev().nth(SHORT_ID_LEN - 1) {
         Some((i, _)) => &id[i..],
         None => id,
     }
 }
-
-/// Length of a short id, and of a whole ULID.
-const SHORT_ID_LEN: usize = 8;
-const ULID_LEN: usize = 26;
 
 /// What a reply's body says it answers. Agents answer a post by starting
 /// theirs with `re <id>:` (there are no threads); see [`parse_reply`].
