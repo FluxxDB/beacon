@@ -255,9 +255,12 @@ fn post_lines(post: &PostItem, app: &App, width: u16) -> Vec<Line> {
         role::TEXT
     });
     let body_w = width.saturating_sub(INDENT + BODY_MARGIN);
+    // Trailing whitespace is never shown: a final newline, or a space that
+    // would land just past a full line, must not add a blank row.
     let body = clean(&post.body);
-    if !body.trim().is_empty() {
-        for text in wrap(&body, body_w) {
+    let body = body.trim_end();
+    if !body.is_empty() {
+        for text in wrap(body, body_w) {
             lines.push(row(body_segs(&text, body_ink, ink(role::STRONG))));
         }
     }
@@ -299,9 +302,10 @@ fn header(post: &PostItem, app: &App, width: u16, bg: Rgb, selected: bool) -> Ve
         badges.push((format!(" {tag} "), Ink::new(role::tag(tag), role::LIFTED)));
     }
     let badge_right = width.saturating_sub(BADGE_MARGIN);
-    let badges_w = segs_width(&badges) + badges.len().saturating_sub(1) as u16;
+    let gaps = u16::try_from(badges.len().saturating_sub(1)).unwrap_or(u16::MAX);
+    let badges_w = segs_width(&badges).saturating_add(gaps);
     let mut left_limit = width.saturating_sub(BODY_MARGIN);
-    if !badges.is_empty() && badges_w + 2 + INDENT < badge_right {
+    if !badges.is_empty() && badges_w.saturating_add(2 + INDENT) < badge_right {
         let mut x = badge_right - badges_w;
         left_limit = x - 2;
         for badge in badges {

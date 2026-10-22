@@ -14,11 +14,17 @@ pub fn grapheme_width(g: &str) -> u16 {
     }
 }
 
-/// Cells taken by `s`.
+/// Cells taken by `s`, saturating at `u16::MAX` (a post body can be wider).
 pub fn display_width(s: &str) -> u16 {
+    u16::try_from(cells(s)).unwrap_or(u16::MAX)
+}
+
+/// Cells taken by `s`, without a ceiling. Widths are summed in `usize` here,
+/// since one valid post body (64 KiB) is wider than `u16` can count.
+fn cells(s: &str) -> usize {
     s.graphemes(true)
-        .map(grapheme_width)
-        .fold(0u16, u16::saturating_add)
+        .map(|g| usize::from(grapheme_width(g)))
+        .sum()
 }
 
 /// Wraps `text` into lines at most `width` cells wide (a zero width counts as
@@ -26,7 +32,7 @@ pub fn display_width(s: &str) -> u16 {
 /// at a break; a word longer than a line starts on a fresh line and is broken
 /// between graphemes. Nothing but those spaces is dropped.
 pub fn wrap(text: &str, width: u16) -> Vec<String> {
-    let width = width.max(1);
+    let width = usize::from(width.max(1));
     let mut lines = Vec::new();
     for paragraph in text.split('\n') {
         wrap_paragraph(paragraph, width, &mut lines);
@@ -34,9 +40,9 @@ pub fn wrap(text: &str, width: u16) -> Vec<String> {
     lines
 }
 
-fn wrap_paragraph(paragraph: &str, width: u16, lines: &mut Vec<String>) {
+fn wrap_paragraph(paragraph: &str, width: usize, lines: &mut Vec<String>) {
     let mut line = String::new();
-    let mut line_w = 0u16;
+    let mut line_w = 0usize;
     // Whether `line` started at a soft break: spaces there are dropped.
     let mut after_break = false;
     // `split(' ')` yields an empty word for each extra space, which keeps
@@ -46,8 +52,8 @@ fn wrap_paragraph(paragraph: &str, width: u16, lines: &mut Vec<String>) {
         if at_break && word.is_empty() {
             continue;
         }
-        let word_w = display_width(word);
-        let gap = u16::from(i > 0 && !at_break);
+        let word_w = cells(word);
+        let gap = usize::from(i > 0 && !at_break);
         if line_w + gap + word_w <= width {
             if gap == 1 {
                 line.push(' ');
@@ -72,7 +78,7 @@ fn wrap_paragraph(paragraph: &str, width: u16, lines: &mut Vec<String>) {
         }
         // Longer than a whole line: break it between graphemes.
         for g in word.graphemes(true) {
-            let g_w = grapheme_width(g);
+            let g_w = usize::from(grapheme_width(g));
             if line_w + g_w > width && !line.is_empty() {
                 push_line(lines, &mut line);
                 line_w = 0;
@@ -92,16 +98,17 @@ fn push_line(lines: &mut Vec<String>, line: &mut String) {
 
 /// `s` cut to at most `width` cells, ending in `…` when anything was cut.
 pub fn truncate(s: &str, width: u16) -> String {
-    if display_width(s) <= width {
+    let width = usize::from(width);
+    if cells(s) <= width {
         return s.to_string();
     }
     if width == 0 {
         return String::new();
     }
     let mut out = String::new();
-    let mut used = 0u16;
+    let mut used = 0usize;
     for g in s.graphemes(true) {
-        let g_w = grapheme_width(g);
+        let g_w = usize::from(grapheme_width(g));
         if used + g_w > width - 1 {
             break;
         }
@@ -115,16 +122,17 @@ pub fn truncate(s: &str, width: u16) -> String {
 /// `s` cut from the front to at most `width` cells, starting with `…` when
 /// anything was cut (keeps the end of text being typed in view).
 pub fn truncate_start(s: &str, width: u16) -> String {
-    if display_width(s) <= width {
+    let width = usize::from(width);
+    if cells(s) <= width {
         return s.to_string();
     }
     if width == 0 {
         return String::new();
     }
     let mut kept: Vec<&str> = Vec::new();
-    let mut used = 0u16;
+    let mut used = 0usize;
     for g in s.graphemes(true).rev() {
-        let g_w = grapheme_width(g);
+        let g_w = usize::from(grapheme_width(g));
         if used + g_w > width - 1 {
             break;
         }

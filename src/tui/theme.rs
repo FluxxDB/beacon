@@ -2,6 +2,8 @@
 //! the approved mockup, and the xterm-256 fallback for terminals without
 //! 24-bit color.
 
+use std::cmp::Reverse;
+
 use ratatui::style::{Color, Modifier, Style};
 
 /// A 24-bit color.
@@ -154,7 +156,9 @@ impl Theme {
 
 /// The xterm-256 index nearest to `rgb` by squared RGB distance, over the
 /// 6×6×6 color cube (16–231) and the 24 greys (232–255). The first 16 are
-/// left out: terminals redefine them.
+/// left out: terminals redefine them. Ties go to the lighter color, so a
+/// lifted surface never collapses onto the panel below it (obsidian sits
+/// exactly between greys 233 and 234; carbon takes 233).
 pub fn nearest_xterm256(rgb: Rgb) -> u8 {
     const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
     let distance = |c: (u8, u8, u8)| -> u32 {
@@ -163,7 +167,7 @@ pub fn nearest_xterm256(rgb: Rgb) -> u8 {
     };
     let nearest_level = |v: u8| -> usize {
         (0..LEVELS.len())
-            .min_by_key(|&i| (i32::from(LEVELS[i]) - i32::from(v)).abs())
+            .min_by_key(|&i| ((i32::from(LEVELS[i]) - i32::from(v)).abs(), Reverse(i)))
             .unwrap_or(0)
     };
     let (r, g, b) = (
@@ -179,10 +183,12 @@ pub fn nearest_xterm256(rgb: Rgb) -> u8 {
             let level = 8 + 10 * i;
             (232 + usize::from(i), distance((level, level, level)))
         })
-        .min_by_key(|&(_, d)| d)
+        .min_by_key(|&(i, d)| (d, Reverse(i)))
         .unwrap_or((232, u32::MAX));
 
-    let index = if grey_distance < cube_distance {
+    let cube_light = u32::from(LEVELS[r]) + u32::from(LEVELS[g]) + u32::from(LEVELS[b]);
+    let grey_light = 3 * (8 + 10 * (grey_index as u32 - 232));
+    let index = if (grey_distance, Reverse(grey_light)) < (cube_distance, Reverse(cube_light)) {
         grey_index
     } else {
         cube_index

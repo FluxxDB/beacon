@@ -21,8 +21,8 @@ use ratatui::layout::Rect;
 use crate::tui::state::{ConfirmDialog, Dialog, FormField, NewChannelForm};
 use crate::tui::theme::{palette, role, Ink};
 use crate::tui::view::Layout;
-use crate::tui::widgets::{Canvas, Seg};
-use crate::tui::wrap::{display_width, truncate, truncate_start, wrap};
+use crate::tui::widgets::{segs_width, Canvas, Seg};
+use crate::tui::wrap::{truncate, truncate_start, wrap};
 
 const WIDTH: u16 = 54;
 /// Content starts this many cells in from the box's left edge.
@@ -203,8 +203,7 @@ impl Panel {
             ),
         ];
         let right = self.content_x() + self.field_width() - BUTTONS_INSET;
-        let width: u16 = segs.iter().map(|(t, _)| display_width(t)).sum();
-        if width <= right.saturating_sub(self.content_x()) {
+        if segs_width(&segs) <= right.saturating_sub(self.content_x()) {
             canvas.segs_right(right, y, &segs);
         }
     }

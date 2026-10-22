@@ -5,6 +5,7 @@ use crate::tui::state::App;
 use crate::tui::theme::{palette, role, ColorMode, Ink};
 use crate::tui::view::Layout;
 use crate::tui::widgets::{segs_width, Canvas, Seg};
+use crate::tui::wrap::{display_width, truncate};
 
 pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
     let area = layout.area;
@@ -30,7 +31,7 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
     };
     let room = right.saturating_sub(left);
     let ansi = canvas.theme().mode == ColorMode::Ansi256;
-    if let Some(status) = status_variants(app, ansi)
+    if let Some(status) = status_variants(app, ansi, room)
         .into_iter()
         .find(|segs| segs_width(segs) <= room)
     {
@@ -39,12 +40,13 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
 }
 
 /// The header status, fullest first: everything, then without the sync
-/// detail, then the node alone.
-fn status_variants(app: &App, ansi: bool) -> Vec<Vec<Seg>> {
+/// detail, then the node alone, then the node cut to fit `room`. In 256-color
+/// mode every variant ends with `· 256 colors`.
+fn status_variants(app: &App, ansi: bool, room: u16) -> Vec<Vec<Seg>> {
     let ink = |fg| Ink::new(fg, role::MAIN_BG);
     let node: Seg = (format!(" {}", app.node), ink(role::TEXT));
     let mut full = vec![node.clone()];
-    let mut short = vec![node.clone()];
+    let mut short = vec![node];
 
     let peers = app.peers.len();
     let offline = app.peers.iter().filter(|p| !p.reachable).count();
@@ -76,16 +78,20 @@ fn status_variants(app: &App, ansi: bool) -> Vec<Vec<Seg>> {
         }
     }
     short.push((format!("{peers_text} "), ink(role::META)));
-    if ansi {
-        for segs in [&mut full, &mut short] {
-            if let Some(last) = segs.last_mut() {
-                last.0.push_str("· 256 colors ");
-            }
+    let node_only = vec![(format!(" {} ", app.node), ink(role::TEXT))];
+
+    let marker: Option<Seg> = ansi.then(|| ("· 256 colors ".to_string(), ink(role::META)));
+    let marker_w = marker.as_ref().map_or(0, |m| display_width(&m.0));
+    let cut = truncate(&app.node, room.saturating_sub(marker_w + 2));
+    let node_cut = vec![(format!(" {cut} "), ink(role::TEXT))];
+
+    let mut variants = vec![full, short, node_only, node_cut];
+    if let Some(marker) = marker {
+        for segs in &mut variants {
+            segs.push(marker.clone());
         }
     }
-    let mut node_only = vec![node];
-    node_only[0].0.push(' ');
-    vec![full, short, node_only]
+    variants
 }
 
 /// `0.4s` under ten seconds, then `12s`, then minutes, hours, days.

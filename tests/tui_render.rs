@@ -4,6 +4,9 @@
 //! (lime only where allowed, every cell painted, 256-color fallback, narrow
 //! layout, wrapping, empty states) hold too.
 
+use std::collections::BTreeSet;
+use std::ops::Range;
+
 use beacon::tui::state::{
     AgentItem, App, AttachmentItem, ChannelItem, Conn, Dialog, Focus, FormField, NewChannelForm,
     PeerItem, PostItem, Selection,
@@ -303,9 +306,9 @@ fn color_name(c: Color) -> String {
         .unwrap_or_else(|| format!("{c:?}"))
 }
 
-/// Checks every cell against the per-row style runs `[col, fg, bg, bold]` of
-/// `{name}.colors.json`.
-fn assert_colors_match_fixture(buf: &Buffer, name: &str) {
+/// Checks every cell of `rows` against the per-row style runs
+/// `[col, fg, bg, bold]` of `{name}.colors.json`.
+fn assert_colors_match_fixture(buf: &Buffer, name: &str, rows: Range<usize>) {
     let path = format!("{FIXTURES}/{name}.colors.json");
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -313,6 +316,9 @@ fn assert_colors_match_fixture(buf: &Buffer, name: &str) {
     assert_eq!(fixture_rows.len(), buf.area.height as usize, "{name}: rows");
     let mut wrong = Vec::new();
     for (y, runs) in fixture_rows.iter().enumerate() {
+        if !rows.contains(&y) {
+            continue;
+        }
         let runs = runs.as_array().unwrap();
         for (i, run) in runs.iter().enumerate() {
             let start = run[0].as_u64().unwrap() as u16;
@@ -396,84 +402,169 @@ fn new_channel_dialog_matches_mockup() {
 #[test]
 fn colors_match_mockup() {
     let board = render(&mockup_app(), TRUECOLOR, 104, 33);
-    assert_colors_match_fixture(&board, "board");
+    assert_colors_match_fixture(&board, "board", 0..33);
     let modal = render(&modal_app(), TRUECOLOR, 104, 33);
-    assert_colors_match_fixture(&modal, "modal");
+    assert_colors_match_fixture(&modal, "modal", 0..33);
+    // The Mac screen's bottom border (row 29) carries a stray obsidian
+    // background left over by the mockup's generator; every other row counts.
+    let mac = render(&mockup_app(), TRUECOLOR, 94, 30);
+    assert_colors_match_fixture(&mac, "mac", 0..29);
 }
 
 // ---------------------------------------------------------------------------
 // Rules the mockup implies everywhere
 // ---------------------------------------------------------------------------
 
-/// The horizontal run of cells around (x, y) whose background is `bg`.
-fn bg_run(buf: &Buffer, x: u16, y: u16, bg: Color) -> (u16, u16) {
-    let mut start = x;
-    while start > 0 && buf[(start - 1, y)].bg == bg {
-        start -= 1;
-    }
-    let mut end = x + 1;
-    while end < buf.area.width && buf[(end, y)].bg == bg {
-        end += 1;
-    }
-    (start, end)
+type Cells = BTreeSet<(u16, u16)>;
+
+/// The cells allowed to carry lime on a screen, each found by the role of
+/// the element it belongs to.
+#[derive(Debug, Default)]
+struct LimeSites {
+    /// `▍` edge rules: the active channel's sidebar row, each announcement row.
+    edges: Cells,
+    /// The composer's `›`.
+    prompt: Cells,
+    /// Block carets: after the composer's text, after a focused field's value.
+    carets: Cells,
+    /// The dialog's primary action button.
+    primary: Cells,
 }
 
-/// Lime marks only the active channel's edge, the composer prompt `›` (and
-/// the caret right after typed text), an announcement's edge rule `▍` and a
-/// dialog's one primary action.
-fn assert_lime_only_where_allowed(buf: &Buffer, label: &str) {
-    let lime = rgb(palette::LIME);
-    let obsidian = rgb(palette::OBSIDIAN);
-    for y in 0..buf.area.height {
-        let row = row_text(buf, y);
-        for x in 0..buf.area.width {
-            let cell = &buf[(x, y)];
-            if cell.fg != lime && cell.bg != lime {
-                continue;
+/// The column where `needle` starts in row `y` (screens without wide glyphs).
+fn column_of(buf: &Buffer, y: u16, needle: &str) -> Option<u16> {
+    let row = row_text(buf, y);
+    row.find(needle)
+        .map(|byte| row[..byte].chars().count() as u16)
+}
+
+fn lime_sites(buf: &Buffer, app: &App) -> LimeSites {
+    let (width, height) = (buf.area.width, buf.area.height);
+    let has_sidebar = width >= 80;
+    let (x0, pane_w) = if has_sidebar {
+        main_pane(width)
+    } else {
+        (1, width - 2)
+    };
+    let mut sites = LimeSites::default();
+
+    // The active channel: the sidebar's first column on its row.
+    if let (true, Selection::Channel(name)) = (has_sidebar, &app.selected) {
+        let label = format!("# {name}");
+        let y = (1..height)
+            .find(|&y| region_text(buf, y, 2, x0 - 1).trim() == label)
+            .expect("active channel row");
+        sites.edges.insert((1, y));
+    }
+    // An announcement: the pane's edge column on its header row (the one
+    // with the `announcement` label) and on each body row under it.
+    for y in 1..height {
+        if region_text(buf, y, x0, x0 + pane_w).contains(" announcement ") {
+            let rows = y..height;
+            for row in
+                rows.take_while(|&r| !region_text(buf, r, x0 + 1, x0 + pane_w).trim().is_empty())
+            {
+                sites.edges.insert((x0, row));
             }
-            let symbol = cell.symbol();
-            let allowed = if cell.bg != lime {
-                // Lime ink: an edge rule on a lifted row, or the composer prompt.
-                (symbol == "▍" && cell.bg == obsidian)
-                    || (symbol == "›" && x >= 2 && buf[(x - 2, y)].symbol() == "│")
-            } else {
-                let (start, end) = bg_run(buf, x, y, lime);
-                let text: String = (start..end).map(|x| buf[(x, y)].symbol()).collect();
-                let primary_action = text.trim().starts_with('↵');
-                // A one-cell caret, in the composer's input row or a dialog field.
-                let caret = end - start == 1
-                    && (row.contains('›') || (start > 0 && buf[(start - 1, y)].bg == obsidian));
-                primary_action || caret
-            };
-            assert!(
-                allowed,
-                "{label}: lime at ({x},{y}) on {symbol:?}, row |{row}|"
-            );
         }
     }
+    // The composer's input row: `│ › text█`.
+    let y = (1..height)
+        .find(|&y| buf[(x0, y)].symbol() == "│" && buf[(x0 + 2, y)].symbol() == "›")
+        .expect("composer input row");
+    sites.prompt.insert((x0 + 2, y));
+    sites
+        .carets
+        .insert((x0 + 4 + wrap::display_width(&app.input), y));
+
+    if let Some(Dialog::NewChannel(form)) = &app.dialog {
+        let value = match form.field {
+            FormField::Name => &form.name,
+            FormField::Topic => &form.topic,
+        };
+        let y = (1..height)
+            .find(|&y| row_text(buf, y).contains(value.as_str()))
+            .expect("focused field row");
+        let x = column_of(buf, y, value).unwrap() + wrap::display_width(value);
+        sites.carets.insert((x, y));
+        let button = " ↵ create ";
+        let y = (1..height)
+            .find(|&y| row_text(buf, y).contains(button))
+            .expect("primary action row");
+        let x = column_of(buf, y, button).unwrap();
+        sites
+            .primary
+            .extend((x..x + wrap::display_width(button)).map(|x| (x, y)));
+    }
+    sites
+}
+
+fn lime_cells(buf: &Buffer) -> Cells {
+    let lime = rgb(palette::LIME);
+    buf.content()
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.fg == lime || c.bg == lime)
+        .map(|(i, _)| buf.pos_of(i))
+        .collect()
 }
 
 #[test]
 fn lime_only_where_allowed() {
-    let screens = [
-        ("board", render(&mockup_app(), TRUECOLOR, 104, 33)),
-        ("mac", render(&mockup_app(), TRUECOLOR, 94, 30)),
-        ("modal", render(&modal_app(), TRUECOLOR, 104, 33)),
-        ("narrow", render(&mockup_app(), TRUECOLOR, 79, 24)),
-    ];
-    for (label, buf) in &screens {
-        assert_lime_only_where_allowed(buf, label);
-    }
-    // The board uses each allowed mark: the active channel's edge, three rows
-    // of announcement edge, the prompt, and the caret.
     let lime = rgb(palette::LIME);
-    let board = &screens[0].1;
-    let lime_cells = board
-        .content()
-        .iter()
-        .filter(|c| c.fg == lime || c.bg == lime)
-        .count();
-    assert_eq!(lime_cells, 6, "lime cells on the board");
+    // Nothing dimmed: exactly the edges, the prompt and the caret are lime.
+    for (label, width, height) in [("board", 104, 33), ("mac", 94, 30), ("narrow", 79, 24)] {
+        let app = mockup_app();
+        let buf = render(&app, TRUECOLOR, width, height);
+        let sites = lime_sites(&buf, &app);
+        let allowed: Cells = sites
+            .edges
+            .iter()
+            .chain(&sites.prompt)
+            .chain(&sites.carets)
+            .copied()
+            .collect();
+        assert_eq!(lime_cells(&buf), allowed, "{label}: {sites:?}");
+        for &(x, y) in &sites.edges {
+            let cell = &buf[(x, y)];
+            assert_eq!(
+                (cell.symbol(), cell.fg, cell.bg),
+                ("▍", lime, rgb(palette::OBSIDIAN)),
+                "{label}: edge ({x},{y})"
+            );
+        }
+        for &(x, y) in &sites.prompt {
+            assert_eq!(
+                (buf[(x, y)].symbol(), buf[(x, y)].fg),
+                ("›", lime),
+                "{label}: prompt"
+            );
+        }
+        for &(x, y) in &sites.carets {
+            assert_eq!(buf[(x, y)].bg, lime, "{label}: caret ({x},{y})");
+        }
+        if label == "board" {
+            // The active channel, three announcement rows, prompt and caret.
+            assert_eq!((sites.edges.len(), allowed.len()), (4, 6));
+        }
+    }
+
+    // Behind a dialog the marks dim: lime stays on the two carets (composer
+    // and the focused field) and the dialog's primary action.
+    let app = modal_app();
+    let buf = render(&app, TRUECOLOR, 104, 33);
+    let sites = lime_sites(&buf, &app);
+    let allowed: Cells = sites.carets.union(&sites.primary).copied().collect();
+    assert_eq!(sites.carets.len(), 2);
+    assert_eq!(sites.primary.len(), 10);
+    assert_eq!(lime_cells(&buf), allowed, "modal: {sites:?}");
+    for &(x, y) in &sites.primary {
+        assert_eq!(
+            (buf[(x, y)].fg, buf[(x, y)].bg),
+            (rgb(palette::VOID), lime),
+            "primary ({x},{y})"
+        );
+    }
 }
 
 #[test]
@@ -522,6 +613,27 @@ fn ansi256_mode_maps_and_says_so() {
 }
 
 #[test]
+fn ansi256_marker_survives_a_long_node_name() {
+    let theme = Theme {
+        mode: ColorMode::Ansi256,
+    };
+    let mut app = mockup_app();
+    for node in [
+        "workstation-in-the-basement-rack-01".to_string(),
+        "n".repeat(70),
+    ] {
+        app.node = node;
+        for (width, height) in [(80, 24), (79, 24), (104, 33)] {
+            let header = row_text(&render(&app, theme, width, height), 0);
+            assert!(
+                header.contains("· 256 colors ─╮"),
+                "{width}x{height}: {header}"
+            );
+        }
+    }
+}
+
+#[test]
 fn ansi256_picks_nearest_xterm_color() {
     let theme = Theme {
         mode: ColorMode::Ansi256,
@@ -533,6 +645,21 @@ fn ansi256_picks_nearest_xterm_color() {
     // #e4f222 -> cube (4, 5, 0) = #d7ff00.
     assert_eq!(theme.c(palette::LIME), Color::Indexed(190));
     assert_eq!(TRUECOLOR.c(palette::LIME), Color::Rgb(0xe4, 0xf2, 0x22));
+    // Obsidian is exactly between greys 233 and 234; the tie goes to the
+    // lighter one, so a lifted row still stands off the carbon panel.
+    assert_eq!(theme.c(palette::CARBON), Color::Indexed(233));
+    assert_eq!(theme.c(palette::OBSIDIAN), Color::Indexed(234));
+    // Every surface keeps its own step.
+    let surfaces: BTreeSet<String> = [
+        palette::VOID,
+        palette::CARBON,
+        palette::OBSIDIAN,
+        palette::GRAPHITE,
+    ]
+    .iter()
+    .map(|&c| format!("{:?}", theme.c(c)))
+    .collect();
+    assert_eq!(surfaces.len(), 4, "{surfaces:?}");
 }
 
 #[test]
@@ -655,8 +782,73 @@ fn wraps_wide_and_long_tokens() {
     );
 
     assert_eq!(wrap::truncate("mac-juicebox-long-handle", 10), "mac-juice…");
+    assert_eq!(
+        wrap::truncate(&"x".repeat(70_000), 5),
+        "xxxx…",
+        "wider than u16 counts"
+    );
     assert_eq!(wrap::truncate("pc-vllm", 10), "pc-vllm");
     assert_eq!(wrap::truncate("日本語のテキスト", 5), "日本…");
+}
+
+#[test]
+fn wraps_a_body_wider_than_u16() {
+    // The server takes bodies up to 64 KiB, so one token can be 65 534 cells.
+    let body = format!("a {}", "x".repeat(65_534));
+    let lines = wrap::wrap(&body, 63);
+    for line in &lines {
+        assert!(line.as_str().cell_width() <= 63, "{} wide", line.len());
+    }
+    assert_eq!(lines[0], "a");
+    assert_eq!(lines.concat(), format!("a{}", "x".repeat(65_534)));
+    assert_eq!(lines.len(), 1 + 65_534_usize.div_ceil(63));
+
+    // And on screen: the newest rows are the token's tail, hard-broken.
+    let mut app = mockup_app();
+    app.posts = vec![post(
+        "01JAN0000000000000000000C1",
+        at(18, 9),
+        "pc-configs",
+        Some("claude-code"),
+        "pc",
+        &body,
+        &[],
+        &[],
+    )];
+    let buf = render(&app, TRUECOLOR, 104, 33);
+    let (x0, pane_w) = main_pane(104);
+    let last = region_text(&buf, 24, x0, x0 + pane_w);
+    let tail = 65_534 % 63;
+    assert_eq!(last.trim(), "x".repeat(tail), "|{last}|");
+    let full = region_text(&buf, 23, x0, x0 + pane_w);
+    assert_eq!(full.trim(), "x".repeat(63), "|{full}|");
+}
+
+#[test]
+fn trailing_whitespace_adds_no_row() {
+    let mut app = mockup_app();
+    let mut first = app.posts[1].clone();
+    first.body = "hello\n".to_string();
+    first.tags.clear();
+    let mut second = app.posts[2].clone();
+    // Exactly the body width (63 at 104 cols), then a space and a newline.
+    second.body = format!("{} \n", "x".repeat(63));
+    second.tags.clear();
+    second.mentions.clear();
+    app.posts = vec![first, second];
+    let buf = render(&app, TRUECOLOR, 104, 33);
+    let (x0, pane_w) = main_pane(104);
+    let pane = |y: u16| region_text(&buf, y, x0, x0 + pane_w).trim().to_string();
+    // Bottom-anchored on row 24, with nothing but a blank between the posts.
+    assert_eq!(pane(24), "x".repeat(63));
+    assert!(
+        pane(23).starts_with("6:12 pm  mac-juicebox"),
+        "{}",
+        pane(23)
+    );
+    assert_eq!(pane(22), "");
+    assert_eq!(pane(21), "hello");
+    assert!(pane(20).starts_with("6:09 pm  pc-configs"), "{}", pane(20));
 }
 
 // ---------------------------------------------------------------------------

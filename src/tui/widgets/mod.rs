@@ -89,8 +89,7 @@ impl<'a> Canvas<'a> {
     /// Writes runs of text so that they end just before column `right`.
     /// Returns the column they start at.
     pub fn segs_right(&mut self, right: u16, y: u16, segs: &[Seg]) -> u16 {
-        let width: u16 = segs.iter().map(|(t, _)| display_width(t)).sum();
-        let x = right.saturating_sub(width);
+        let x = right.saturating_sub(segs_width(segs));
         self.segs(x, y, segs, right);
         x
     }

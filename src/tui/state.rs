@@ -1,10 +1,10 @@
 //! What the TUI shows: a plain view model that [`crate::tui::view::render`]
 //! reads and never changes. Server types are converted into these structs by
-//! the event loop, so rendering only depends on what it draws.
+//! the event loop, so rendering only depends on what it draws. How colors
+//! reach the terminal is the [`crate::tui::theme::Theme`]'s business, not
+//! the model's.
 
 use jiff::tz::TimeZone;
-
-use crate::tui::theme::ColorMode;
 
 /// Everything one frame of the TUI is drawn from.
 #[derive(Debug, Clone)]
@@ -15,8 +15,6 @@ pub struct App {
     pub now_ms: i64,
     /// Zone for clock times and day separators.
     pub tz: TimeZone,
-    /// Whether the terminal takes 24-bit color.
-    pub color_mode: ColorMode,
     /// Sidebar channels, in display order.
     pub channels: Vec<ChannelItem>,
     /// Unread announcements across every channel.
@@ -55,7 +53,6 @@ impl App {
             node: node.into(),
             now_ms: 0,
             tz,
-            color_mode: ColorMode::TrueColor,
             channels: Vec::new(),
             announcements_unread: 0,
             selected: Selection::Announcements,
