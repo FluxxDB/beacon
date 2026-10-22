@@ -97,11 +97,15 @@ pub fn switcher(canvas: &mut Canvas, app: &App, layout: &Layout) {
     } else {
         role::QUIET
     };
-    segs.push(("  ‹ ".to_string(), ink(arrows)));
-    segs.push((current, ink(role::STRONG)));
-    segs.push((" ›".to_string(), ink(arrows)));
     let main = layout.main;
     let room = main.width.saturating_sub(2);
+    let (open, close) = ("  ‹ ", " ›");
+    // A long name is cut with `…`, keeping the closing arrow.
+    let fixed = segs_width(&segs) + display_width(open) + display_width(close);
+    let current = truncate(&current, room.saturating_sub(fixed));
+    segs.push((open.to_string(), ink(arrows)));
+    segs.push((current, ink(role::STRONG)));
+    segs.push((close.to_string(), ink(arrows)));
     let elsewhere: u32 = app
         .channels
         .iter()

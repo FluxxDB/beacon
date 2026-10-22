@@ -84,6 +84,8 @@ pub struct App {
     pub selected_post: Option<String>,
     /// A short notice shown in the help row (`saved to ./exchange/x`).
     pub toast: Option<String>,
+    /// The toast reports a failure (drawn in coral).
+    pub toast_error: bool,
 
     // ------------------------------------------- remembered between frames
     /// When the toast goes away (epoch ms); `None` keeps it up.
@@ -93,6 +95,9 @@ pub struct App {
     /// The view's posts are being fetched: the pane stays blank rather than
     /// say the channel is empty.
     pub loading: bool,
+    /// The view's newest posts could not be fetched: the pane says so
+    /// rather than call the channel empty.
+    pub load_failed: bool,
     /// The live feed from the local server is open.
     pub live: bool,
     /// A first view has been picked (the first channel list picks it).
@@ -119,6 +124,10 @@ pub struct App {
     /// What arrived live while the view's newest page was on its way, so the
     /// page cannot drop it (or bring back what was deleted meanwhile).
     pub arrivals: Option<Arrivals>,
+    /// Live posts older than the oldest page post that came while a page of
+    /// older posts was on its way: the node may have read that page before
+    /// they arrived, so they go in when it lands, where they fit.
+    pub held: Vec<(PostItem, PostExtra)>,
     pub last_heartbeat_ms: Option<i64>,
     pub last_status_ms: Option<i64>,
 }
@@ -146,9 +155,11 @@ impl App {
             filter: None,
             selected_post: None,
             toast: None,
+            toast_error: false,
             toast_until_ms: None,
             size: (0, 0),
             loading: false,
+            load_failed: false,
             live: false,
             view_chosen: false,
             filter_editing: false,
@@ -160,6 +171,7 @@ impl App {
             loading_older: false,
             extras: HashMap::new(),
             arrivals: None,
+            held: Vec::new(),
             last_heartbeat_ms: None,
             last_status_ms: None,
         }
@@ -181,7 +193,7 @@ pub struct PostExtra {
 /// being fetched.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Arrivals {
-    pub posts: Vec<PostItem>,
+    pub posts: Vec<(PostItem, PostExtra)>,
     pub deleted: HashSet<String>,
 }
 
@@ -453,16 +465,20 @@ pub struct ConfirmDialog {
 impl App {
     /// Applies `msg` and returns what the event loop should do next.
     pub fn update(&mut self, msg: Msg) -> Vec<Cmd> {
+        let scrolled = self.scroll > 0;
+        let filtered = !posts::shows_all(self);
+        let mut cmds = self.apply(msg);
+        // Back down at the newest (by a key, a resize, a deletion or a sent
+        // post), or the filter gone: what was out of sight is seen now.
+        if self.scroll == 0 && (scrolled || (filtered && posts::shows_all(self))) {
+            cmds.extend(self.caught_up());
+        }
+        cmds
+    }
+
+    fn apply(&mut self, msg: Msg) -> Vec<Cmd> {
         match msg {
-            Msg::Key(key) => {
-                let scrolled = self.scroll > 0;
-                let mut cmds = self.on_key(key);
-                // Back down at the newest: what came in meanwhile is seen.
-                if scrolled && self.scroll == 0 {
-                    cmds.extend(self.caught_up());
-                }
-                cmds
-            }
+            Msg::Key(key) => self.on_key(key),
             Msg::Paste(text) => self.on_paste(&text),
             Msg::Resize(width, height) => {
                 self.size = (width, height);
@@ -522,16 +538,23 @@ impl App {
 
     /// Shows `text` in the help row for a few seconds.
     pub(crate) fn toast(&mut self, text: impl Into<String>) {
-        self.toast_for(text.into(), TOAST_MS);
+        self.toast_for(text.into(), TOAST_MS, false);
     }
 
-    /// Shows a failure in the help row, for longer.
+    /// Shows a failure in the help row, in coral, for longer.
     pub(crate) fn error(&mut self, text: impl Into<String>) {
-        self.toast_for(text.into(), ERROR_TOAST_MS);
+        self.toast_for(text.into(), ERROR_TOAST_MS, true);
     }
 
-    fn toast_for(&mut self, text: String, ms: i64) {
+    /// Shows what is being waited on (`saving x…`) as long as a failure
+    /// stays; the answer replaces it.
+    pub(crate) fn waiting(&mut self, text: impl Into<String>) {
+        self.toast_for(text.into(), ERROR_TOAST_MS, false);
+    }
+
+    fn toast_for(&mut self, text: String, ms: i64, error: bool) {
         self.toast = Some(text);
+        self.toast_error = error;
         self.toast_until_ms = Some(self.now_ms.saturating_add(ms));
     }
 
@@ -541,6 +564,7 @@ impl App {
         self.now_ms = now_ms;
         if self.toast_until_ms.is_some_and(|until| now_ms >= until) {
             self.toast = None;
+            self.toast_error = false;
             self.toast_until_ms = None;
         }
         // Presence ages with the clock: active for 5 minutes, then idle,
@@ -613,6 +637,7 @@ impl App {
         self.scroll = 0;
         self.has_older = false;
         self.oldest_page = None;
+        self.held.clear();
         self.load_view()
     }
 
@@ -621,6 +646,7 @@ impl App {
     fn load_view(&mut self) -> Vec<Cmd> {
         self.arrivals = Some(Arrivals::default());
         self.loading = self.posts.is_empty();
+        self.load_failed = false;
         self.loading_older = false;
         vec![match &self.selected {
             Selection::Channel(name) => Cmd::LoadPosts {
@@ -764,6 +790,7 @@ impl App {
                     self.loading_older = false;
                 } else {
                     self.loading = false;
+                    self.load_failed = true;
                     self.arrivals = None;
                 }
                 self.error(format!("Couldn't load {}: {e}", view_name(&view)));
@@ -796,27 +823,52 @@ impl App {
                     self.posts.push(item);
                 }
             }
+            // Held posts below the new cursor go in now; any above it come
+            // with the next page, which is asked for after they arrived.
+            for (item, extra) in std::mem::take(&mut self.held) {
+                let above = full
+                    && self
+                        .oldest_page
+                        .as_ref()
+                        .is_some_and(|c| before_cursor(&item, c));
+                if !above && !self.posts.iter().any(|p| p.id == item.id) {
+                    self.extras.insert(item.id.clone(), extra);
+                    self.posts.push(item);
+                }
+            }
             sort_posts(&mut self.posts);
             return Vec::new();
         }
 
         let has_older = full && matches!(self.selected, Selection::Channel(_));
+        // An older page asked for while this one loaded (paging the posts
+        // still on screen) fits only if this page starts where the last one
+        // did. Otherwise it will be dropped, and paging must not wait for it.
+        self.loading_older = self.loading_older && page_oldest == self.oldest_page;
+        if !self.loading_older {
+            self.held.clear();
+        }
         let arrivals = self.arrivals.take().unwrap_or_default();
         let mut posts: Vec<PostItem> = items
             .into_iter()
             .filter(|p| !arrivals.deleted.contains(&p.id))
             .collect();
-        for post in arrivals.posts {
+        for (post, extra) in arrivals.posts {
+            if arrivals.deleted.contains(&post.id) || posts.iter().any(|p| p.id == post.id) {
+                continue;
+            }
             let above = has_older
                 && page_oldest
                     .as_ref()
                     .is_some_and(|c| before_cursor(&post, c));
-            if !above
-                && !arrivals.deleted.contains(&post.id)
-                && !posts.iter().any(|p| p.id == post.id)
-            {
-                posts.push(post);
+            if above {
+                if self.loading_older {
+                    self.hold(post, extra);
+                }
+                continue;
             }
+            self.extras.insert(post.id.clone(), extra);
+            posts.push(post);
         }
         sort_posts(&mut posts);
         self.oldest_page = page_oldest;
@@ -844,9 +896,10 @@ impl App {
             StreamEvent::Post(post) => self.on_live_post(&post),
             StreamEvent::PostDeleted { id } => {
                 if let Some(arrivals) = &mut self.arrivals {
-                    arrivals.posts.retain(|p| p.id != id);
+                    arrivals.posts.retain(|(p, _)| p.id != id);
                     arrivals.deleted.insert(id.clone());
                 }
+                self.held.retain(|(p, _)| p.id != id);
                 self.remove_post(&id);
                 // The unread counts may have included it.
                 vec![Cmd::LoadChannels]
@@ -956,8 +1009,8 @@ impl App {
         }
         let item = convert::post_item(&created.post);
         self.add_to_view(item, convert::post_extra(&created.post));
-        // Down to the newest, to see it; what came in meanwhile is seen too.
-        let scrolled = self.scroll > 0;
+        // Down to the newest, to see it; what came in meanwhile is seen too
+        // (`update` marks it read).
         self.scroll = 0;
         let queued: Vec<&str> = created
             .delivery
@@ -968,11 +1021,7 @@ impl App {
         if !queued.is_empty() {
             self.toast(format!("sent · queued for {} (offline)", queued.join(", ")));
         }
-        if scrolled {
-            self.caught_up()
-        } else {
-            Vec::new()
-        }
+        Vec::new()
     }
 
     /// Puts a post that came outside a page (live, or just sent) into the
@@ -987,7 +1036,7 @@ impl App {
         }
         // While the first page is on its way, the page decides (on_posts).
         if let Some(arrivals) = &mut self.arrivals {
-            arrivals.posts.push(item.clone());
+            arrivals.posts.push((item.clone(), extra.clone()));
         }
         if self.has_older
             && self
@@ -995,11 +1044,22 @@ impl App {
                 .as_ref()
                 .is_some_and(|c| before_cursor(&item, c))
         {
+            // Left for paging; a page already on its way may not have it.
+            if self.loading_older {
+                self.hold(item, extra);
+            }
             return false;
         }
         self.extras.insert(item.id.clone(), extra);
         self.insert_post(item);
         true
+    }
+
+    /// Keeps `item` for the older page on its way (once).
+    fn hold(&mut self, item: PostItem, extra: PostExtra) {
+        if !self.held.iter().any(|(p, _)| p.id == item.id) {
+            self.held.push((item, extra));
+        }
     }
 
     fn on_created(&mut self, result: Result<ChannelAck, String>) -> Vec<Cmd> {
@@ -1056,13 +1116,13 @@ impl App {
             return;
         }
         // Somewhere in the middle (a late post): measure what moved.
-        let before = total_rows(&posts::spans(self, width));
+        let before = posts::total_rows(self, &posts::spans(self, width));
         let id = item.id.clone();
         self.posts.insert(at, item);
         let spans = posts::spans(self, width);
         let below = spans.iter().find(|s| s.id == id).map(|s| s.bottom);
         if below.is_some_and(|b| b < self.scroll) {
-            self.scroll += total_rows(&spans).saturating_sub(before);
+            self.scroll += posts::total_rows(self, &spans).saturating_sub(before);
         }
     }
 
@@ -1107,7 +1167,7 @@ impl App {
     /// The highest useful scroll: the oldest loaded row at the top.
     pub(crate) fn max_scroll(&self) -> Option<usize> {
         let view = self.viewport()?;
-        let total = total_rows(&posts::spans(self, view.width));
+        let total = posts::total_rows(self, &posts::spans(self, view.width));
         Some(total.saturating_sub(usize::from(view.height)))
     }
 
@@ -1121,11 +1181,6 @@ impl App {
 /// Whether `post` sorts before the cursor `(ts, id)`.
 fn before_cursor(post: &PostItem, cursor: &(i64, String)) -> bool {
     (post.ts_ms, post.id.as_str()) < (cursor.0, cursor.1.as_str())
-}
-
-/// Rows taken by everything laid out in `spans`.
-pub(crate) fn total_rows(spans: &[posts::Span]) -> usize {
-    spans.last().map_or(0, |s| s.bottom + s.height)
 }
 
 /// Whether something done every `every` ms, last at `last`, is due at `now`.
@@ -1148,7 +1203,7 @@ fn sort_agents(agents: &mut [AgentItem]) {
 }
 
 /// `#beacon` or `announcements`, for messages.
-fn view_name(view: &Selection) -> String {
+pub(crate) fn view_name(view: &Selection) -> String {
     match view {
         Selection::Channel(name) => format!("#{name}"),
         Selection::Announcements => "announcements".to_string(),
