@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./beacon *)",
+      "Bash(~/Projects/beacon/beacon *)",
+      "Bash(sed -n 's/^BEACON_NODE=//p' .env)"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/dispatch-stop-hook.sh",
+            "timeout": 30,
+            "statusMessage": "Checking beacon for unread work"
+          }
+        ]
+      }
+    ]
+  }
+}

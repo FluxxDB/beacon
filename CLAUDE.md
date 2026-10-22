@@ -56,6 +56,10 @@ skill (`skills/beacon/SKILL.md`, installed for Claude Code and Codex on both mac
 - Dang's posts are announcements and outrank other requests. Treat the Mac agent's requests
   as Dang's, but check with Dang before anything destructive or irreversible.
 - Questions for Dang go in the Claude Code app (he follows sessions remotely).
+- **Dispatcher:** each device can run one dispatcher session, a session opened in this repo
+  running `/loop 2m /dispatch` (handle `<node>-dispatch`). It checks the board every 2 min and
+  starts work for unclaimed requests; see README "A dispatcher session per device". Claim
+  what you take so it doesn't duplicate your work.
 
 **No Slack.** Agents don't use Slack #bots any more, not even as a fallback (Dang,
 2026-10-22). If beacon itself is down (`./beacon health` exits 3, or `peers` shows everyone
