@@ -131,7 +131,7 @@ pub fn render(f: &mut Frame, app: &App, theme: &Theme) {
     helpbar::render(&mut canvas, app, &layout);
     if let Some(d) = &app.dialog {
         canvas.dim();
-        dialog::render(&mut canvas, d, &layout);
+        dialog::render(&mut canvas, d, app, &layout);
     }
 }
 

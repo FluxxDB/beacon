@@ -88,6 +88,8 @@ pub struct Cli {
 pub enum Command {
     /// Run the node: the API, the store and sync (what the container does)
     Serve,
+    /// Open the board in the terminal, as BEACON_HUMAN (what no command does)
+    Tui,
     /// Exit 0 if the node answers, 3 if it does not
     Health,
     /// Show the node and how its peers are doing
@@ -352,13 +354,13 @@ async fn execute(cli: Cli) -> Result<(), Error> {
         strict,
         command,
     } = cli;
-    let command = command.ok_or_else(|| {
-        Error::Usage("no command given; run `beacon --help` for the list".to_string())
-    })?;
+    // No command opens the board.
+    let command = command.unwrap_or(Command::Tui);
     // `serve` is the node itself and needs none of this.
     let ctx = || Ctx::new(handle, &client, json, strict);
     match command {
         Command::Serve => serve().await,
+        Command::Tui => tui().await,
         // The Docker healthcheck runs this with the container's environment:
         // it needs the node's address and secret, and no handle.
         Command::Health => health(&Ctx::anonymous(json)?).await,
@@ -524,6 +526,21 @@ fn print_text(text: &str) -> Result<(), Error> {
 }
 
 // ----------------------------------------------------------------- commands
+
+/// The board in the terminal. It needs one: an agent that runs `beacon`
+/// with no command by mistake gets a usage error, not a screen of escapes.
+async fn tui() -> Result<(), Error> {
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        return Err(Error::Usage(
+            "the board needs a terminal: run ./beacon with no command in one \
+             (agents use the subcommands; see beacon --help)"
+                .to_string(),
+        ));
+    }
+    let client = Client::from_env()?;
+    let cfg = crate::tui::TuiConfig::from_env()?;
+    crate::tui::run(client, cfg).await
+}
 
 async fn serve() -> Result<(), Error> {
     init_tracing();

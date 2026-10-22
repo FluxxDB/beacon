@@ -18,24 +18,122 @@
 
 use ratatui::layout::Rect;
 
-use crate::tui::state::{ConfirmDialog, Dialog, FormField, NewChannelForm};
+use crate::timefmt::age_short;
+use crate::tui::keys::HELP;
+use crate::tui::state::{
+    App, AttachPicker, ConfirmDialog, Dialog, FormField, NewChannelForm, NAME_RULE,
+};
 use crate::tui::theme::{palette, role, Ink};
 use crate::tui::view::Layout;
+use crate::tui::widgets::posts::human_size;
 use crate::tui::widgets::{segs_width, Canvas, Seg};
-use crate::tui::wrap::{truncate, truncate_start, wrap};
+use crate::tui::wrap::{display_width, truncate, truncate_start, wrap};
 
 const WIDTH: u16 = 54;
 /// Content starts this many cells in from the box's left edge.
 const PAD: u16 = 3;
 /// The buttons end this many cells before the fields do.
 const BUTTONS_INSET: u16 = 4;
-const NAME_HINT: &str = "lowercase letters, digits and dashes";
+const NAME_HINT: &str = NAME_RULE;
+/// Files the attach picker lists at once; more scroll.
+const PICKER_ROWS: usize = 8;
+/// Cells of the help's key column.
+const HELP_KEYS: u16 = 15;
 
-pub fn render(canvas: &mut Canvas, dialog: &Dialog, layout: &Layout) {
+pub fn render(canvas: &mut Canvas, dialog: &Dialog, app: &App, layout: &Layout) {
     match dialog {
         Dialog::NewChannel(form) => new_channel(canvas, form, layout),
         Dialog::Confirm(confirm) => confirmation(canvas, confirm, layout),
+        Dialog::Attach(picker) => attach(canvas, picker, app, layout),
+        Dialog::Help => help(canvas, layout),
     }
+}
+
+/// The attach picker: the exchange folder, newest first, the highlighted
+/// file lifted; what message goes with it; `esc cancel   ↵ attach`.
+///
+/// ```text
+/// │  Attach a file                                     │
+/// │                                                    │
+/// │   test-report.txt                    12 KB    3m   │   highlighted: lifted
+/// │  build.log                          3.4 MB    1h   │
+/// │                                                    │
+/// │  with "on my way, tagging after the PC…"           │
+/// │                                                    │
+/// │                        esc cancel   ↵ attach       │
+/// ```
+fn attach(canvas: &mut Canvas, picker: &AttachPicker, app: &App, layout: &Layout) {
+    let files = match &picker.files {
+        Some(Ok(files)) if !files.is_empty() => files,
+        other => {
+            let (text, fg) = match other {
+                None => ("Reading ./exchange…".to_string(), role::META),
+                Some(Err(e)) => (format!("Can't read ./exchange: {e}"), role::ERROR),
+                Some(Ok(_)) => (
+                    "No files in ./exchange yet. Copy one there, then press a again.".to_string(),
+                    role::META,
+                ),
+            };
+            let field_w = WIDTH
+                .min(layout.main.width.saturating_sub(2))
+                .saturating_sub(2 * PAD);
+            let lines = wrap(&text, field_w.max(1));
+            let height = 6 + lines.len() as u16;
+            let Some(b) = Panel::open(canvas, layout, height, "Attach a file") else {
+                return;
+            };
+            for (i, line) in lines.iter().enumerate() {
+                b.text(canvas, 3 + i as u16, line, Ink::new(fg, role::DIALOG_BG));
+            }
+            b.close_only(canvas, height - 2);
+            return;
+        }
+    };
+
+    // Rows for files: as many as fit, up to PICKER_ROWS, scrolled to keep
+    // the highlighted one in view.
+    let fixed = 8u16;
+    let room = usize::from(layout.area.height.saturating_sub(2 + fixed)).max(1);
+    let rows = files.len().min(PICKER_ROWS).min(room);
+    let first = picker
+        .selected
+        .saturating_sub(rows - 1)
+        .min(files.len() - rows);
+    let height = fixed + rows as u16;
+    let Some(b) = Panel::open(canvas, layout, height, "Attach a file") else {
+        return;
+    };
+    for (i, file) in files.iter().enumerate().skip(first).take(rows) {
+        let row = 3 + (i - first) as u16;
+        let highlighted = i == picker.selected;
+        b.file_row(canvas, row, file, app.now_ms, highlighted);
+    }
+    let message = picker.message.split('\n').next().unwrap_or("").trim();
+    let with = if message.is_empty() {
+        "no message: the file goes on its own".to_string()
+    } else {
+        format!("with “{message}”")
+    };
+    let with_row = 4 + rows as u16;
+    b.text(
+        canvas,
+        with_row,
+        &with,
+        Ink::new(role::META, role::DIALOG_BG),
+    );
+    b.buttons(canvas, height - 2, "attach");
+}
+
+/// Every key and what it does; any key closes it.
+fn help(canvas: &mut Canvas, layout: &Layout) {
+    let height = 6 + HELP.len() as u16;
+    let Some(b) = Panel::open(canvas, layout, height, "Keys") else {
+        return;
+    };
+    for (i, (keys, what)) in HELP.iter().enumerate() {
+        b.pair(canvas, 3 + i as u16, keys, what);
+    }
+    b.close_only(canvas, height - 2);
 }
 
 fn new_channel(canvas: &mut Canvas, form: &NewChannelForm, layout: &Layout) {
@@ -97,8 +195,14 @@ impl Panel {
         }
         let x = main.x + (main.width - width) / 2;
         let posts = layout.posts;
+        // Centered on the posts; a taller box on the rows between the top
+        // border and the help row's rule, and only past those if it must.
+        let body_top = area.y + 1;
+        let body_rows = layout.help_y.saturating_sub(1 + body_top);
         let y = if height <= posts.height {
             posts.y + (posts.height - height) / 2
+        } else if height <= body_rows {
+            body_top + (body_rows - height) / 2
         } else {
             area.y + (area.height - height) / 2
         };
@@ -206,5 +310,88 @@ impl Panel {
         if segs_width(&segs) <= right.saturating_sub(self.content_x()) {
             canvas.segs_right(right, y, &segs);
         }
+    }
+
+    /// `esc close` where the buttons go, for a dialog with nothing to do.
+    fn close_only(&self, canvas: &mut Canvas, row: u16) {
+        let Some(y) = self.row(row) else { return };
+        let segs: Vec<Seg> = vec![(
+            " esc close ".to_string(),
+            Ink::new(role::META, role::DIALOG_BG),
+        )];
+        let right = self.content_x() + self.field_width() - BUTTONS_INSET;
+        if segs_width(&segs) <= right.saturating_sub(self.content_x()) {
+            canvas.segs_right(right, y, &segs);
+        }
+    }
+
+    /// One line of the help: the keys in mist, what they do in fog.
+    fn pair(&self, canvas: &mut Canvas, row: u16, keys: &str, what: &str) {
+        let Some(y) = self.row(row) else { return };
+        let x = self.content_x();
+        let end = x + self.field_width();
+        let key_w = HELP_KEYS.min(self.field_width() / 2);
+        canvas.text(
+            x,
+            y,
+            &truncate(keys, key_w.saturating_sub(1)),
+            Ink::new(role::TEXT, role::DIALOG_BG),
+            end,
+        );
+        let what = truncate(what, self.field_width().saturating_sub(key_w));
+        canvas.text(
+            x + key_w,
+            y,
+            &what,
+            Ink::new(role::META, role::DIALOG_BG),
+            end,
+        );
+    }
+
+    /// A file in the picker: name, size and age; lifted when highlighted.
+    fn file_row(
+        &self,
+        canvas: &mut Canvas,
+        row: u16,
+        file: &crate::tui::state::ExchangeFile,
+        now_ms: i64,
+        highlighted: bool,
+    ) {
+        let Some(y) = self.row(row) else { return };
+        let x0 = self.content_x();
+        let width = self.field_width();
+        let end = x0 + width;
+        let bg = if highlighted {
+            role::LIFTED
+        } else {
+            role::DIALOG_BG
+        };
+        if highlighted {
+            canvas.fill(Rect::new(x0, y, width, 1), Ink::new(role::TEXT, bg));
+        }
+        let size = human_size(file.size);
+        let age = age_short(now_ms.saturating_sub(file.modified_ms));
+        let right = format!("{size:>7}  {age:>4} ");
+        let right_w = display_width(&right);
+        let name_room = width.saturating_sub(right_w + 3);
+        let name_fg = if highlighted {
+            role::STRONG
+        } else {
+            role::META
+        };
+        canvas.text(
+            x0 + 1,
+            y,
+            &truncate(&file.name, name_room),
+            Ink::new(name_fg, bg),
+            end,
+        );
+        canvas.text(
+            end.saturating_sub(right_w),
+            y,
+            &right,
+            Ink::new(role::QUIET, bg),
+            end,
+        );
     }
 }

@@ -1,8 +1,8 @@
 //! The main pane's title row (`# beacon   topic`) and its rule, and the
 //! one-line channel switcher that stands in for the sidebar below 80 columns.
 
-use crate::tui::state::{App, Selection};
-use crate::tui::theme::{role, Ink};
+use crate::tui::state::{App, Focus, Selection};
+use crate::tui::theme::{palette, role, Ink};
 use crate::tui::view::Layout;
 use crate::tui::widgets::{segs_width, Canvas, Seg};
 use crate::tui::wrap::{display_width, truncate};
@@ -20,14 +20,19 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
         ink(role::FRAME),
     );
 
-    // An active filter, right-aligned where the post badges end.
-    if let Some(filter) = app.filter.as_deref().filter(|f| !f.is_empty()) {
-        let segs: Vec<Seg> = vec![
+    // An active filter, right-aligned where the post badges end; while it is
+    // being typed, with the caret after it.
+    let filter = app.filter.as_deref().unwrap_or("");
+    if !filter.is_empty() || app.filter_editing {
+        let mut segs: Vec<Seg> = vec![
             ("filter ".to_string(), ink(role::QUIET)),
             (format!("/{filter}"), ink(role::TEXT)),
         ];
+        if app.filter_editing {
+            segs.push((" ".to_string(), Ink::new(palette::VOID, role::ACCENT)));
+        }
         let end = main.right().saturating_sub(3);
-        if segs_width(&segs) + 2 < end.saturating_sub(left) {
+        if segs_width(&segs).saturating_add(2) < end.saturating_sub(left) {
             right = canvas.segs_right(end, layout.title_y, &segs) - 2;
         }
     }
@@ -86,9 +91,15 @@ pub fn switcher(canvas: &mut Canvas, app: &App, layout: &Layout) {
         Selection::Announcements => "◆ Announcements".to_string(),
         Selection::Channel(name) => format!("# {name}"),
     };
-    segs.push(("  ‹ ".to_string(), ink(role::QUIET)));
+    // The arrows brighten while j/k switch channels here (the sidebar's focus).
+    let arrows = if app.focus == Focus::Sidebar {
+        role::TEXT
+    } else {
+        role::QUIET
+    };
+    segs.push(("  ‹ ".to_string(), ink(arrows)));
     segs.push((current, ink(role::STRONG)));
-    segs.push((" ›".to_string(), ink(role::QUIET)));
+    segs.push((" ›".to_string(), ink(arrows)));
     let main = layout.main;
     let room = main.width.saturating_sub(2);
     let elsewhere: u32 = app

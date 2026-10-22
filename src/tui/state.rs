@@ -1,12 +1,52 @@
-//! What the TUI shows: a plain view model that [`crate::tui::view::render`]
-//! reads and never changes. Server types are converted into these structs by
-//! the event loop, so rendering only depends on what it draws. How colors
-//! reach the terminal is the [`crate::tui::theme::Theme`]'s business, not
-//! the model's.
+//! What the TUI shows, and how it changes.
+//!
+//! [`App`] is a plain view model that [`crate::tui::view::render`] reads and
+//! never changes. [`App::update`] is the only thing that changes it: it takes
+//! one [`Msg`] (a key, a tick, something from the server) and answers with
+//! the [`Cmd`]s the event loop ([`crate::tui::live`]) should carry out, whose
+//! results come back as more `Msg`s. `update` does no I/O, reads no clock and
+//! never blocks, so all of the TUI's behaviour is tested without a terminal
+//! or a server. Server types become view structs in [`crate::tui::convert`],
+//! so rendering only depends on what it draws. How colors reach the terminal
+//! is the [`crate::tui::theme::Theme`]'s business, not the model's.
 
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
+use crossterm::event::KeyEvent;
 use jiff::tz::TimeZone;
+use ratatui::layout::Rect;
 
-/// Everything one frame of the TUI is drawn from.
+use crate::api::{
+    ChannelAck, ChannelsJson, PeerJson, PostCreated, PostJson, PostsResponse, StatusJson,
+    StreamEvent, WhoJson, ACTIVE_WINDOW_MS,
+};
+use crate::model::AuthorKind;
+use crate::tui::convert;
+use crate::tui::view::Layout;
+use crate::tui::widgets::posts;
+
+/// Posts asked for at a time in a channel (the newest, then older pages).
+pub const PAGE: u32 = 100;
+/// Announcements asked for (the newest; that view has no older pages).
+pub const ANNOUNCEMENTS_LIMIT: u32 = 200;
+/// Longest filter, in characters (a tag or `@handle` is far shorter).
+pub const FILTER_MAX: usize = 64;
+/// Shown under the new channel's name field, in coral when the name breaks it.
+pub const NAME_RULE: &str = "lowercase letters, digits and dashes";
+/// Longest channel name, as the server allows.
+pub const CHANNEL_NAME_MAX: usize = 32;
+/// How long an ordinary toast stays, and one that reports a failure.
+const TOAST_MS: i64 = 5_000;
+const ERROR_TOAST_MS: i64 = 10_000;
+/// How often the TUI tells the node Dang is here, and asks how sync is going.
+pub const HEARTBEAT_MS: i64 = 60_000;
+pub const STATUS_MS: i64 = 5_000;
+/// Agents not seen for this long leave the sidebar (as `who` drops them).
+const AGENT_WINDOW_MS: i64 = 2 * 60 * 60 * 1000;
+
+/// Everything one frame of the TUI is drawn from, plus the little the
+/// keyboard and the live feed need to remember between frames.
 #[derive(Debug, Clone)]
 pub struct App {
     /// This device's node name, shown in the header.
@@ -44,6 +84,43 @@ pub struct App {
     pub selected_post: Option<String>,
     /// A short notice shown in the help row (`saved to ./exchange/x`).
     pub toast: Option<String>,
+
+    // ------------------------------------------- remembered between frames
+    /// When the toast goes away (epoch ms); `None` keeps it up.
+    pub toast_until_ms: Option<i64>,
+    /// The terminal's size, for paging and keeping the selected post in view.
+    pub size: (u16, u16),
+    /// The view's posts are being fetched: the pane stays blank rather than
+    /// say the channel is empty.
+    pub loading: bool,
+    /// The live feed from the local server is open.
+    pub live: bool,
+    /// A first view has been picked (the first channel list picks it).
+    pub view_chosen: bool,
+    /// `/` is being typed: keys go to the filter.
+    pub filter_editing: bool,
+    /// What the open confirmation does on `↵`.
+    pub confirm: Option<Cmd>,
+    /// The body of the post on its way. One at a time, so `↵` pressed
+    /// twice never posts twice.
+    pub sending: Option<String>,
+    /// A full page came back, so there may be older posts above the oldest.
+    pub has_older: bool,
+    /// `(ts, id)` of the oldest post the pages brought: what the next older
+    /// page is asked for, and the line above which live posts are left for
+    /// paging to bring (a late-synced old post must not move it).
+    pub oldest_page: Option<(i64, String)>,
+    /// The node refused BEACON_SECRET: the down band says so.
+    pub secret_rejected: bool,
+    /// A page of older posts is on its way.
+    pub loading_older: bool,
+    /// What the view structs leave out of each loaded post, by id.
+    pub extras: HashMap<String, PostExtra>,
+    /// What arrived live while the view's newest page was on its way, so the
+    /// page cannot drop it (or bring back what was deleted meanwhile).
+    pub arrivals: Option<Arrivals>,
+    pub last_heartbeat_ms: Option<i64>,
+    pub last_status_ms: Option<i64>,
 }
 
 impl App {
@@ -69,8 +146,178 @@ impl App {
             filter: None,
             selected_post: None,
             toast: None,
+            toast_until_ms: None,
+            size: (0, 0),
+            loading: false,
+            live: false,
+            view_chosen: false,
+            filter_editing: false,
+            confirm: None,
+            sending: None,
+            has_older: false,
+            oldest_page: None,
+            secret_rejected: false,
+            loading_older: false,
+            extras: HashMap::new(),
+            arrivals: None,
+            last_heartbeat_ms: None,
+            last_status_ms: None,
         }
     }
+}
+
+/// What a loaded post carries that the view structs leave out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostExtra {
+    /// Where the post arrived on this node: what a read cursor is set to.
+    pub arrival: i64,
+    /// The attachment's hash, to fetch its bytes by.
+    pub sha256: Option<String>,
+    /// Whether this node holds the attachment's bytes yet.
+    pub available: bool,
+}
+
+/// Posts and deletions that came in live while a view's newest page was
+/// being fetched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Arrivals {
+    pub posts: Vec<PostItem>,
+    pub deleted: HashSet<String>,
+}
+
+/// A file in the exchange folder, for the attach picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExchangeFile {
+    pub name: String,
+    pub path: PathBuf,
+    pub size: u64,
+    /// Last modified, epoch ms.
+    pub modified_ms: i64,
+}
+
+// ------------------------------------------------------------- messages
+
+/// Something that happened: a key, a tick, an answer from the server.
+#[derive(Debug, Clone)]
+pub enum Msg {
+    Key(KeyEvent),
+    /// Text pasted into the terminal (bracketed paste), all at once.
+    Paste(String),
+    Resize(u16, u16),
+    /// Once a second, with the time (epoch ms): ages, toasts, heartbeats.
+    Tick(i64),
+    /// An event from the live feed.
+    Stream(StreamEvent),
+    Loaded(Loaded),
+    /// The live feed opened (`Up`) or broke (`Down`).
+    Connection(Conn),
+    /// A post (or an upload) went out, or did not.
+    Sent(Result<PostCreated, String>),
+    Created(Result<ChannelAck, String>),
+    /// The post with this id was deleted, or was not.
+    PostDeleted(Result<String, String>),
+    /// The channel with this name was deleted, or was not.
+    ChannelDeleted(Result<String, String>),
+    /// An attachment was saved to the exchange folder under this name.
+    Saved(Result<String, String>),
+    /// A problem worth a toast.
+    Notice(String),
+    /// The node answered 401: this device's BEACON_SECRET is not the node's.
+    SecretRejected,
+}
+
+/// Merges what one batch of messages asked for: one `MarkRead` per channel,
+/// at the highest arrival, where the first one was; one `LoadChannels`.
+/// Everything else is kept, in order. A burst of live posts then costs one
+/// cursor update, not one per post.
+pub fn coalesce(cmds: Vec<Cmd>) -> Vec<Cmd> {
+    let mut out: Vec<Cmd> = Vec::with_capacity(cmds.len());
+    for cmd in cmds {
+        match cmd {
+            Cmd::MarkRead { channel, arrival } => {
+                let earlier = out.iter_mut().find_map(|c| match c {
+                    Cmd::MarkRead {
+                        channel: seen,
+                        arrival: at,
+                    } if *seen == channel => Some(at),
+                    _ => None,
+                });
+                match earlier {
+                    Some(at) => *at = (*at).max(arrival),
+                    None => out.push(Cmd::MarkRead { channel, arrival }),
+                }
+            }
+            Cmd::LoadChannels if out.contains(&Cmd::LoadChannels) => {}
+            cmd => out.push(cmd),
+        }
+    }
+    out
+}
+
+/// An answer to a `Load…` command.
+#[derive(Debug, Clone)]
+pub enum Loaded {
+    Channels(ChannelsJson),
+    /// A page of posts for `view`; `before` as it was asked for.
+    Posts {
+        view: Selection,
+        before: Option<(i64, String)>,
+        page: Result<PostsResponse, String>,
+    },
+    Agents(WhoJson),
+    Status(StatusJson),
+    /// The exchange folder, newest first.
+    Files(Result<Vec<ExchangeFile>, String>),
+}
+
+/// Something for the event loop to do. Each runs on its own task; its
+/// result comes back as a [`Msg`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cmd {
+    /// The channels, with `me`'s unread counts.
+    LoadChannels,
+    /// A channel's newest page, or the page before `(ts_ms, id)`.
+    LoadPosts {
+        channel: String,
+        before: Option<(i64, String)>,
+    },
+    /// Human posts from every channel.
+    LoadAnnouncements,
+    LoadAgents,
+    LoadStatus,
+    /// List the exchange folder for the attach picker.
+    ListFiles,
+    SendPost {
+        channel: String,
+        body: String,
+    },
+    /// Post the file at `path` with `body` as its message.
+    Upload {
+        channel: String,
+        path: PathBuf,
+        body: String,
+    },
+    /// Save a post's attachment into the exchange folder as `name` (or
+    /// `name (1)` and so on if that is taken).
+    Save {
+        post_id: String,
+        sha: String,
+        name: String,
+    },
+    CreateChannel {
+        name: String,
+        topic: Option<String>,
+    },
+    DeleteChannel(String),
+    DeletePost(String),
+    /// `me` has read `channel` up to the post that arrived as `arrival`.
+    MarkRead {
+        channel: String,
+        arrival: i64,
+    },
+    /// Tell the node `me` is here (kind human, client `tui`).
+    Heartbeat,
+    Quit,
 }
 
 /// One channel row in the sidebar.
@@ -157,6 +404,21 @@ pub enum Conn {
 pub enum Dialog {
     NewChannel(NewChannelForm),
     Confirm(ConfirmDialog),
+    /// Pick a file from the exchange folder to post.
+    Attach(AttachPicker),
+    /// Every key, and what it does.
+    Help,
+}
+
+/// The attach picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachPicker {
+    /// The folder's files, newest first, once listed (or why they could not be).
+    pub files: Option<Result<Vec<ExchangeFile>, String>>,
+    /// Index of the highlighted file.
+    pub selected: usize,
+    /// The composer's text, which goes out as the file's message.
+    pub message: String,
 }
 
 /// The "New channel" form.
@@ -184,4 +446,711 @@ pub struct ConfirmDialog {
     pub message: String,
     /// The primary action's verb (`delete`).
     pub action: String,
+}
+
+// ---------------------------------------------------------------- update
+
+impl App {
+    /// Applies `msg` and returns what the event loop should do next.
+    pub fn update(&mut self, msg: Msg) -> Vec<Cmd> {
+        match msg {
+            Msg::Key(key) => {
+                let scrolled = self.scroll > 0;
+                let mut cmds = self.on_key(key);
+                // Back down at the newest: what came in meanwhile is seen.
+                if scrolled && self.scroll == 0 {
+                    cmds.extend(self.caught_up());
+                }
+                cmds
+            }
+            Msg::Paste(text) => self.on_paste(&text),
+            Msg::Resize(width, height) => {
+                self.size = (width, height);
+                self.clamp_scroll();
+                Vec::new()
+            }
+            Msg::Tick(now_ms) => self.on_tick(now_ms),
+            Msg::Stream(event) => self.on_stream(event),
+            Msg::Loaded(loaded) => self.on_loaded(loaded),
+            Msg::Connection(conn) => self.on_connection(conn),
+            Msg::Sent(result) => self.on_sent(result),
+            Msg::Created(result) => self.on_created(result),
+            Msg::PostDeleted(result) => {
+                match result {
+                    Ok(id) => {
+                        self.remove_post(&id);
+                    }
+                    Err(e) => self.error(format!("Not deleted: {e}")),
+                }
+                Vec::new()
+            }
+            Msg::ChannelDeleted(result) => match result {
+                Ok(name) => {
+                    self.channels.retain(|c| c.name != name);
+                    let mut cmds = Vec::new();
+                    if self.selected == Selection::Channel(name.clone()) {
+                        cmds = self.channel_gone(&name);
+                    }
+                    self.toast(format!("deleted #{name}"));
+                    cmds.push(Cmd::LoadChannels);
+                    cmds
+                }
+                Err(e) => {
+                    self.error(format!("Not deleted: {e}"));
+                    Vec::new()
+                }
+            },
+            Msg::Saved(result) => {
+                match result {
+                    Ok(name) => self.toast(format!("saved to ./exchange/{name}")),
+                    Err(e) => self.error(format!("Not saved: {e}")),
+                }
+                Vec::new()
+            }
+            Msg::Notice(text) => {
+                self.error(text);
+                Vec::new()
+            }
+            Msg::SecretRejected => {
+                self.secret_rejected = true;
+                Vec::new()
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ toasts
+
+    /// Shows `text` in the help row for a few seconds.
+    pub(crate) fn toast(&mut self, text: impl Into<String>) {
+        self.toast_for(text.into(), TOAST_MS);
+    }
+
+    /// Shows a failure in the help row, for longer.
+    pub(crate) fn error(&mut self, text: impl Into<String>) {
+        self.toast_for(text.into(), ERROR_TOAST_MS);
+    }
+
+    fn toast_for(&mut self, text: String, ms: i64) {
+        self.toast = Some(text);
+        self.toast_until_ms = Some(self.now_ms.saturating_add(ms));
+    }
+
+    // -------------------------------------------------------------- time
+
+    fn on_tick(&mut self, now_ms: i64) -> Vec<Cmd> {
+        self.now_ms = now_ms;
+        if self.toast_until_ms.is_some_and(|until| now_ms >= until) {
+            self.toast = None;
+            self.toast_until_ms = None;
+        }
+        // Presence ages with the clock: active for 5 minutes, then idle,
+        // then gone after 2 hours.
+        self.agents
+            .retain(|a| now_ms.saturating_sub(a.last_seen_ms) <= AGENT_WINDOW_MS);
+        for agent in &mut self.agents {
+            agent.active = now_ms.saturating_sub(agent.last_seen_ms) <= ACTIVE_WINDOW_MS;
+        }
+        let mut cmds = Vec::new();
+        if self.live {
+            if due(self.last_heartbeat_ms, now_ms, HEARTBEAT_MS) {
+                self.last_heartbeat_ms = Some(now_ms);
+                cmds.push(Cmd::Heartbeat);
+            }
+            if due(self.last_status_ms, now_ms, STATUS_MS) {
+                self.last_status_ms = Some(now_ms);
+                cmds.push(Cmd::LoadStatus);
+            }
+        }
+        cmds
+    }
+
+    // -------------------------------------------------------- connection
+
+    fn on_connection(&mut self, conn: Conn) -> Vec<Cmd> {
+        match conn {
+            Conn::Down { since_ms } => {
+                self.live = false;
+                // Retries keep the time it first went down.
+                if self.connection == Conn::Up {
+                    self.connection = Conn::Down { since_ms };
+                }
+                Vec::new()
+            }
+            Conn::Up => {
+                self.connection = Conn::Up;
+                self.live = true;
+                self.secret_rejected = false;
+                self.last_heartbeat_ms = Some(self.now_ms);
+                self.last_status_ms = Some(self.now_ms);
+                // Whatever happened while the feed was closed is read afresh.
+                let mut cmds = vec![
+                    Cmd::Heartbeat,
+                    Cmd::LoadChannels,
+                    Cmd::LoadAgents,
+                    Cmd::LoadStatus,
+                ];
+                if self.view_chosen {
+                    cmds.extend(self.load_view());
+                }
+                cmds
+            }
+        }
+    }
+
+    // ------------------------------------------------------------- views
+
+    /// Shows `view` in the main pane and asks for its posts. A channel is
+    /// marked read for `me` once they arrive.
+    pub(crate) fn select(&mut self, view: Selection) -> Vec<Cmd> {
+        if self.view_chosen && self.selected == view {
+            return Vec::new();
+        }
+        self.view_chosen = true;
+        self.selected = view;
+        self.posts.clear();
+        self.extras.clear();
+        self.selected_post = None;
+        self.scroll = 0;
+        self.has_older = false;
+        self.oldest_page = None;
+        self.load_view()
+    }
+
+    /// Asks for the current view's newest posts. What arrives live until
+    /// they come is kept aside, so the page cannot lose it.
+    fn load_view(&mut self) -> Vec<Cmd> {
+        self.arrivals = Some(Arrivals::default());
+        self.loading = self.posts.is_empty();
+        self.loading_older = false;
+        vec![match &self.selected {
+            Selection::Channel(name) => Cmd::LoadPosts {
+                channel: name.clone(),
+                before: None,
+            },
+            Selection::Announcements => Cmd::LoadAnnouncements,
+        }]
+    }
+
+    /// Where to go when the channel on screen goes away.
+    fn fallback_view(&self) -> Selection {
+        self.channels.first().map_or(Selection::Announcements, |c| {
+            Selection::Channel(c.name.clone())
+        })
+    }
+
+    /// Whether `post` belongs in the view on screen.
+    fn in_view(&self, post: &PostItem) -> bool {
+        match &self.selected {
+            Selection::Channel(name) => &post.channel == name,
+            Selection::Announcements => post.announcement,
+        }
+    }
+
+    /// Marks the channel on screen read up to the newest post loaded.
+    fn mark_read(&mut self) -> Vec<Cmd> {
+        let Selection::Channel(name) = &self.selected else {
+            return Vec::new();
+        };
+        let name = name.clone();
+        // What is on screen: the filter may hide some of the view.
+        let newest = posts::shown(self)
+            .iter()
+            .filter_map(|p| self.extras.get(&p.id))
+            .map(|e| e.arrival)
+            .max();
+        let Some(arrival) = newest else {
+            return Vec::new();
+        };
+        if let Some(channel) = self.channels.iter_mut().find(|c| c.name == name) {
+            channel.unread = 0;
+        }
+        vec![Cmd::MarkRead {
+            channel: name,
+            arrival,
+        }]
+    }
+
+    /// The view is back at the newest post: if posts came in while it was
+    /// scrolled up, they have now been seen.
+    fn caught_up(&mut self) -> Vec<Cmd> {
+        let Selection::Channel(name) = &self.selected else {
+            return Vec::new();
+        };
+        if self
+            .channels
+            .iter()
+            .any(|c| &c.name == name && c.unread > 0)
+        {
+            self.mark_read()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The channel on screen went away: says so and shows another view.
+    fn channel_gone(&mut self, name: &str) -> Vec<Cmd> {
+        self.toast(format!("#{name} was deleted"));
+        let next = self.fallback_view();
+        self.select(next)
+    }
+
+    // ------------------------------------------------------------ loaded
+
+    fn on_loaded(&mut self, loaded: Loaded) -> Vec<Cmd> {
+        match loaded {
+            Loaded::Channels(list) => self.on_channels(&list),
+            Loaded::Posts { view, before, page } => self.on_posts(view, before, page),
+            Loaded::Agents(who) => {
+                self.agents = who
+                    .agents
+                    .iter()
+                    .filter(|p| p.kind == AuthorKind::Agent)
+                    .map(convert::agent_item)
+                    .collect();
+                sort_agents(&mut self.agents);
+                Vec::new()
+            }
+            Loaded::Status(status) => {
+                self.node = convert::clean_line(&status.node);
+                self.set_peers(&status.peers);
+                Vec::new()
+            }
+            Loaded::Files(files) => {
+                if let Some(Dialog::Attach(picker)) = &mut self.dialog {
+                    picker.files = Some(files);
+                    picker.selected = 0;
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    fn on_channels(&mut self, list: &ChannelsJson) -> Vec<Cmd> {
+        self.channels = list.channels.iter().map(convert::channel_item).collect();
+        self.announcements_unread = list.announcements_unread.unwrap_or(0);
+        if !self.view_chosen {
+            // The board opens on its first channel (`general` comes first).
+            let first = self.fallback_view();
+            return self.select(first);
+        }
+        if let Selection::Channel(name) = &self.selected {
+            if !self.channels.iter().any(|c| &c.name == name) {
+                let name = name.clone();
+                return self.channel_gone(&name);
+            }
+        }
+        Vec::new()
+    }
+
+    fn on_posts(
+        &mut self,
+        view: Selection,
+        before: Option<(i64, String)>,
+        page: Result<PostsResponse, String>,
+    ) -> Vec<Cmd> {
+        if view != self.selected {
+            return Vec::new();
+        }
+        let older = before.is_some();
+        // An older page fits only right above the oldest page post; one
+        // asked for before the view was reloaded would leave a gap.
+        if older && before != self.oldest_page {
+            return Vec::new();
+        }
+        let page = match page {
+            Ok(page) => page,
+            Err(e) => {
+                if older {
+                    self.loading_older = false;
+                } else {
+                    self.loading = false;
+                    self.arrivals = None;
+                }
+                self.error(format!("Couldn't load {}: {e}", view_name(&view)));
+                return Vec::new();
+            }
+        };
+        let limit = match view {
+            Selection::Channel(_) => PAGE,
+            Selection::Announcements => ANNOUNCEMENTS_LIMIT,
+        };
+        let full = page.posts.len() >= limit as usize;
+        for post in &page.posts {
+            self.extras
+                .insert(post.id.clone(), convert::post_extra(post));
+        }
+        let mut items: Vec<PostItem> = page.posts.iter().map(convert::post_item).collect();
+        sort_posts(&mut items);
+        // Where the next older page starts: set by pages only, never by a
+        // live post, however old its ts.
+        let page_oldest = items.first().map(|p| (p.ts_ms, p.id.clone()));
+
+        if older {
+            self.loading_older = false;
+            self.has_older = full;
+            if page_oldest.is_some() {
+                self.oldest_page = page_oldest;
+            }
+            for item in items {
+                if !self.posts.iter().any(|p| p.id == item.id) {
+                    self.posts.push(item);
+                }
+            }
+            sort_posts(&mut self.posts);
+            return Vec::new();
+        }
+
+        let has_older = full && matches!(self.selected, Selection::Channel(_));
+        let arrivals = self.arrivals.take().unwrap_or_default();
+        let mut posts: Vec<PostItem> = items
+            .into_iter()
+            .filter(|p| !arrivals.deleted.contains(&p.id))
+            .collect();
+        for post in arrivals.posts {
+            let above = has_older
+                && page_oldest
+                    .as_ref()
+                    .is_some_and(|c| before_cursor(&post, c));
+            if !above
+                && !arrivals.deleted.contains(&post.id)
+                && !posts.iter().any(|p| p.id == post.id)
+            {
+                posts.push(post);
+            }
+        }
+        sort_posts(&mut posts);
+        self.oldest_page = page_oldest;
+        self.posts = posts;
+        let ids: HashSet<String> = self.posts.iter().map(|p| p.id.clone()).collect();
+        self.extras.retain(|id, _| ids.contains(id));
+        if self
+            .selected_post
+            .as_ref()
+            .is_some_and(|id| !ids.contains(id))
+        {
+            self.selected_post = None;
+        }
+        self.loading = false;
+        self.has_older = has_older;
+        self.clamp_scroll();
+        // A channel on screen is a channel read.
+        self.mark_read()
+    }
+
+    // ------------------------------------------------------------ stream
+
+    fn on_stream(&mut self, event: StreamEvent) -> Vec<Cmd> {
+        match event {
+            StreamEvent::Post(post) => self.on_live_post(&post),
+            StreamEvent::PostDeleted { id } => {
+                if let Some(arrivals) = &mut self.arrivals {
+                    arrivals.posts.retain(|p| p.id != id);
+                    arrivals.deleted.insert(id.clone());
+                }
+                self.remove_post(&id);
+                // The unread counts may have included it.
+                vec![Cmd::LoadChannels]
+            }
+            StreamEvent::Channel { channel, deleted } => {
+                if deleted {
+                    self.channels.retain(|c| c.name != channel.name);
+                    let mut cmds = Vec::new();
+                    if self.selected == Selection::Channel(channel.name.clone()) {
+                        cmds = self.channel_gone(&channel.name);
+                    }
+                    cmds.push(Cmd::LoadChannels);
+                    return cmds;
+                }
+                let item = convert::channel_item(&channel);
+                match self.channels.iter_mut().find(|c| c.name == item.name) {
+                    Some(existing) => existing.topic = item.topic,
+                    None => self.channels.push(item),
+                }
+                // The server knows where it goes and what is unread there.
+                vec![Cmd::LoadChannels]
+            }
+            StreamEvent::Presence(presence) => {
+                // The sidebar lists agents; Dang (and any other human) is not one.
+                if presence.kind == AuthorKind::Agent {
+                    let item = convert::agent_item(&presence);
+                    match self
+                        .agents
+                        .iter_mut()
+                        .find(|a| a.handle.eq_ignore_ascii_case(&item.handle))
+                    {
+                        Some(existing) => *existing = item,
+                        None => self.agents.push(item),
+                    }
+                    sort_agents(&mut self.agents);
+                }
+                Vec::new()
+            }
+            StreamEvent::Peers(peers) => {
+                self.set_peers(&peers);
+                Vec::new()
+            }
+        }
+    }
+
+    fn on_live_post(&mut self, post: &PostJson) -> Vec<Cmd> {
+        let item = convert::post_item(post);
+        let mut cmds = Vec::new();
+        if !self.channels.iter().any(|c| c.name == item.channel) {
+            // A post can arrive before its channel does, or bring a deleted
+            // channel back.
+            self.channels.push(ChannelItem {
+                name: item.channel.clone(),
+                topic: None,
+                unread: 0,
+            });
+            cmds.push(Cmd::LoadChannels);
+        }
+        let mine = item.author.eq_ignore_ascii_case(&self.me);
+        let on_screen = self.selected == Selection::Channel(item.channel.clone());
+        let announcement = item.announcement;
+        let channel = item.channel.clone();
+        let shown = posts::is_shown(self, &item);
+        let placed = self.add_to_view(item, convert::post_extra(post));
+        if mine {
+            return cmds;
+        }
+        // Read only if it is where Dang is looking: the bottom of the view.
+        if on_screen && placed && shown && self.scroll == 0 {
+            cmds.push(Cmd::MarkRead {
+                channel,
+                arrival: post.arrival,
+            });
+        } else {
+            if let Some(c) = self.channels.iter_mut().find(|c| c.name == channel) {
+                c.unread = c.unread.saturating_add(1);
+            }
+            if announcement {
+                self.announcements_unread = self.announcements_unread.saturating_add(1);
+            }
+        }
+        cmds
+    }
+
+    fn set_peers(&mut self, peers: &[PeerJson]) {
+        self.peers = peers.iter().map(convert::peer_item).collect();
+        self.last_sync_ms = convert::last_sync_ms(peers);
+    }
+
+    // ----------------------------------------------------------- results
+
+    fn on_sent(&mut self, result: Result<PostCreated, String>) -> Vec<Cmd> {
+        let body = self.sending.take();
+        let created = match result {
+            Ok(created) => created,
+            Err(e) => {
+                // The text stays in the composer, to send again.
+                self.error(format!("Not sent: {e}"));
+                return Vec::new();
+            }
+        };
+        // Only what was sent leaves the composer; anything typed since stays.
+        if let Some(body) = body {
+            if self.input.starts_with(&body) {
+                self.input.drain(..body.len());
+            }
+        }
+        let item = convert::post_item(&created.post);
+        self.add_to_view(item, convert::post_extra(&created.post));
+        // Down to the newest, to see it; what came in meanwhile is seen too.
+        let scrolled = self.scroll > 0;
+        self.scroll = 0;
+        let queued: Vec<&str> = created
+            .delivery
+            .iter()
+            .filter(|d| !d.delivered)
+            .map(|d| d.node.as_str())
+            .collect();
+        if !queued.is_empty() {
+            self.toast(format!("sent · queued for {} (offline)", queued.join(", ")));
+        }
+        if scrolled {
+            self.caught_up()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Puts a post that came outside a page (live, or just sent) into the
+    /// view, if it belongs there. One older than the oldest page post, with
+    /// more history above, is left for paging to bring in its place: shown
+    /// now, it would become the oldest post and the next page would be asked
+    /// for from it, skipping everything in between. Returns whether it is
+    /// now in the view.
+    fn add_to_view(&mut self, item: PostItem, extra: PostExtra) -> bool {
+        if !self.in_view(&item) {
+            return false;
+        }
+        // While the first page is on its way, the page decides (on_posts).
+        if let Some(arrivals) = &mut self.arrivals {
+            arrivals.posts.push(item.clone());
+        }
+        if self.has_older
+            && self
+                .oldest_page
+                .as_ref()
+                .is_some_and(|c| before_cursor(&item, c))
+        {
+            return false;
+        }
+        self.extras.insert(item.id.clone(), extra);
+        self.insert_post(item);
+        true
+    }
+
+    fn on_created(&mut self, result: Result<ChannelAck, String>) -> Vec<Cmd> {
+        let ack = match result {
+            Ok(ack) => ack,
+            Err(e) => {
+                self.error(format!("Not created: {e}"));
+                return Vec::new();
+            }
+        };
+        let name = ack.channel.name.clone();
+        if !self.channels.iter().any(|c| c.name == name) {
+            self.channels.push(convert::channel_item(&ack.channel));
+        }
+        self.toast(if ack.created {
+            format!("created #{name}")
+        } else {
+            format!("#{name} was already there")
+        });
+        self.focus = Focus::Composer;
+        let mut cmds = self.select(Selection::Channel(name));
+        cmds.push(Cmd::LoadChannels);
+        cmds
+    }
+
+    // ------------------------------------------------------------- posts
+
+    /// Adds `item` to the view in display order, once. When the view is
+    /// scrolled up it stays put rather than jump.
+    fn insert_post(&mut self, item: PostItem) {
+        if self.posts.iter().any(|p| p.id == item.id) {
+            return;
+        }
+        let at = self
+            .posts
+            .partition_point(|p| (p.ts_ms, p.id.as_str()) < (item.ts_ms, item.id.as_str()));
+        // At the bottom nothing moves; measuring is only needed scrolled up.
+        let width = match self.posts_width() {
+            Some(width) if self.scroll > 0 => width,
+            _ => {
+                self.posts.insert(at, item);
+                return;
+            }
+        };
+        if at == self.posts.len() {
+            // The usual case, a new newest post: it adds its own rows and
+            // the gap above it, below the view.
+            if posts::is_shown(self, &item) {
+                let above = posts::shown(self).last().map(|p| (*p).clone());
+                let gap = above.map_or(0, |p| posts::gap_rows(&p, &item, self));
+                self.scroll += gap + posts::post_rows(&item, self, width);
+            }
+            self.posts.push(item);
+            return;
+        }
+        // Somewhere in the middle (a late post): measure what moved.
+        let before = total_rows(&posts::spans(self, width));
+        let id = item.id.clone();
+        self.posts.insert(at, item);
+        let spans = posts::spans(self, width);
+        let below = spans.iter().find(|s| s.id == id).map(|s| s.bottom);
+        if below.is_some_and(|b| b < self.scroll) {
+            self.scroll += total_rows(&spans).saturating_sub(before);
+        }
+    }
+
+    /// Takes post `id` out of the view; a selection on it moves to a
+    /// neighbour. Returns whether it was there.
+    pub(crate) fn remove_post(&mut self, id: &str) -> bool {
+        let Some(index) = self.posts.iter().position(|p| p.id == id) else {
+            return false;
+        };
+        if self.selected_post.as_deref() == Some(id) {
+            let shown: Vec<String> = posts::shown(self).iter().map(|p| p.id.clone()).collect();
+            let at = shown.iter().position(|s| s == id);
+            self.selected_post = at.and_then(|i| {
+                shown
+                    .get(i + 1)
+                    .or_else(|| i.checked_sub(1).and_then(|j| shown.get(j)))
+                    .cloned()
+            });
+        }
+        self.posts.remove(index);
+        self.extras.remove(id);
+        self.clamp_scroll();
+        true
+    }
+
+    // ------------------------------------------------------------ layout
+
+    /// The board's layout at the terminal's size, if it is drawn at all.
+    pub(crate) fn layout(&self) -> Option<Layout> {
+        Layout::compute(Rect::new(0, 0, self.size.0, self.size.1), self)
+    }
+
+    /// The rows the posts are drawn in.
+    pub(crate) fn viewport(&self) -> Option<Rect> {
+        self.layout().map(|layout| posts::viewport(self, &layout))
+    }
+
+    fn posts_width(&self) -> Option<u16> {
+        self.layout().map(|layout| layout.posts.width)
+    }
+
+    /// The highest useful scroll: the oldest loaded row at the top.
+    pub(crate) fn max_scroll(&self) -> Option<usize> {
+        let view = self.viewport()?;
+        let total = total_rows(&posts::spans(self, view.width));
+        Some(total.saturating_sub(usize::from(view.height)))
+    }
+
+    pub(crate) fn clamp_scroll(&mut self) {
+        if let Some(max) = self.max_scroll() {
+            self.scroll = self.scroll.min(max);
+        }
+    }
+}
+
+/// Whether `post` sorts before the cursor `(ts, id)`.
+fn before_cursor(post: &PostItem, cursor: &(i64, String)) -> bool {
+    (post.ts_ms, post.id.as_str()) < (cursor.0, cursor.1.as_str())
+}
+
+/// Rows taken by everything laid out in `spans`.
+pub(crate) fn total_rows(spans: &[posts::Span]) -> usize {
+    spans.last().map_or(0, |s| s.bottom + s.height)
+}
+
+/// Whether something done every `every` ms, last at `last`, is due at `now`.
+fn due(last: Option<i64>, now: i64, every: i64) -> bool {
+    last.is_none_or(|t| now.saturating_sub(t) >= every)
+}
+
+/// Display order: `(ts, id)`.
+fn sort_posts(posts: &mut [PostItem]) {
+    posts.sort_by(|a, b| (a.ts_ms, &a.id).cmp(&(b.ts_ms, &b.id)));
+}
+
+/// Most recently seen first.
+fn sort_agents(agents: &mut [AgentItem]) {
+    agents.sort_by(|a, b| {
+        b.last_seen_ms
+            .cmp(&a.last_seen_ms)
+            .then_with(|| a.handle.cmp(&b.handle))
+    });
+}
+
+/// `#beacon` or `announcements`, for messages.
+fn view_name(view: &Selection) -> String {
+    match view {
+        Selection::Channel(name) => format!("#{name}"),
+        Selection::Announcements => "announcements".to_string(),
+    }
 }
