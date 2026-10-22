@@ -2616,6 +2616,105 @@ mod behaviour {
         assert_eq!(page_to_top(&mut app), [ask_before(0)]);
     }
 
+    /// A post that belongs above the loaded page, written offline.
+    fn late_post(n: u32, minute: u32) -> PostJson {
+        let mut late = api_post(n, "beacon", "pc-vllm", &format!("late {n}"));
+        late.ts_ms = ts_of(minute) + 30_000;
+        late
+    }
+
+    #[test]
+    fn a_post_deleted_during_an_outage_is_not_brought_back_by_the_next_older_page() {
+        let mut app = full_page_app();
+        assert_eq!(page_to_top(&mut app), [ask_before(100)]);
+        // A late post is kept for the page on its way...
+        app.update(Msg::Stream(StreamEvent::Post(late_post(500, 60))));
+        assert_eq!(app.held.len(), 1);
+        // ...then the feed drops, and the post is deleted somewhere else while
+        // it is down: no PostDeleted ever reaches this device.
+        reconnect(&mut app);
+        // The fresh first page starts where the old one did (so the older page
+        // on its way still fits) and, being fresh, has nothing held over it.
+        app.update(Msg::Loaded(page(beacon_posts(100..100 + PAGE))));
+        assert!(app.held.is_empty(), "{:?}", app.held);
+        app.update(older_page((ts_of(100), ulid(100)), 50..100));
+        assert!(
+            app.posts.iter().all(|p| p.id != ulid(500)),
+            "the deleted post came back"
+        );
+        assert_eq!(app.posts.len(), PAGE as usize + 50);
+
+        // A first page that lands while the user has paged up since it was
+        // asked for keeps what is held: that older page is still to come.
+        let mut app = full_page_app();
+        reconnect(&mut app);
+        assert_eq!(page_to_top(&mut app), [ask_before(100)]);
+        app.update(Msg::Stream(StreamEvent::Post(late_post(500, 60))));
+        app.update(Msg::Loaded(page(beacon_posts(100..100 + PAGE))));
+        assert_eq!(app.held.len(), 1);
+        // But when that first page starts later, the older page is dropped
+        // and nothing is held for it.
+        let mut app = full_page_app();
+        reconnect(&mut app);
+        assert_eq!(page_to_top(&mut app), [ask_before(100)]);
+        app.update(Msg::Stream(StreamEvent::Post(late_post(500, 60))));
+        assert_eq!(app.held.len(), 1);
+        app.update(Msg::Loaded(page(beacon_posts(150..150 + PAGE))));
+        assert!(app.held.is_empty(), "{:?}", app.held);
+    }
+
+    #[test]
+    fn a_late_post_that_came_while_the_first_page_loaded_waits_for_the_older_page() {
+        let mut app = full_page_app();
+        reconnect(&mut app);
+        // The view is reloading; nothing has asked for older posts yet, so
+        // the late post is not held (no page is on its way for it).
+        app.update(Msg::Stream(StreamEvent::Post(late_post(500, 60))));
+        app.update(Msg::Stream(StreamEvent::Post(late_post(501, 70))));
+        app.update(Msg::Stream(StreamEvent::PostDeleted { id: ulid(501) }));
+        assert!(app.held.is_empty());
+        // Then the user pages up, and the fresh page lands, starting where
+        // the old one did: the older page asked for still fits.
+        assert_eq!(page_to_top(&mut app), [ask_before(100)]);
+        app.update(Msg::Loaded(page(beacon_posts(100..100 + PAGE))));
+        assert!(
+            app.posts.iter().all(|p| p.id != ulid(500)),
+            "not before its page"
+        );
+        assert_eq!(app.held.len(), 1, "kept for the page on its way");
+        // The older page may have been read before the post arrived. It goes
+        // in with that page, in its place; the deleted one stays gone.
+        app.update(older_page((ts_of(100), ulid(100)), 50..100));
+        let at = app
+            .posts
+            .iter()
+            .position(|p| p.id == ulid(500))
+            .expect("shown once its page is in");
+        assert_eq!(app.posts[at - 1].id, ulid(60));
+        assert_eq!(app.posts[at + 1].id, ulid(61));
+        assert!(app.posts.iter().all(|p| p.id != ulid(501)));
+        assert!(app.held.is_empty());
+    }
+
+    #[test]
+    fn switching_view_drops_what_was_held_for_the_old_one() {
+        let mut app = full_page_app();
+        assert_eq!(page_to_top(&mut app), [ask_before(100)]);
+        app.update(Msg::Stream(StreamEvent::Post(late_post(500, 60))));
+        assert_eq!(app.held.len(), 1);
+        app.focus = Focus::Sidebar;
+        app.update(ch('j'));
+        assert_ne!(app.selected, beacon_view());
+        assert!(app.held.is_empty(), "{:?}", app.held);
+        // Back again: the older page asked for before the switch still fits
+        // the fresh view, and the late post is not in it.
+        app.update(ch('k'));
+        app.update(Msg::Loaded(page(beacon_posts(100..100 + PAGE))));
+        app.update(older_page((ts_of(100), ulid(100)), 50..100));
+        assert_eq!(app.posts.len(), PAGE as usize + 50);
+        assert!(app.posts.iter().all(|p| p.id != ulid(500)));
+    }
+
     #[test]
     fn clearing_the_filter_marks_what_it_hid_as_read() {
         for keep in [true, false] {
