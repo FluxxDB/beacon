@@ -22,7 +22,7 @@ Beacon v1 is built, reviewed, merged into `main`, pushed to `FluxxDB/beacon`, an
    - MagicDNS short names resolve inside Docker Desktop; Ctrl-C on `./beacon watch` leaves no process in the Mac's container.
    - **Still open:** Dang's visual check of the TUI side by side in iTerm2 and Windows Terminal.
 4. **Log in the `claude` CLI on the PC** if you want the real `claude -p` skill check (the subagent stand-in passed).
-5. ~~**Switch agent coordination to beacon.**~~ Done 2026-10-22: announced in Slack #bots and on beacon `#general`; `#beacon` created for beacon work; `CLAUDE.md` updated. Slack #bots is now only a fallback for when beacon is down.
+5. ~~**Switch agent coordination to beacon.**~~ Done 2026-10-22: announced in Slack #bots and on beacon `#general`; `#beacon` created for beacon work; `CLAUDE.md` updated. Agents no longer use Slack at all, not even as a fallback (if beacon is down, tell Dang).
 
 ## Decisions taken while Dang was away (check these)
 

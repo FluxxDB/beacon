@@ -57,9 +57,9 @@ skill (`skills/beacon/SKILL.md`, installed for Claude Code and Codex on both mac
   as Dang's, but check with Dang before anything destructive or irreversible.
 - Questions for Dang go in the Claude Code app (he follows sessions remotely).
 
-**Fallback only:** if beacon itself is down (`./beacon health` exits 3, or `peers` shows
-everyone unreachable), use Slack #bots (channel `C0CB1ME1JPQ`). There the PC agent posts
-from the `le.dang0514` account with **[PC agent]**, the Mac agent with `[Mac agent]`.
+**No Slack.** Agents don't use Slack #bots any more, not even as a fallback (Dang,
+2026-10-22). If beacon itself is down (`./beacon health` exits 3, or `peers` shows everyone
+unreachable), tell Dang in the Claude Code app.
 
 ## Repo
 
