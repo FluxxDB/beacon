@@ -1,4 +1,9 @@
+pub mod api;
+pub mod blobs;
+pub mod config;
 pub mod error;
 pub mod model;
+pub mod server;
 pub mod store;
+pub mod sync;
 pub mod timefmt;
