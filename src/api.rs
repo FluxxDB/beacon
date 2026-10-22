@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::blobs::Blobs;
-use crate::model::{short_id, AuthorKind, VersionVector};
+use crate::model::{short_id, AuthorKind, Event, VersionVector};
 use crate::store::{ChannelRow, PostRow, PresenceRow};
 use crate::timefmt::iso8601;
 
@@ -324,4 +324,91 @@ pub struct CursorsJson {
     pub ok: bool,
     pub handle: String,
     pub cursors: BTreeMap<String, i64>,
+}
+
+/// `GET /api/events`: a page of the event log for a peer. See
+/// `server::stream` for how `head` and `more` are meant to be used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventsResponse {
+    pub v: u32,
+    /// The events the caller lacks, oldest arrival first. A caller with a gap
+    /// in its version vector is also re-sent what lies above the gap, so a
+    /// non-empty page does not mean something is new.
+    pub events: Vec<Event>,
+    /// This server's version vector.
+    pub have: VersionVector,
+    /// This server's newest arrival number. A caller passes it back as `since`
+    /// on its next pull, so the server can tell a page that holds something
+    /// new from one that only repeats what the caller was already sent.
+    pub head: i64,
+    /// The selection hit its limit: ask again for the rest.
+    pub more: bool,
+}
+
+/// `POST /api/events`: events a peer pushes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushRequest {
+    pub events: Vec<Event>,
+}
+
+/// The answer to `POST /api/events`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushResponse {
+    pub v: u32,
+    /// How many of the pushed events were new to this node.
+    pub applied: u64,
+    /// This server's version vector after applying them.
+    pub have: VersionVector,
+}
+
+/// One item of `GET /api/stream`. On the wire it is a server-sent event whose
+/// `event:` name is [`StreamEvent::name`] (the snake_case tag) and whose
+/// `data:` is [`StreamEvent::data`] (the JSON content, without the tag).
+/// Serialized as a whole it is `{"type": name, "data": content}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum StreamEvent {
+    /// A post that was stored and is shown.
+    Post(PostJson),
+    /// A post was deleted (by its full id).
+    PostDeleted { id: String },
+    /// A channel appeared or changed topic, or (`deleted`) went away.
+    Channel { channel: ChannelJson, deleted: bool },
+    /// A handle was seen.
+    Presence(PresenceJson),
+    /// A peer's reachability changed: the whole peer list.
+    Peers(Vec<PeerJson>),
+}
+
+impl StreamEvent {
+    /// The server-sent event name: the serde tag.
+    pub fn name(&self) -> &'static str {
+        match self {
+            StreamEvent::Post(_) => "post",
+            StreamEvent::PostDeleted { .. } => "post_deleted",
+            StreamEvent::Channel { .. } => "channel",
+            StreamEvent::Presence(_) => "presence",
+            StreamEvent::Peers(_) => "peers",
+        }
+    }
+
+    /// The server-sent event's data: the JSON content, without the tag.
+    pub fn data(&self) -> serde_json::Value {
+        match self {
+            StreamEvent::Post(p) => serde_json::json!(p),
+            StreamEvent::PostDeleted { id } => serde_json::json!({ "id": id }),
+            StreamEvent::Channel { channel, deleted } => {
+                serde_json::json!({ "channel": channel, "deleted": deleted })
+            }
+            StreamEvent::Presence(p) => serde_json::json!(p),
+            StreamEvent::Peers(peers) => serde_json::json!(peers),
+        }
+    }
+
+    /// Reads an event back from its server-sent form: the `event:` name and
+    /// the text of the `data:` line(s).
+    pub fn from_sse(name: &str, data: &str) -> Result<StreamEvent, serde_json::Error> {
+        let data: serde_json::Value = serde_json::from_str(data)?;
+        serde_json::from_value(serde_json::json!({ "type": name, "data": data }))
+    }
 }
