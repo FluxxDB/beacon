@@ -19,14 +19,25 @@ fn pair() -> (Store, Store) {
     )
 }
 
-/// Applies to each store the events the other has and it lacks.
+/// Events per `events_after` page in `sync`, small so every test pages.
+const PAGE: usize = 3;
+
+/// Pages to each store the events the other has and it lacks, `PAGE` at a
+/// time, until a round brings nothing new.
 fn sync(a: &mut Store, b: &mut Store) {
-    for ev in a.events_after(&b.version_vector(), 10_000).unwrap() {
-        b.apply(&ev).unwrap();
+    for _ in 0..100 {
+        let mut fresh = 0;
+        for ev in a.events_after(&b.version_vector(), PAGE).unwrap() {
+            fresh += usize::from(b.apply(&ev).unwrap().is_some());
+        }
+        for ev in b.events_after(&a.version_vector(), PAGE).unwrap() {
+            fresh += usize::from(a.apply(&ev).unwrap().is_some());
+        }
+        if fresh == 0 {
+            return;
+        }
     }
-    for ev in b.events_after(&a.version_vector(), 10_000).unwrap() {
-        a.apply(&ev).unwrap();
-    }
+    panic!("sync did not settle in 100 rounds");
 }
 
 fn local(s: &mut Store, kind: EventKind, ts: i64) -> Event {
@@ -137,17 +148,21 @@ fn apply_twice_is_noop() {
 
 #[test]
 fn apply_is_atomic() {
-    let (mut a, mut b) = pair();
-    let mut ev = post(&mut b, "mac", "ghost", "too big", 10);
-    // SQLite integers are i64, so storing this size fails after the event row
-    // and the channel mark were written: nothing of it may remain.
-    if let EventKind::PostCreated(p) = &mut ev.kind {
-        p.attachment = Some(Attachment {
-            sha256: "00".repeat(32),
-            name: "huge".into(),
-            size: u64::MAX,
-        });
-    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("beacon.db");
+    let mut a = Store::open(&path, "pc").unwrap();
+    let mut b = Store::open_in_memory("mac").unwrap();
+    let ev = post(&mut b, "mac", "ghost", "boom", 10);
+
+    // Make the post insert fail, after the event row and the channel mark
+    // were written: nothing of the event may remain.
+    let other = rusqlite::Connection::open(&path).unwrap();
+    other
+        .execute_batch(
+            "CREATE TRIGGER fail_boom BEFORE INSERT ON posts WHEN NEW.body = 'boom'
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
     let before = a.version_vector();
     assert!(a.apply(&ev).is_err());
     assert_eq!(a.version_vector(), before);
@@ -155,12 +170,10 @@ fn apply_is_atomic() {
     assert_eq!(a.arrival_head(), 1);
     assert!(a.events_since_arrival(1, 10).unwrap().is_empty());
 
-    // The same (origin, seq) can still be applied once it is valid.
-    if let EventKind::PostCreated(p) = &mut ev.kind {
-        p.attachment = None;
-    }
+    // The same (origin, seq) can still be applied once the failure is gone.
+    other.execute_batch("DROP TRIGGER fail_boom").unwrap();
     assert!(a.apply(&ev).unwrap().is_some());
-    assert_eq!(bodies(&a, &in_channel("ghost")), vec!["too big"]);
+    assert_eq!(bodies(&a, &in_channel("ghost")), vec!["boom"]);
 }
 
 #[test]
@@ -398,17 +411,18 @@ fn fresh_store_has_general() {
     let (a, b) = pair();
     assert_eq!(a.channels().unwrap(), vec![general.clone()]);
     assert_eq!(b.channels().unwrap(), vec![general.clone()]);
+    // Stamped ts 0, so it never outranks a channel event someone made.
+    let created = a.events_since_arrival(0, 1).unwrap().remove(0).event;
+    assert_eq!(created.ts, 0);
+    assert!(matches!(created.kind, EventKind::ChannelCreated { .. }));
 
-    // On disk, reopening does not create it a second time.
+    // On disk, reopening keeps the origin and does not create it again.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("beacon.db");
-    let once: VersionVector = [("pc".to_string(), 1)].into();
-    {
-        let s = Store::open(&path, "pc").unwrap();
-        assert_eq!(s.version_vector(), once);
-    }
+    let origin = Store::open(&path, "pc").unwrap().origin().to_string();
     let s = Store::open(&path, "pc").unwrap();
-    assert_eq!(s.version_vector(), once);
+    assert_eq!(s.origin(), origin);
+    assert_eq!(s.version_vector(), [(origin, 1)].into());
     assert_eq!(s.channels().unwrap(), vec![general]);
 }
 
@@ -419,14 +433,14 @@ fn events_after_relays_all_origins() {
     post(&mut b, "mac", "general", "from mac", 20);
     sync(&mut a, &mut b);
 
-    let have: VersionVector = [("pc".to_string(), 0)].into();
+    let have: VersionVector = [(a.origin().to_string(), 0)].into();
     let events = a.events_after(&have, 100).unwrap();
     let origins: BTreeSet<&str> = events.iter().map(|e| e.origin.as_str()).collect();
-    assert_eq!(origins, BTreeSet::from(["mac", "pc"]));
+    assert_eq!(origins, BTreeSet::from([a.origin(), b.origin()]));
     assert_eq!(events.len(), 4, "both nodes' general and post");
 
-    // Nothing is resent to a caller that has everything, and limit keeps the
-    // oldest arrivals.
+    // Nothing is resent to a caller that has everything; a limit below the
+    // number of origins keeps the oldest arrival among their first events.
     assert!(a.events_after(&a.version_vector(), 100).unwrap().is_empty());
     let pc_general = a.events_since_arrival(0, 1).unwrap().remove(0).event;
     assert_eq!(
@@ -444,15 +458,15 @@ fn version_vector_counts_only_the_gapless_prefix() {
     assert_eq!(mac.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
 
     a.apply(&mac[2]).unwrap();
-    assert_eq!(a.version_vector()["mac"], 0);
+    assert_eq!(a.version_vector()[b.origin()], 0);
     a.apply(&mac[0]).unwrap();
-    assert_eq!(a.version_vector()["mac"], 1);
+    assert_eq!(a.version_vector()[b.origin()], 1);
     // Whoever syncs from a's vector is sent seq 2 again, not skipped past it.
     let resend = b.events_after(&a.version_vector(), 10).unwrap();
     assert_eq!(resend.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
     a.apply(&mac[1]).unwrap();
-    assert_eq!(a.version_vector()["mac"], 3);
-    assert_eq!(a.version_vector()["pc"], 1);
+    assert_eq!(a.version_vector()[b.origin()], 3);
+    assert_eq!(a.version_vector()[a.origin()], 1);
 }
 
 #[test]
@@ -595,4 +609,233 @@ fn announced_peers_latest_per_node() {
     ];
     assert_eq!(a.announced_peers().unwrap(), expected);
     assert_eq!(b.announced_peers().unwrap(), expected);
+}
+
+#[test]
+fn gap_filler_beyond_limit_converges() {
+    // The reviewer's probe: the relay holds mac:2..12 and received mac:1 last;
+    // the receiver holds mac:2..12 and lacks mac:1.
+    let mut mac = Store::open_in_memory("mac").unwrap();
+    for i in 0..11 {
+        post(&mut mac, "mac", "general", &format!("post {i}"), 10 + i);
+    }
+    let events = mac.events_after(&VersionVector::new(), 100).unwrap();
+    assert_eq!(events.iter().map(|e| e.seq).max(), Some(12));
+    let mut relay = Store::open_in_memory("relay").unwrap();
+    let mut receiver = Store::open_in_memory("receiver").unwrap();
+    for ev in &events[1..] {
+        relay.apply(ev).unwrap();
+        receiver.apply(ev).unwrap();
+    }
+    relay.apply(&events[0]).unwrap();
+    assert_eq!(receiver.version_vector()[mac.origin()], 0);
+
+    // One page of 5 already carries mac:1 (and the relay's own first event),
+    // though mac:1 is the relay's newest arrival.
+    for ev in relay.events_after(&receiver.version_vector(), 5).unwrap() {
+        receiver.apply(&ev).unwrap();
+    }
+    assert_eq!(receiver.version_vector()[mac.origin()], 12);
+    assert_eq!(receiver.version_vector()[relay.origin()], 1);
+}
+
+#[test]
+fn events_after_since_skips_what_arrived_before() {
+    let (mut a, _) = pair();
+    let head = a.arrival_head();
+    post(&mut a, "pc", "general", "one", 10);
+    post(&mut a, "pc", "general", "two", 20);
+
+    let all = a.events_after_since(&VersionVector::new(), 0, 10).unwrap();
+    let since = a
+        .events_after_since(&VersionVector::new(), head, 10)
+        .unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(since, all[1..].to_vec());
+    assert_eq!(
+        since.iter().map(|x| x.arrival).collect::<Vec<_>>(),
+        vec![head + 1, head + 2]
+    );
+    let events: Vec<Event> = all.into_iter().map(|x| x.event).collect();
+    assert_eq!(a.events_after(&VersionVector::new(), 10).unwrap(), events);
+}
+
+#[test]
+fn fresh_node_does_not_reset_general() {
+    let (mut a, mut b) = pair();
+    create(&mut a, "general", Some("lobby"), 100);
+    sync(&mut a, &mut b);
+    let mut c = Store::open_in_memory("new-laptop").unwrap();
+    sync(&mut c, &mut b);
+    sync(&mut a, &mut b);
+    for s in [&a, &b, &c] {
+        let general = s.channel("general").unwrap().unwrap();
+        assert_eq!(general.topic.as_deref(), Some("lobby"));
+    }
+
+    delete_channel(&mut a, "general", 200);
+    let mut d = Store::open_in_memory("another").unwrap();
+    sync(&mut d, &mut a);
+    for s in [&a, &d] {
+        assert!(s.channel("general").unwrap().is_none());
+    }
+}
+
+#[test]
+fn same_node_name_on_fresh_databases_gets_new_origins() {
+    let mut before_wipe = Store::open_in_memory("pc").unwrap();
+    let mut after_wipe = Store::open_in_memory("pc").unwrap();
+    assert_eq!(before_wipe.node(), "pc");
+    assert_ne!(before_wipe.origin(), after_wipe.origin());
+    let (node, db_id) = before_wipe.origin().split_once('~').unwrap();
+    assert_eq!(node, "pc");
+    assert_eq!(db_id.len(), 8);
+    assert!(db_id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+
+    post(&mut before_wipe, "pc", "general", "before the wipe", 10);
+    post(&mut after_wipe, "pc", "general", "after the wipe", 20);
+    let mut mac = Store::open_in_memory("mac").unwrap();
+    sync(&mut before_wipe, &mut mac);
+    sync(&mut after_wipe, &mut mac);
+    assert_eq!(
+        bodies(&mac, &in_channel("general")),
+        vec!["before the wipe", "after the wipe"]
+    );
+}
+
+/// A peer's event with the given payload, as if `append_local` had not
+/// checked it.
+fn remote(seq: u64, kind: EventKind) -> Event {
+    Event {
+        origin: "evil~abcdefgh".into(),
+        seq,
+        id: format!("01JDB7K4TR00000000000000{seq:02}"),
+        ts: 1_000,
+        kind,
+    }
+}
+
+#[test]
+fn invalid_remote_event_is_stored_and_relayed_not_applied() {
+    let (mut a, mut b) = pair();
+    let bad = remote(
+        1,
+        EventKind::ChannelCreated {
+            name: "Bad Name".into(),
+            topic: None,
+        },
+    );
+    assert!(a.apply(&bad).unwrap().is_some());
+    assert_eq!(a.version_vector()["evil~abcdefgh"], 1);
+    assert_eq!(names(&a), vec!["general"]);
+    assert!(a.apply(&bad).unwrap().is_none());
+
+    sync(&mut a, &mut b);
+    assert_eq!(b.version_vector()["evil~abcdefgh"], 1);
+    assert_eq!(names(&b), vec!["general"]);
+    assert_eq!(b.events_after(&a.version_vector(), 10).unwrap(), vec![]);
+}
+
+#[test]
+fn invalid_payloads_change_nothing() {
+    let valid = || new_post("evil", "general", "hi @pc-agent");
+    let attachment = |name: &str, size: u64| {
+        Some(Attachment {
+            sha256: "00".repeat(32),
+            name: name.into(),
+            size,
+        })
+    };
+    let posts = [
+        NewPost {
+            channel: "#general".into(),
+            ..valid()
+        },
+        NewPost {
+            author: "-dash".into(),
+            ..valid()
+        },
+        NewPost {
+            tags: vec!["Done".into()],
+            ..valid()
+        },
+        NewPost {
+            mentions: vec!["PC-agent".into()],
+            ..valid()
+        },
+        NewPost {
+            mentions: vec!["pc agent".into()],
+            ..valid()
+        },
+        NewPost {
+            body: "x".repeat(64 * 1024 + 1),
+            ..valid()
+        },
+        NewPost {
+            attachment: attachment("", 1),
+            ..valid()
+        },
+        NewPost {
+            attachment: attachment(&"n".repeat(256), 1),
+            ..valid()
+        },
+        NewPost {
+            attachment: attachment("big", u64::MAX),
+            ..valid()
+        },
+    ];
+    let mut kinds: Vec<EventKind> = posts.into_iter().map(EventKind::PostCreated).collect();
+    kinds.push(EventKind::ChannelDeleted {
+        name: "general ".into(),
+    });
+    kinds.push(EventKind::PostDeleted {
+        post_id: "x".into(),
+        by: "".into(),
+    });
+    kinds.push(EventKind::AgentSeen(heartbeat("bad handle", None)));
+
+    for kind in kinds {
+        let (mut a, _) = pair();
+        let label = format!("{kind:?}");
+        let mut local_store = Store::open_in_memory("evil").unwrap();
+        assert!(
+            matches!(
+                local_store.append_local(kind.clone(), 1_000),
+                Err(Error::Usage(_))
+            ),
+            "append_local accepted {label}"
+        );
+        assert_eq!(local_store.arrival_head(), 1, "{label}");
+
+        assert!(a.apply(&remote(1, kind)).unwrap().is_some(), "{label}");
+        assert_eq!(a.version_vector()["evil~abcdefgh"], 1, "{label}");
+        assert_eq!(names(&a), vec!["general"], "{label}");
+        assert!(
+            a.posts(&PostQuery::default()).unwrap().is_empty(),
+            "{label}"
+        );
+        assert!(a.who(1_000).unwrap().is_empty(), "{label}");
+    }
+
+    // A valid post is applied, as a control.
+    let (mut a, _) = pair();
+    a.apply(&remote(1, EventKind::PostCreated(valid())))
+        .unwrap();
+    assert_eq!(bodies(&a, &PostQuery::default()), vec!["hi @pc-agent"]);
+}
+
+#[test]
+fn seq_out_of_range() {
+    let (mut a, _) = pair();
+    let hello = || EventKind::PostCreated(new_post("evil", "general", "hello"));
+    let huge = remote(u64::MAX, hello());
+    assert!(matches!(a.apply(&huge), Err(Error::Usage(_))));
+    assert_eq!(a.arrival_head(), 1);
+    assert!(!a.version_vector().contains_key("evil~abcdefgh"));
+
+    // seq 0 fits in SQLite, so it is stored but not applied.
+    assert!(a.apply(&remote(0, hello())).unwrap().is_some());
+    assert!(a.posts(&PostQuery::default()).unwrap().is_empty());
 }

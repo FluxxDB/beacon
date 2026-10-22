@@ -5,6 +5,13 @@
 -- "Newest" always means the greatest (ts, origin, seq): the spec's (ts, origin),
 -- with the origin's own seq breaking a tie between two of its events in one ms.
 
+-- Facts about this database. `db_id` (8 random lowercase base32 characters,
+-- made when the database is created) makes this node's origin `{node}~{db_id}`.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) WITHOUT ROWID;
+
 -- Every event, numbered by local arrival (`arrival`, never reused). Read
 -- cursors follow arrival, not `ts`, so a late post with an old ts is still new.
 CREATE TABLE IF NOT EXISTS events (

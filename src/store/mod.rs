@@ -2,9 +2,11 @@
 //!
 //! [`Store::apply`] stores an event once per `(origin, seq)` and updates the
 //! derived tables (channels, posts, presence, announced peers) in the same
-//! transaction. The derived state depends only on the set of events stored,
-//! never on the order they arrived in, so nodes that hold the same events show
-//! the same board. See `schema.sql` for the tables and the visibility rule.
+//! transaction. An event whose payload breaks [`validate_event`] is stored
+//! and relayed but changes no derived state. The derived state depends only
+//! on the set of events stored, never on the order they arrived in, so nodes
+//! that hold the same events show the same board. See `schema.sql` for the
+//! tables and the visibility rule.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,7 +17,9 @@ use serde::de::DeserializeOwned;
 use ulid::{Generator, Ulid};
 
 use crate::error::Error;
-use crate::model::{Attachment, AuthorKind, Event, EventKind, NewPost, Presence, VersionVector};
+use crate::model::{
+    validate_event, Attachment, AuthorKind, Event, EventKind, NewPost, Presence, VersionVector,
+};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -48,8 +52,10 @@ const CHANNEL_SELECT: &str = "SELECT v.name, v.topic, \
 /// fields are private to `store` and its child modules (such as `unread`).
 pub struct Store {
     conn: Connection,
-    /// This node's name, the origin of every event it appends.
+    /// This node's name (`BEACON_NODE`), as it appears in payloads.
     node: String,
+    /// `{node}~{db_id}`: the origin of every event this database appends.
+    origin: String,
     ids: Generator,
     /// Per origin, the highest seq up to which every event is stored.
     vv: VersionVector,
@@ -157,10 +163,18 @@ impl Store {
         Store::init(Connection::open_in_memory()?, node)
     }
 
-    /// Creates the tables, loads the version vector and, on a board with no
-    /// channel event yet, creates `general` as a local event.
+    /// Creates the tables and this database's id, loads the version vector
+    /// and, on a board with no channel event yet, creates `general`.
     fn init(conn: Connection, node: &str) -> Result<Store> {
         conn.execute_batch(SCHEMA)?;
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('db_id', ?1) ON CONFLICT (key) DO NOTHING",
+            [new_db_id()],
+        )?;
+        let db_id: String =
+            conn.query_row("SELECT value FROM meta WHERE key = 'db_id'", [], |r| {
+                r.get(0)
+            })?;
         let vv = load_version_vector(&conn)?;
         let head = conn.query_row("SELECT COALESCE(MAX(arrival), 0) FROM events", [], |r| {
             r.get(0)
@@ -173,6 +187,7 @@ impl Store {
         let mut store = Store {
             conn,
             node: node.to_string(),
+            origin: format!("{node}~{db_id}"),
             ids: Generator::new(),
             vv,
             head,
@@ -182,33 +197,52 @@ impl Store {
                 name: GENERAL.into(),
                 topic: None,
             };
-            store.append_local(general, wall_clock_ms())?;
+            // ts 0, so every new device's `general` is older than any channel
+            // event a person made (a topic, a delete); the id keeps real time.
+            store.append(general, 0, wall_clock_ms())?;
         }
         Ok(store)
     }
 
+    /// This node's name, as given to `open`.
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    /// The origin of the events this database appends: `{node}~{db_id}`.
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
     /// Records a change made on this node: the next seq of our own origin, a
     /// new ULID, ts `now_ms`, then [`Store::apply`]. A `post_created` with an
-    /// empty `post_id` gets the event's id as its post id.
-    pub fn append_local(&mut self, mut kind: EventKind, now_ms: i64) -> Result<Applied> {
+    /// empty `post_id` gets the event's id as its post id. A payload that
+    /// breaks [`validate_event`] is [`Error::Usage`] and is not stored.
+    pub fn append_local(&mut self, kind: EventKind, now_ms: i64) -> Result<Applied> {
+        self.append(kind, now_ms, now_ms)
+    }
+
+    /// [`Store::append_local`] with ts `ts` and an id made for time `id_ms`.
+    fn append(&mut self, mut kind: EventKind, ts: i64, id_ms: i64) -> Result<Applied> {
         let seq: u64 = self.conn.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE origin = ?1",
-            [&self.node],
+            [&self.origin],
             |r| r.get(0),
         )?;
-        let id = self.next_id(now_ms).to_string();
+        let id = self.next_id(id_ms).to_string();
         if let EventKind::PostCreated(post) = &mut kind {
             if post.post_id.is_empty() {
                 post.post_id = id.clone();
             }
         }
         let ev = Event {
-            origin: self.node.clone(),
+            origin: self.origin.clone(),
             seq,
             id,
-            ts: now_ms,
+            ts,
             kind,
         };
+        validate_event(&ev)?;
         self.apply(&ev)?.ok_or_else(|| {
             Error::Internal(anyhow::anyhow!(
                 "local event {}:{} is already stored",
@@ -220,7 +254,19 @@ impl Store {
 
     /// Stores `ev` and updates the derived state, all in one transaction.
     /// Returns `None`, changing nothing, if `(origin, seq)` is already stored.
+    ///
+    /// An event whose payload breaks [`validate_event`] is still stored (so
+    /// version vectors stay gap-free and it relays) and returned, but changes
+    /// no derived state; code that renders events should read derived state or
+    /// check it too. A seq above `i64::MAX` cannot be stored: [`Error::Usage`].
     pub fn apply(&mut self, ev: &Event) -> Result<Option<Applied>> {
+        if i64::try_from(ev.seq).is_err() {
+            return Err(Error::Usage(format!(
+                "event {}:{} has a seq too large to store",
+                ev.origin, ev.seq
+            )));
+        }
+        let invalid = validate_event(ev).err();
         let json = serde_json::to_string(ev).map_err(anyhow::Error::from)?;
         let tx = self.conn.transaction()?;
         let inserted = tx.execute(
@@ -232,7 +278,14 @@ impl Store {
             return Ok(None);
         }
         let arrival = tx.last_insert_rowid();
-        derive(&tx, ev, arrival)?;
+        match &invalid {
+            None => derive(&tx, ev, arrival)?,
+            Some(why) => tracing::warn!(
+                origin = %ev.origin,
+                seq = ev.seq,
+                "stored an invalid event without applying it: {why}"
+            ),
+        }
         let have = self.vv.get(&ev.origin).copied().unwrap_or(0);
         let have = gapless_from(&tx, &ev.origin, have)?;
         tx.commit()?;
@@ -246,32 +299,70 @@ impl Store {
 
     /// For every origin stored, the highest seq up to which this node has
     /// every event (so a gap is asked for again, never skipped).
+    ///
+    /// Because it stops at a gap, a peer syncing from this vector is sent the
+    /// events above the gap again, which this node already holds. So a
+    /// non-empty [`Store::events_after`] does not mean the caller lacks
+    /// anything: two nodes missing the same event re-send each other what lies
+    /// above it for as long as the gap lasts. To fetch only what is new, pass
+    /// the responder's last arrival seen to [`Store::events_after_since`].
     pub fn version_vector(&self) -> VersionVector {
         self.vv.clone()
     }
 
-    /// Events of every origin with `seq > have[origin]` (0 when absent), the
-    /// oldest `limit` by arrival.
+    /// Events of every origin with `seq > have[origin]` (0 when absent): at
+    /// most `limit`, taking each origin's lowest seqs first, ordered by
+    /// arrival. As long as `limit` is at least the number of origins, every
+    /// origin's next missing event is included, so paging always makes
+    /// progress. See [`Store::version_vector`]: a non-empty result does not
+    /// mean the caller lacks anything.
     pub fn events_after(&self, have: &VersionVector, limit: usize) -> Result<Vec<Event>> {
-        let limit_sql = sql_limit(limit);
+        let applied = self.events_after_since(have, 0, limit)?;
+        Ok(applied.into_iter().map(|a| a.event).collect())
+    }
+
+    /// [`Store::events_after`] limited to events that arrived after `since`,
+    /// with their arrivals, so a caller can page through a responder's log
+    /// and skip what it was already sent.
+    pub fn events_after_since(
+        &self,
+        have: &VersionVector,
+        since: i64,
+        limit: usize,
+    ) -> Result<Vec<Applied>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT arrival, json FROM events WHERE origin = ?1 AND seq > ?2
-             ORDER BY arrival LIMIT ?3",
+            "SELECT arrival, json FROM events WHERE origin = ?1 AND seq > ?2 AND arrival > ?3
+             ORDER BY seq LIMIT ?4",
         )?;
-        let mut found: Vec<(i64, String)> = Vec::new();
+        // (rank within its origin by seq, arrival, json)
+        let mut found: Vec<(usize, i64, String)> = Vec::new();
         for origin in self.vv.keys() {
             let after = have.get(origin).copied().unwrap_or(0);
             let after = i64::try_from(after).unwrap_or(i64::MAX);
-            let rows = stmt.query_map(params![origin, after, limit_sql], |r| {
+            let rows = stmt.query_map(params![origin, after, since, sql_limit(limit)], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?;
-            for row in rows {
-                found.push(row?);
+            for (rank, row) in rows.enumerate() {
+                let (arrival, json) = row?;
+                found.push((rank, arrival, json));
             }
         }
-        found.sort_unstable_by_key(|(arrival, _)| *arrival);
-        found.truncate(limit);
-        found.iter().map(|(_, json)| parse_event(json)).collect()
+        if found.len() > limit {
+            // Cut by rank, not arrival: an origin's lowest missing seq may
+            // have arrived here after many later ones.
+            found.sort_unstable_by_key(|&(rank, arrival, _)| (rank, arrival));
+            found.truncate(limit);
+        }
+        found.sort_unstable_by_key(|&(_, arrival, _)| arrival);
+        found
+            .into_iter()
+            .map(|(_, arrival, json)| {
+                Ok(Applied {
+                    event: parse_event(&json)?,
+                    arrival,
+                })
+            })
+            .collect()
     }
 
     /// The highest arrival stored (0 when empty).
@@ -623,6 +714,12 @@ fn parse_event(json: &str) -> Result<Event> {
 /// `limit` as an SQL `LIMIT` (which is an i64).
 fn sql_limit(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
+}
+
+/// 8 random lowercase base32 characters (the random tail of a ULID).
+fn new_db_id() -> String {
+    let ulid = Ulid::generate().to_string();
+    ulid[ulid.len() - 8..].to_ascii_lowercase()
 }
 
 fn wall_clock_ms() -> i64 {

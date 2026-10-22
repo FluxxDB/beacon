@@ -10,7 +10,9 @@ use crate::error::Error;
 /// One immutable change to the board, keyed by `(origin, seq)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
-    /// Name of the node that created the event.
+    /// The database that created the event: `{node}~{db_id}`, where `db_id`
+    /// is made once per database, so a node whose database is wiped starts a
+    /// new origin instead of reusing seqs its peers already hold.
     pub origin: String,
     /// Position in the origin's own log; increases by one per event.
     pub seq: u64,
@@ -78,6 +80,10 @@ pub struct Presence {
 const CHANNEL_MAX: usize = 32;
 const HANDLE_MAX: usize = 32;
 const TAG_MAX: usize = 24;
+/// Longest post body, in bytes.
+pub const BODY_MAX: usize = 64 * 1024;
+/// Longest attachment name, in bytes.
+pub const ATTACHMENT_NAME_MAX: usize = 255;
 
 fn is_handle_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
@@ -174,7 +180,8 @@ pub fn short_id(id: &str) -> &str {
     }
 }
 
-/// Highest `seq` seen from each origin.
+/// Per origin, the highest `seq` up to which every event of that origin is
+/// held: an event above a missing one does not count until the gap is filled.
 pub type VersionVector = BTreeMap<String, u64>;
 
 /// Parses `origin:seq,origin:seq`; the empty string is the empty vector.
@@ -204,4 +211,74 @@ pub fn format_vv(vv: &VersionVector) -> String {
         .map(|(origin, seq)| format!("{origin}:{seq}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Checks an event against the rules local input is held to: `seq` from 1 to
+/// `i64::MAX`; channel names already normalized; handles, tags and lowercase
+/// mentions valid; a body of at most [`BODY_MAX`] bytes; an attachment name of
+/// 1 to [`ATTACHMENT_NAME_MAX`] bytes and a size SQLite can store.
+pub fn validate_event(ev: &Event) -> Result<(), Error> {
+    if ev.seq == 0 || i64::try_from(ev.seq).is_err() {
+        return Err(Error::Usage(format!(
+            "event seq {} is outside 1..={}",
+            ev.seq,
+            i64::MAX
+        )));
+    }
+    match &ev.kind {
+        EventKind::ChannelCreated { name, .. } | EventKind::ChannelDeleted { name } => {
+            check_channel(name)
+        }
+        EventKind::PostCreated(post) => check_post(post),
+        EventKind::PostDeleted { by, .. } => validate_handle(by).map(drop),
+        EventKind::AgentSeen(p) => validate_handle(&p.handle).map(drop),
+        EventKind::PeerAnnounced { .. } => Ok(()),
+    }
+}
+
+/// A channel name in an event must already be in normal form.
+fn check_channel(name: &str) -> Result<(), Error> {
+    if normalize_channel(name)? == name {
+        Ok(())
+    } else {
+        Err(Error::Usage(format!(
+            "channel name {name:?} is not normalized"
+        )))
+    }
+}
+
+fn check_post(post: &NewPost) -> Result<(), Error> {
+    check_channel(&post.channel)?;
+    validate_handle(&post.author)?;
+    for tag in &post.tags {
+        validate_tag(tag)?;
+    }
+    for mention in &post.mentions {
+        validate_handle(mention)?;
+        if mention.chars().any(|c| c.is_ascii_uppercase()) {
+            return Err(Error::Usage(format!(
+                "mention {mention:?} is not lowercase"
+            )));
+        }
+    }
+    if post.body.len() > BODY_MAX {
+        return Err(Error::Usage(format!(
+            "post body is {} bytes, over the {BODY_MAX}-byte limit",
+            post.body.len()
+        )));
+    }
+    if let Some(att) = &post.attachment {
+        if att.name.is_empty() || att.name.len() > ATTACHMENT_NAME_MAX {
+            return Err(Error::Usage(format!(
+                "attachment name must be 1-{ATTACHMENT_NAME_MAX} bytes"
+            )));
+        }
+        if i64::try_from(att.size).is_err() {
+            return Err(Error::Usage(format!(
+                "attachment size {} is too large",
+                att.size
+            )));
+        }
+    }
+    Ok(())
 }
