@@ -15,17 +15,24 @@ use rusqlite::{params, Connection};
 use super::{post_row, sql_limit, PostRow, Result, Store, POST_COLUMNS, SHOWN_POSTS};
 use crate::model::{mentions_handle, normalize_channel};
 
-/// The shown posts handle `?1` has not read and that are relevant to it, as
-/// further conditions after [`SHOWN_POSTS`]. The SQL twin of
-/// [`Store::is_relevant`] plus the read cursor; a test keeps the two agreeing.
-const RELEVANT_UNREAD: &str = "
+/// Conditions after [`SHOWN_POSTS`] for the posts that are new to handle `?1`:
+/// not its own (case-insensitive) and arrived after its cursor for the channel.
+const NEW_FROM_OTHERS: &str = "
     AND lower(p.author) <> lower(?1)
     AND p.arrival > COALESCE(
-        (SELECT c.arrival FROM cursors AS c WHERE c.handle = ?1 AND c.channel = p.channel), 0)
+        (SELECT c.arrival FROM cursors AS c WHERE c.handle = ?1 AND c.channel = p.channel), 0)";
+
+/// Further conditions for the ones relevant to handle `?1`: the SQL twin of the
+/// rule in [`Store::is_relevant`] (its first clause, not own, is in
+/// [`NEW_FROM_OTHERS`]); a test keeps the two agreeing.
+const RELEVANT: &str = concat!(
+    "
     AND (p.author_kind = 'human'
-         OR EXISTS (SELECT 1 FROM json_each(p.mentions_json)
-                    WHERE lower(value) IN ('all', lower(?1)))
-         OR p.channel IN (SELECT j.channel FROM joins AS j WHERE j.handle = ?1))";
+         OR ",
+    mentions_sql!("?1"),
+    "
+         OR p.channel IN (SELECT j.channel FROM joins AS j WHERE j.handle = ?1))"
+);
 
 /// A page of what is new for a handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +110,8 @@ impl Store {
     /// Nothing is marked read; see [`Store::mark_read`].
     pub fn unread(&self, handle: &str, limit: usize) -> Result<Unread> {
         let sql = format!(
-            "SELECT {POST_COLUMNS} FROM {SHOWN_POSTS}{RELEVANT_UNREAD} ORDER BY p.arrival LIMIT ?2"
+            "SELECT {POST_COLUMNS} FROM {SHOWN_POSTS}{NEW_FROM_OTHERS}{RELEVANT} \
+             ORDER BY p.arrival LIMIT ?2"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![handle, sql_limit(limit)], post_row)?;
@@ -144,12 +152,15 @@ impl Store {
         Ok(())
     }
 
-    /// How many unread posts `handle` has in each channel, all of them (not
-    /// one page), by the same rule as [`Store::unread`]. Channels with none
-    /// are left out.
+    /// For the sidebar badges: how many new posts `handle` has in each
+    /// channel, relevant or not. That is every shown post not by `handle`
+    /// (case-insensitive) that arrived after its cursor for the channel, not
+    /// one page and not only what [`Store::unread`] would list: an agent's
+    /// post in a channel `handle` has not joined counts here. Channels with
+    /// none are left out.
     pub fn unread_counts(&self, handle: &str) -> Result<BTreeMap<String, u32>> {
         let sql = format!(
-            "SELECT p.channel, COUNT(*) FROM {SHOWN_POSTS}{RELEVANT_UNREAD} GROUP BY p.channel"
+            "SELECT p.channel, COUNT(*) FROM {SHOWN_POSTS}{NEW_FROM_OTHERS} GROUP BY p.channel"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map([handle], |r| Ok((r.get(0)?, r.get::<_, i64>(1)?)))?;
@@ -161,8 +172,22 @@ impl Store {
         Ok(counts)
     }
 
+    /// For the Announcements badge: how many announcements (human-authored
+    /// shown posts) not by `handle` arrived after its cursor for their
+    /// channel, across all channels.
+    pub fn unread_announcements(&self, handle: &str) -> Result<u32> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {SHOWN_POSTS}{NEW_FROM_OTHERS} AND p.author_kind = 'human'"
+        );
+        let n: i64 = self
+            .conn
+            .prepare_cached(&sql)?
+            .query_row([handle], |r| r.get(0))?;
+        Ok(u32::try_from(n).unwrap_or(u32::MAX))
+    }
+
     fn count_unread(&self, handle: &str) -> Result<usize> {
-        let sql = format!("SELECT COUNT(*) FROM {SHOWN_POSTS}{RELEVANT_UNREAD}");
+        let sql = format!("SELECT COUNT(*) FROM {SHOWN_POSTS}{NEW_FROM_OTHERS}{RELEVANT}");
         let n: i64 = self
             .conn
             .prepare_cached(&sql)?

@@ -1036,6 +1036,7 @@ fn unread_agrees_with_is_relevant() {
         ("PC-Configs", &[]),
         ("nobody", &["general"]),
     ];
+    let mut wider = false;
     for (handle, joined) in cases {
         a.set_joins(handle, &strings(joined)).unwrap();
         let joins = a.joins(handle).unwrap();
@@ -1055,12 +1056,131 @@ fn unread_agrees_with_is_relevant() {
         got_ids.sort_unstable();
         assert_eq!(got_ids, want_ids, "{handle}");
 
+        // The badges count every new post by anyone else, relevant or not.
         let mut want_counts = std::collections::BTreeMap::new();
-        for p in &want {
+        for p in every
+            .iter()
+            .filter(|p| !p.author.eq_ignore_ascii_case(handle))
+        {
             *want_counts.entry(p.channel.clone()).or_insert(0u32) += 1;
         }
+        wider |= want_counts.values().sum::<u32>() as usize > want.len();
         assert_eq!(a.unread_counts(handle).unwrap(), want_counts, "{handle}");
     }
+    assert!(
+        wider,
+        "some handle should have new posts that are not relevant"
+    );
+}
+
+/// The sidebar badges: every shown post by someone else after the cursor.
+#[test]
+fn unread_counts_cover_every_new_post_by_others() {
+    let (mut a, _) = pair();
+    let me = "dang";
+    // No joins, no mentions: none of these is relevant to `dang`.
+    agent_post(&mut a, "mac-agent", "vllm", "plain in vllm", 1_000);
+    agent_post(&mut a, "mac-agent", "beacon", "plain in beacon", 2_000);
+    // His own posts, spelled any way, are not new to him.
+    post_by(
+        &mut a,
+        "DANG",
+        AuthorKind::Human,
+        "beacon",
+        "own announcement",
+        3_000,
+    );
+    agent_post(&mut a, "Dang", "vllm", "own, as an agent", 4_000);
+    // A deleted post and a deleted channel's posts are not shown.
+    let gone = agent_post(&mut a, "mac-agent", "beacon", "deleted", 5_000);
+    delete_post(&mut a, &gone, 6_000);
+    agent_post(&mut a, "mac-agent", "old", "in a deleted channel", 7_000);
+    delete_channel(&mut a, "old", 8_000);
+
+    let counts = |s: &Store, h: &str| -> Vec<(String, u32)> {
+        s.unread_counts(h).unwrap().into_iter().collect()
+    };
+    assert_eq!(counts(&a, me), [("beacon".into(), 1), ("vllm".into(), 1)]);
+    assert_eq!(counts(&a, "DANG"), counts(&a, me));
+    // `unread` lists only what is relevant; the badges are wider on purpose.
+    assert!(a.unread(me, 50).unwrap().posts.is_empty());
+    // Someone else sees the posts that were `dang`'s own.
+    assert_eq!(
+        counts(&a, "reader"),
+        [("beacon".into(), 2), ("vllm".into(), 2)]
+    );
+
+    // Announcements by someone else count too.
+    post_by(
+        &mut a,
+        "ann",
+        AuthorKind::Human,
+        "vllm",
+        "from another human",
+        9_000,
+    );
+    assert_eq!(counts(&a, me), [("beacon".into(), 1), ("vllm".into(), 2)]);
+
+    // Cursors are per channel: reading vllm leaves beacon's badge, and a
+    // newer post in vllm lights it again.
+    let vllm = a.posts(&in_channel("vllm")).unwrap();
+    let newest = vllm.iter().map(|p| p.arrival).max().unwrap();
+    a.set_cursor(me, "vllm", newest).unwrap();
+    assert_eq!(counts(&a, me), [("beacon".into(), 1)]);
+    agent_post(&mut a, "mac-agent", "vllm", "one more", 10_000);
+    assert_eq!(counts(&a, me), [("beacon".into(), 1), ("vllm".into(), 1)]);
+    a.set_cursor(me, "beacon", i64::MAX).unwrap();
+    assert_eq!(counts(&a, me), [("vllm".into(), 1)]);
+}
+
+#[test]
+fn unread_announcements_counts_others_human_posts_across_channels() {
+    let (mut a, _) = pair();
+    let me = "reader";
+    dang_post(&mut a, "vllm", "a1", 1_000);
+    dang_post(&mut a, "beacon", "a2", 2_000);
+    dang_post(&mut a, "beacon", "a3", 3_000);
+    // Not announcements, not new to him, or not shown.
+    agent_post(&mut a, "mac-agent", "beacon", "an agent", 4_000);
+    post_by(
+        &mut a,
+        "READER",
+        AuthorKind::Human,
+        "beacon",
+        "his own",
+        5_000,
+    );
+    let gone = dang_post(&mut a, "beacon", "deleted", 6_000);
+    delete_post(&mut a, &gone, 7_000);
+    dang_post(&mut a, "old", "in a deleted channel", 8_000);
+    delete_channel(&mut a, "old", 9_000);
+
+    assert_eq!(a.unread_announcements(me).unwrap(), 3);
+    assert_eq!(a.unread_announcements("READER").unwrap(), 3);
+    // Dang's own announcements are not new to him; the human "reader" posted one.
+    assert_eq!(a.unread_announcements("dang").unwrap(), 1);
+
+    // Joins do not matter, and it agrees with what `unread` lists.
+    let listed = |s: &Store| {
+        s.unread(me, 1_000)
+            .unwrap()
+            .posts
+            .iter()
+            .filter(|p| p.announcement())
+            .count()
+    };
+    assert_eq!(listed(&a), 3);
+
+    // Cursors are per channel: reading beacon up to a2 leaves a1 (vllm) and a3.
+    let beacon = a.posts(&in_channel("beacon")).unwrap();
+    let a2 = beacon.iter().find(|p| p.body == "a2").unwrap();
+    a.set_cursor(me, "beacon", a2.arrival).unwrap();
+    assert_eq!(a.unread_announcements(me).unwrap(), 2, "a1 and a3 remain");
+    assert_eq!(listed(&a), 2);
+
+    let shown = a.unread(me, 50).unwrap().posts;
+    a.mark_read(me, &shown).unwrap();
+    assert_eq!(a.unread_announcements(me).unwrap(), 0);
 }
 
 #[test]

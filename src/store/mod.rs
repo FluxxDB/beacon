@@ -7,7 +7,21 @@
 //! on the set of events stored, never on the order they arrived in, so nodes
 //! that hold the same events show the same board. See `schema.sql` for the
 //! tables and the visibility rule. What each handle has read and joined lives
-//! beside the log, local to the node; see [`unread`].
+//! beside the log, local to the node; see [`Unread`].
+
+/// SQL for "post `p` mentions the handle bound to `$param` (or `@all`)",
+/// mirroring [`crate::model::mentions_handle`]. One definition for
+/// [`Store::posts`] and the unread queries.
+macro_rules! mentions_sql {
+    ($param:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM json_each(p.mentions_json) \
+             WHERE lower(value) IN ('all', lower(",
+            $param,
+            ")))"
+        )
+    };
+}
 
 mod unread;
 
@@ -432,11 +446,7 @@ impl Store {
             args.push(tag.clone().into());
         }
         if let Some(handle) = &q.mentions_of {
-            // Mirrors model::mentions_handle.
-            sql.push_str(
-                " AND EXISTS (SELECT 1 FROM json_each(p.mentions_json) \
-                 WHERE lower(value) IN ('all', lower(?)))",
-            );
+            sql.push_str(concat!(" AND ", mentions_sql!("?")));
             args.push(handle.clone().into());
         }
         if q.announcements_only {
