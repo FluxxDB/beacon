@@ -264,10 +264,7 @@ fn esc_puts_the_ghost_away_for_this_word() {
     assert_eq!(app.ghost(), None, "still the same word");
     // With no ghost, Tab moves the focus again.
     app.update(key(KeyCode::Tab));
-    assert_eq!(
-        (app.focus, app.input.as_str()),
-        (Focus::Sidebar, "hey @pc-")
-    );
+    assert_eq!((app.focus, app.input.as_str()), (Focus::Posts, "hey @pc-"));
 
     // The next `@` brings it back.
     app.focus = Focus::Composer;
@@ -307,7 +304,7 @@ fn no_match_means_no_ghost_and_the_keys_do_what_they_did() {
     app.update(key(KeyCode::Up));
     assert_eq!(app.input, "@zz");
     app.update(key(KeyCode::Tab));
-    assert_eq!((app.focus, app.input.as_str()), (Focus::Sidebar, "@zz"));
+    assert_eq!((app.focus, app.input.as_str()), (Focus::Posts, "@zz"));
 
     // Only Dang's own name starts with a d: nothing to offer.
     let mut app = typing();

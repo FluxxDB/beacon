@@ -350,8 +350,8 @@ async fn attach_save_and_delete_through_the_keys() {
         assert_eq!(post["attachment"]["name"], "notes.txt");
         let id = post["id"].as_str().unwrap().to_string();
 
-        // Save: the name is taken, so it gets the next free one.
-        tui.press(KeyCode::Tab);
+        // Save: the name is taken, so it gets the next free one. Out to the
+        // composer and back to the posts selects the newest post.
         tui.press(KeyCode::Tab);
         tui.press(KeyCode::Tab);
         tui.press(KeyCode::Char('s'));
@@ -446,8 +446,7 @@ async fn save_refuses_a_file_that_does_not_match_its_post() {
             s.contains("here is the log") && s.contains("claimed.txt")
         })
         .await;
-        // From the composer: the sidebar, then the posts.
-        tui.press(KeyCode::Tab);
+        // From the composer to the posts.
         tui.press(KeyCode::Tab);
         tui.press(KeyCode::Char('s'));
         tui.until(Duration::from_secs(5), "the refusal", |s| {
@@ -536,8 +535,10 @@ async fn forget_a_stale_agent_from_the_sidebar() {
         })
         .await;
 
-        // Sidebar, past #general onto the agent, `d`, then ↵ in the dialog.
+        // Sidebar (the posts, then shift-e), past #general onto the agent,
+        // `d`, then ↵ in the dialog.
         tui.press(KeyCode::Tab);
+        tui.press(KeyCode::Char('E'));
         tui.press(KeyCode::Char('j'));
         tui.until(Duration::from_secs(5), "the cursor on the agent", |s| {
             s.contains("▍ ● pc-test")

@@ -9,11 +9,17 @@
 //!   `Esc` leaves for the posts.
 //! * **Sidebar and posts:** `j`/`k` and the arrows move (in the sidebar that
 //!   opens the channel; past the last channel the cursor goes on through the
-//!   agent rows, where `d` forgets one), `n` `a` `s` `d` `/` `?` `q` are
+//!   agent rows, where `d` forgets one), `n` `a` `s` `d` `E` `/` `?` `q` are
 //!   commands, and any other printable key jumps to the composer and types
 //!   itself.
-//! * Anywhere: `Tab`/`Shift-Tab` cycle the focus, `PgUp`/`PgDn` scroll the
-//!   posts, `Esc` clears the filter.
+//! * **`E` (shift-e)** is the only way into the sidebar: from the posts it
+//!   goes there, showing it first if it is hidden; from the sidebar it hides
+//!   it and goes to the composer. Below 80 columns it goes to the switcher
+//!   row (which stands in for the sidebar) and back, hiding nothing.
+//! * Anywhere: `Tab`/`Shift-Tab` move between the posts and the composer,
+//!   never into the sidebar (from it, `Tab` goes to the composer and
+//!   `Shift-Tab` to the posts), `PgUp`/`PgDn` scroll the posts, `Esc` clears
+//!   the filter.
 //! * **`@` ghost** ([`crate::tui::mention`]): while the composer shows one,
 //!   `Tab` takes it, `↑`/`↓` pick another match and `Esc` puts it away;
 //!   without one those keys do what they always do.
@@ -27,12 +33,16 @@ use crate::tui::state::{
     possessive, App, AttachPicker, Cmd, ConfirmDialog, Dialog, Focus, FormField, NewChannelForm,
     Selection, CHANNEL_NAME_MAX, FILTER_MAX, NAME_RULE,
 };
+use crate::tui::view::SIDEBAR_MIN_WIDTH;
 use crate::tui::widgets::posts::{self, Span};
 
 /// What every key in the help overlay does, in its order.
-/// Each description fits the dialog at 80 columns.
-pub const HELP: [(&str, &str); 14] = [
-    ("tab  shift-tab", "channels, posts, composer"),
+/// Each description fits the dialog at 80 columns, and the whole list fits
+/// the board at 80×24 (the dialog is six rows more than the list): `?` is
+/// left out, since the footer always shows it.
+pub const HELP: [(&str, &str); 13] = [
+    ("tab  shift-tab", "posts, composer"),
+    ("shift-e", "go to or hide the sidebar"),
     ("j k  ↓ ↑", "pick a channel or a post"),
     ("enter", "send, or write in the channel"),
     ("shift-enter", "new line (or alt-enter, ctrl-j)"),
@@ -43,14 +53,12 @@ pub const HELP: [(&str, &str); 14] = [
     ("d", "delete, or forget an agent"),
     ("/", "filter by tag or @handle"),
     ("esc", "clear filter, leave composer"),
-    ("?", "this help"),
-    ("q", "quit (not from the composer)"),
-    ("ctrl-c", "quit from anywhere"),
+    ("q  ctrl-c", "quit; ctrl-c from anywhere"),
 ];
 
 /// What a `Select a post` hint says where.
 const PICK_POST: &str = "Select a post first: j/k";
-const PICK_POST_FROM_SIDEBAR: &str = "Select a post first: tab to the posts, then j/k";
+const PICK_POST_FROM_SIDEBAR: &str = "Select a post first: shift-tab to the posts, then j/k";
 const STILL_SENDING: &str = "Still sending the last post…";
 const BODY_FULL: &str = "A post holds up to 64 KB of text";
 
@@ -176,7 +184,7 @@ impl App {
             return Vec::new();
         }
         let Selection::Channel(channel) = &self.selected else {
-            self.toast("Pick a channel to post in: tab to the channels, then j/k");
+            self.toast("Pick a channel to post in: tab, shift-e, then j/k");
             return Vec::new();
         };
         if self.sending.is_some() {
@@ -249,6 +257,10 @@ impl App {
                 Vec::new()
             }
             Some('q') => vec![Cmd::Quit],
+            Some('E') => {
+                self.toggle_sidebar();
+                Vec::new()
+            }
             Some(c) => {
                 self.focus = Focus::Composer;
                 self.insert_text(c.encode_utf8(&mut [0; 4]));
@@ -406,15 +418,54 @@ impl App {
         Vec::new()
     }
 
-    /// `Tab` forward: sidebar → posts → composer → sidebar.
+    /// `Tab` and `Shift-Tab`: between the posts and the composer, never into
+    /// the sidebar (only `shift-e` goes there). From the sidebar, `Tab` goes
+    /// on to the composer and `Shift-Tab` back to the posts.
     fn cycle_focus(&mut self, forward: bool) {
         self.focus = match (self.focus, forward) {
-            (Focus::Sidebar, true) | (Focus::Composer, false) => Focus::Posts,
-            (Focus::Posts, true) | (Focus::Sidebar, false) => Focus::Composer,
-            (Focus::Composer, true) | (Focus::Posts, false) => Focus::Sidebar,
+            (Focus::Posts, _) | (Focus::Sidebar, true) => Focus::Composer,
+            (Focus::Composer, _) | (Focus::Sidebar, false) => Focus::Posts,
         };
         if self.focus == Focus::Posts {
             self.pick_visible_post();
+        }
+    }
+
+    /// `shift-e` in the posts or the sidebar: goes to the sidebar, showing it
+    /// first if it is hidden; from the sidebar, hides it and goes to the
+    /// composer. Below 80 columns the switcher row stands in for the sidebar
+    /// and there is nothing to show or hide: `shift-e` only goes to the
+    /// switcher and back to the composer.
+    fn toggle_sidebar(&mut self) {
+        let leave = self.focus == Focus::Sidebar;
+        self.focus = if leave {
+            Focus::Composer
+        } else {
+            Focus::Sidebar
+        };
+        if self.size.0 < SIDEBAR_MIN_WIDTH || self.hide_sidebar == leave {
+            return;
+        }
+        self.hide_sidebar = leave;
+        self.refit();
+    }
+
+    /// After a resize: the keys can't stay on a sidebar that is hidden at the
+    /// new width (focused below 80 columns, where the switcher stands in for
+    /// it). They go to the composer, as when `shift-e` hides it.
+    pub(crate) fn leave_hidden_sidebar(&mut self) {
+        if self.focus == Focus::Sidebar && self.hide_sidebar && self.size.0 >= SIDEBAR_MIN_WIDTH {
+            self.focus = Focus::Composer;
+        }
+    }
+
+    /// The posts pane changed width, so the posts wrap anew: the scroll stays
+    /// in range and the selected post in view.
+    fn refit(&mut self) {
+        self.clamp_scroll();
+        let spans = self.post_spans();
+        if let Some(at) = self.selected_index(&spans) {
+            self.reveal(&spans[at]);
         }
     }
 
@@ -431,7 +482,11 @@ impl App {
 
     fn open_attach(&mut self) -> Vec<Cmd> {
         if !matches!(self.selected, Selection::Channel(_)) {
-            self.toast("Pick a channel to attach a file to: tab to the channels, then j/k");
+            self.toast(if self.focus == Focus::Sidebar {
+                "Pick a channel to attach a file to: j/k"
+            } else {
+                "Pick a channel to attach a file to: shift-e, then j/k"
+            });
             return Vec::new();
         }
         if self.sending.is_some() {

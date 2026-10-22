@@ -77,6 +77,10 @@ pub struct App {
     /// by handle; the view on screen stays. Only while the sidebar has the
     /// keys: `None` whenever it does not.
     pub selected_agent: Option<String>,
+    /// `shift-e` hid the sidebar: from 80 columns up the main pane takes its
+    /// place. Below 80 there is no sidebar, and `shift-e` leaves this alone.
+    /// For this session only.
+    pub hide_sidebar: bool,
     /// Sync peers, for the header.
     pub peers: Vec<PeerItem>,
     /// When the last sync with the peers finished.
@@ -161,6 +165,7 @@ impl App {
             scroll: 0,
             agents: Vec::new(),
             selected_agent: None,
+            hide_sidebar: false,
             peers: Vec::new(),
             last_sync_ms: None,
             me: me.into(),
@@ -539,6 +544,7 @@ impl App {
             Msg::Resize(width, height) => {
                 self.size = (width, height);
                 self.clamp_scroll();
+                self.leave_hidden_sidebar();
                 Vec::new()
             }
             Msg::Tick(now_ms) => self.on_tick(now_ms),

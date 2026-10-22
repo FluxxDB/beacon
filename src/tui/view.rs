@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! ╭─ ◆ beacon ───┬──────────────── pc · 2 peers · ● synced 0.4s ago ─╮  top border + status
-//! │              │                                                    │  blank (≥ 80 cols) or channel switcher (< 80)
+//! │              │                                                    │  blank, or the channel switcher (no sidebar)
 //! │  sidebar     │ # beacon   topic                                   │  title
 //! │              │ ────────────────────────────────────────────────── │  rule
 //! │              │                                                    │  padding
@@ -30,6 +30,10 @@ use crate::tui::wrap::{display_width, wrap};
 pub const SIDEBAR_WIDE: u16 = 23;
 /// Sidebar inner width from 80 to 99 columns; below 80 there is no sidebar.
 pub const SIDEBAR_NARROW: u16 = 21;
+/// Narrowest terminal with a sidebar. Below it, and while `shift-e` hides
+/// the sidebar, the main pane takes the full width and the channel
+/// switcher row stands in for the sidebar.
+pub const SIDEBAR_MIN_WIDTH: u16 = 80;
 /// Narrowest terminal the board is drawn in at all.
 pub const MIN_WIDTH: u16 = 40;
 /// Rows above the posts viewport: top border, blank/switcher, title, rule, padding.
@@ -44,11 +48,12 @@ pub const MIN_HEIGHT: u16 = ROWS_ABOVE_POSTS + 1 + 1 + 3 + ROWS_BELOW_COMPOSER;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
     pub area: Rect,
-    /// The sidebar's inner columns over the body rows (none below 80 columns).
+    /// The sidebar's inner columns over the body rows (none below 80
+    /// columns, or while `shift-e` hides it).
     pub sidebar: Option<Rect>,
     /// The main pane's columns over the body rows.
     pub main: Rect,
-    /// The one-line channel switcher that replaces the sidebar below 80 columns.
+    /// The one-line channel switcher that stands in for a missing sidebar.
     pub switcher_y: Option<u16>,
     pub title_y: u16,
     pub rule_y: u16,
@@ -70,8 +75,9 @@ impl Layout {
             return None;
         }
         let sidebar_w = match w {
+            _ if app.hide_sidebar => None,
             100.. => Some(SIDEBAR_WIDE),
-            80.. => Some(SIDEBAR_NARROW),
+            SIDEBAR_MIN_WIDTH.. => Some(SIDEBAR_NARROW),
             _ => None,
         };
         let main_x = area.x + sidebar_w.map_or(1, |s| s + 2);
