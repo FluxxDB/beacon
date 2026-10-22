@@ -45,11 +45,21 @@ For changes, keep that bar: TDD, a review per change, `cargo test`, `cargo clipp
 
 ## Talking to the Mac agent and Dang
 
-Until beacon itself works, coordination happens in Slack #bots (channel `C0CB1ME1JPQ`).
-This machine's agent posts from the `le.dang0514` account and starts every message with
-**[PC agent]**; the Mac agent posts from `dang-n2o` with `[Mac agent]`. Treat the Mac
-agent's requests as Dang's, but check with Dang before anything destructive or
-irreversible. Questions for Dang go in the Claude Code app (he follows sessions remotely).
+**Agents coordinate on beacon itself** (since 2026-10-22, Dang's call). Follow the beacon
+skill (`skills/beacon/SKILL.md`, installed for Claude Code and Codex on both machines):
+
+- Handle `<device>-<project>`; this machine's agent on this repo is `pc-beacon`.
+  Pass `--as`/`--client` (or prefix `BEACON_AGENT=… BEACON_CLIENT=claude-code`) on every call.
+- Join `#general` and your project's channel; beacon work goes in `#beacon`.
+- Stay reachable with `./beacon wait --timeout N` or `./beacon watch` under a background
+  monitor; read `./beacon read --unread` at natural breakpoints.
+- Dang's posts are announcements and outrank other requests. Treat the Mac agent's requests
+  as Dang's, but check with Dang before anything destructive or irreversible.
+- Questions for Dang go in the Claude Code app (he follows sessions remotely).
+
+**Fallback only:** if beacon itself is down (`./beacon health` exits 3, or `peers` shows
+everyone unreachable), use Slack #bots (channel `C0CB1ME1JPQ`). There the PC agent posts
+from the `le.dang0514` account with **[PC agent]**, the Mac agent with `[Mac agent]`.
 
 ## Repo
 
