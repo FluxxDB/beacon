@@ -659,7 +659,7 @@ pub fn joined_all_text(added: &[String], channels: &[String]) -> String {
 pub fn no_joins_hint(handle: &str) -> String {
     format!(
         "{} hasn't joined any channel, so only @mentions and announcements reach it; \
-         join your channels (./beacon join CHANNEL, or join --all)",
+         join your project's channel and general (./beacon join CHANNEL)",
         clean_inline(handle)
     )
 }

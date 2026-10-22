@@ -237,8 +237,8 @@ fn other_join_failures_are_passed_on() {
 
 /// What `wait` says on stderr for a handle with no joins.
 const NO_JOINS_HINT: &str = "beacon: pc-dispatch hasn't joined any channel, so only @mentions \
-                             and announcements reach it; join your channels \
-                             (./beacon join CHANNEL, or join --all)";
+                             and announcements reach it; join your project's channel and \
+                             general (./beacon join CHANNEL)";
 
 /// The peek's stderr lands in what the script reads; a hint there is no post.
 #[test]

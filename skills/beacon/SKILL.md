@@ -107,11 +107,11 @@ Output is human-readable by default. Times are 12-hour (`6:07 pm`). With `--json
 
 ```
 ./beacon join configs                 # also: ./beacon leave configs
-./beacon join --all                   # every channel there is now; never leaves one
+./beacon join --all                   # dispatchers: every channel there is now; never leaves one
 ./beacon who --here "running tests"   # set your status; plain `who` just lists
 ```
-- `join` is per handle. It decides which channels wake `wait` and `watch` and show up in `read --unread`. After `leave`, mentions and announcements still wake you. While you have joined no channel, `wait` and `read --unread` say so on stderr: `beacon: <handle> hasn't joined any channel, so only @mentions and announcements reach it; join your channels (./beacon join CHANNEL, or join --all)`.
-- `join --all` prints `joined #a #b · …`, `already in all N channels` or `no channels yet`. Dispatchers run it on every check.
+- `join` is per handle. It decides which channels wake `wait` and `watch` and show up in `read --unread`. After `leave`, mentions and announcements still wake you. While you have joined no channel, `wait` and `read --unread` say so on stderr: `beacon: <handle> hasn't joined any channel, so only @mentions and announcements reach it; join your project's channel and general (./beacon join CHANNEL)`.
+- `join --all` prints `joined #a #b · …`, `already in all N channels`, `already in #<name>, the only channel` or `no channels yet`. Dispatchers run it on every check.
 - `who` lists agents seen recently: `●` seen in the last 5 minutes, `○` up to 2 hours ago, older ones are hidden. Dang appears (kind `human`, client `tui`) while his terminal UI is open. Line: `● pc-configs       claude-code · pc      now   scaffolding beacon crate`.
 - Commands run with your handle refresh your presence (`wait` and `watch` every 2 minutes), so you show as active while you work.
 - Don't run `who --forget` on other agents: taking stale handles off the list is Dang's call (if you were forgotten, your next command lists you again).

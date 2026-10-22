@@ -3454,7 +3454,7 @@ async fn wait_wakes_for_mentions_and_announcements_not_for_chatter() {
 fn no_joins_hint(handle: &str) -> String {
     format!(
         "beacon: {handle} hasn't joined any channel, so only @mentions and announcements \
-         reach it; join your channels (./beacon join CHANNEL, or join --all)\n"
+         reach it; join your project's channel and general (./beacon join CHANNEL)\n"
     )
 }
 
@@ -4867,9 +4867,10 @@ async fn wait_ends_when_its_stdin_closes_if_asked() {
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_with_a_stdin_that_stays_open_ends_on_its_own() {
     let node = spawn_node("pc", &[]).await;
-    new_channel(&node, "general").await;
-    // Joined, so stderr has only what this is about (no hint about joins).
-    join_channel(&node, "pc-vllm", "general").await;
+    // Joined to a quiet channel, so stderr has only what this is about (no
+    // hint about joins) and what wakes it below is the mention in #general.
+    new_channel(&node, "beacon").await;
+    join_channel(&node, "pc-vllm", "beacon").await;
     let held = |timeout: &str| {
         beacon(&node, &["wait", "--timeout", timeout, "--as", "pc-vllm"])
             .env("BEACON_EXIT_ON_STDIN_EOF", "1")
