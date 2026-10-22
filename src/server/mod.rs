@@ -7,6 +7,7 @@
 //! [`AppState::arrivals`] and wake the sync engine.
 
 pub mod routes;
+pub mod stream;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -256,6 +257,7 @@ pub async fn start(cfg: Config) -> Result<NodeHandle, Error> {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::router())
+        .merge(stream::router(&state))
         .fallback(no_such_endpoint)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
