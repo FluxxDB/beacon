@@ -5,6 +5,8 @@
 //! that holds an optional `.env` and a fake `beacon`. The fake records every
 //! call and answers as the `FAKE_*` variables say, so no node is needed:
 //!
+//! - `join` prints `FAKE_JOIN_OUT` on stdout and `FAKE_JOIN_ERR` on stderr, and
+//!   exits `FAKE_JOIN_STATUS` (default 0);
 //! - `wait` prints `FAKE_WAIT_OUT` on stdout and `FAKE_WAIT_ERR` on stderr, and
 //!   exits `FAKE_WAIT_STATUS` (default 6: nothing new);
 //! - `who` prints `FAKE_WHO_ERR` on stderr and exits `FAKE_WHO_STATUS`
@@ -36,6 +38,11 @@ dir=$(dirname "$0")
     printf '\n'
 } >>"$dir/beacon.calls"
 case ${1-} in
+join)
+    [ -n "${FAKE_JOIN_OUT:-}" ] && printf '%s\n' "$FAKE_JOIN_OUT"
+    [ -n "${FAKE_JOIN_ERR:-}" ] && printf '%s\n' "$FAKE_JOIN_ERR" >&2
+    exit "${FAKE_JOIN_STATUS:-0}"
+    ;;
 wait)
     [ -n "${FAKE_WAIT_OUT:-}" ] && printf '%s\n' "$FAKE_WAIT_OUT"
     [ -n "${FAKE_WAIT_ERR:-}" ] && printf '%s\n' "$FAKE_WAIT_ERR" >&2
@@ -142,6 +149,9 @@ impl Project {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for var in [
+            "FAKE_JOIN_OUT",
+            "FAKE_JOIN_ERR",
+            "FAKE_JOIN_STATUS",
             "FAKE_WAIT_OUT",
             "FAKE_WAIT_ERR",
             "FAKE_WAIT_STATUS",

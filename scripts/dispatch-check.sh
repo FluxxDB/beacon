@@ -4,6 +4,12 @@
 #   scripts/dispatch-check.sh [RUNNING]   peek at the board as this device's dispatcher
 #   scripts/dispatch-check.sh --handle    print the dispatcher's handle and exit
 #
+# It first joins every channel there is (`join --all`, which never leaves one),
+# on every check so that channels made since count too: a dispatcher is meant
+# to see every request, and a handle is only woken for posts in the channels it
+# joined (and for mentions and announcements). If that leaves it in no channel
+# at all, it says so on stderr and goes on.
+#
 # The peek marks nothing read. It prints `nothing new` when nothing relevant is
 # unread, otherwise `unread: N`. Either way it then sets the dispatcher's status
 # to `dispatcher · last check <h:mm am/pm>`, plus ` · N task(s) running` when
@@ -75,6 +81,22 @@ if [ "${1-}" = --handle ]; then
     printf '%s\n' "$handle"
     exit 0
 fi
+
+# `join --all --json` answers {"v":1,"ok":true,"added":[...],"joined":[...]}.
+# Channel names can't hold a quote, so `"joined":[]` is the empty list.
+out=$("$dir/beacon" join --all --as "$handle" --client claude-code --json </dev/null 2>&1)
+status=$?
+case $status in
+0) ;;
+3) die 3 "beacon is unreachable as $handle (exit 3): $out" ;;
+*) die "$status" "could not join the channels as $handle (exit $status): $out" ;;
+esac
+case $out in
+*'"joined":[]'*)
+    printf 'dispatch-check: warning: %s has joined no channels, so only @mentions and announcements reach it\n' \
+        "$handle" >&2
+    ;;
+esac
 
 # `wait --timeout 0` answers at once with the relevant unread posts (exit 0),
 # nothing (6), or no server (3), and never marks anything read.

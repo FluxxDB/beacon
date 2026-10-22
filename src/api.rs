@@ -336,6 +336,16 @@ pub struct JoinAck {
     pub joined: Vec<String>,
 }
 
+/// What `join --all` (`--json`) answers: the channels it joined just now,
+/// then every channel the handle has joined, both sorted by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinAllAck {
+    pub v: u32,
+    pub ok: bool,
+    pub added: Vec<String>,
+    pub joined: Vec<String>,
+}
+
 /// `PUT /api/read-cursors/:handle`: the handle has read `channel` up to the
 /// post that arrived as `arrival` (see [`PostJson::arrival`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

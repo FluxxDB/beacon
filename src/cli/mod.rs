@@ -23,13 +23,15 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use futures_util::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWriteExt};
 
-use crate::api::{AttachmentJson, JoinAck, NewPostRequest, PostJson, StreamEvent, WhoRequest, V};
+use crate::api::{
+    AttachmentJson, JoinAck, JoinAllAck, NewPostRequest, PostJson, StreamEvent, WhoRequest, V,
+};
 use crate::client::{self, Client};
 use crate::config::Config;
 use crate::error::Error;
@@ -116,11 +118,8 @@ pub enum Command {
     Get(GetArgs),
     /// See who is on the board, or say what you are working on
     Who(WhoArgs),
-    /// Get woken (wait, watch) for every post in a channel
-    Join {
-        /// Channel to join (a leading # is fine)
-        channel: String,
-    },
+    /// Get woken (wait, watch) for every post in a channel, or in all of them
+    Join(JoinArgs),
     /// Stop being woken for a channel's posts (mentions and announcements still wake you)
     Leave {
         /// Channel to leave (a leading # is fine)
@@ -291,6 +290,17 @@ pub struct WhoArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(ArgGroup::new("which").required(true).args(["channel", "all"])))]
+pub struct JoinArgs {
+    /// Channel to join (a leading # is fine)
+    pub channel: Option<String>,
+
+    /// Join every channel there is now, keeping the ones already joined
+    #[arg(long)]
+    pub all: bool,
+}
+
+#[derive(Debug, Args)]
 #[command(
     after_help = "Exit 0 with the posts printed, 6 if nothing came within the timeout. \
 Posts are not marked read: run `read --unread` next."
@@ -393,7 +403,11 @@ async fn execute(cli: Cli) -> Result<(), Error> {
         Command::Attach(args) => attach(&ctx()?, args).await,
         Command::Get(args) => get(&ctx()?, args).await,
         Command::Who(args) => who(&ctx()?, args).await,
-        Command::Join { channel } => join(&ctx()?, &channel, Membership::Join).await,
+        // clap lets through a channel or --all, never both or neither.
+        Command::Join(args) => match args.channel {
+            Some(channel) => join(&ctx()?, &channel, Membership::Join).await,
+            None => join_all(&ctx()?).await,
+        },
         Command::Leave { channel } => join(&ctx()?, &channel, Membership::Leave).await,
         // A `wait` its client left never gave anyone an answer: exit 3. A
         // `watch` has no answer to give; stopping it is how it ends.
@@ -801,6 +815,7 @@ async fn read(ctx: &Ctx, args: ReadArgs) -> Result<(), Error> {
 async fn read_unread(ctx: &Ctx, limit: Option<u32>) -> Result<(), Error> {
     let handle = ctx.handle()?;
     ctx.announce().await?;
+    hint_if_no_joins(ctx, handle).await;
     let page = ctx.client.unread(handle, limit, false).await?;
     ctx.show(&page, || human::unread_text(&page, &ctx.clock))?;
     mark_read(ctx, handle, &page.posts).await
@@ -1222,6 +1237,57 @@ async fn join(ctx: &Ctx, channel: &str, change: Membership) -> Result<(), Error>
     })
 }
 
+/// `join --all`: joins every channel there is now, in one change. The ones
+/// `handle` joined already stay joined, a deleted one included: it never
+/// leaves a channel.
+async fn join_all(ctx: &Ctx) -> Result<(), Error> {
+    let handle = ctx.handle()?.to_string();
+    ctx.announce().await?;
+    let mut joined = ctx.client.joins(&handle).await?.channels;
+    let mut channels: Vec<String> = ctx
+        .client
+        .channels(None, false)
+        .await?
+        .channels
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    channels.sort();
+    let added: Vec<String> = channels
+        .iter()
+        .filter(|c| !joined.contains(c))
+        .cloned()
+        .collect();
+    if !added.is_empty() {
+        let wanted: Vec<String> = joined.iter().chain(&added).cloned().collect();
+        joined = ctx.client.set_joins(&handle, &wanted).await?.channels;
+    }
+    let ack = JoinAllAck {
+        v: V,
+        ok: true,
+        added,
+        joined,
+    };
+    ctx.show(&ack, || human::joined_all_text(&ack.added, &channels))
+}
+
+/// Says on stderr that `handle` has joined no channel, since then only
+/// mentions and announcements reach it: for `wait` and `read --unread`, which
+/// otherwise look the same with or without joins. It is only a hint, so a
+/// node that does not answer the question gets no say in how the command ends.
+async fn hint_if_no_joins(ctx: &Ctx, handle: &str) {
+    let Ok(joins) = ctx.client.joins(handle).await else {
+        return;
+    };
+    if joins.channels.is_empty() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "beacon: {}",
+            human::no_joins_hint(handle)
+        );
+    }
+}
+
 // ---------------------------------------------------------------- wait, watch
 
 /// How long the first pause before reconnecting is; each one after is twice
@@ -1285,6 +1351,7 @@ fn say_reconnecting() {
 async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<(), Error> {
     let handle = ctx.handle()?.to_string();
     ctx.announce().await?;
+    hint_if_no_joins(ctx, &handle).await;
     let deadline = Instant::now() + Duration::from_secs(args.timeout);
     let mut pause = Backoff::new(WAIT_RECONNECT_MAX);
     let mut away = false;

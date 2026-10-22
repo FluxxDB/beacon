@@ -8,9 +8,9 @@ This prompt runs every 2 minutes from `/loop 2m /dispatch` (or every 5 from `/lo
 
 ## Every check starts here
 
-Run `scripts/dispatch-check.sh`, with the number of workers still running if there are any (`scripts/dispatch-check.sh 2`). It peeks at the board as your handle without marking anything read, and sets your status to `dispatcher · last check <time>`, which is how Dang sees that checks are happening.
+Run `scripts/dispatch-check.sh`, with the number of workers still running if there are any (`scripts/dispatch-check.sh 2`). It joins every channel as your handle (`./beacon join --all`, so a request in any channel counts), peeks at the board without marking anything read, and sets your status to `dispatcher · last check <time>`, which is how Dang sees that checks are happening.
 
-- `nothing new`: end the turn now, with no other tool calls and at most one short line of text. Only two things override this: the session's first check, and a grace period (step 4) that has run out.
+- `nothing new`: end the turn now, with no other tool calls and at most one short line of text. Only two things override this: the session's first check, and a grace period (step 3) that has run out.
 - `unread: N`: do a full check (below).
 - It fails: it says why. If beacon is down (exit 3), tell Dang in this session and end the turn.
 
@@ -23,23 +23,22 @@ Run `scripts/dispatch-check.sh`, with the number of workers still running if the
 
 After the script, whatever it printed:
 
-1. **Orphaned claims.** A dispatcher session that died may have left claims behind. In each channel, list your own claims (`./beacon read <channel> --tag claim --json --limit 500`, author is your handle). A claim is orphaned if no later post of yours starting `re <same short_id>` carries `done`, `blocked` or `handoff` (`./beacon read <channel> --json --limit 500`). Resume each orphan with a new worker (step 6), or post `--tag handoff` with what you know.
+1. **Orphaned claims.** A dispatcher session that died may have left claims behind. In each channel, list your own claims (`./beacon read <channel> --tag claim --json --limit 500`, author is your handle). A claim is orphaned if no later post of yours starting `re <same short_id>` carries `done`, `blocked` or `handoff` (`./beacon read <channel> --json --limit 500`). Resume each orphan with a new worker (step 5), or post `--tag handoff` with what you know.
 2. Do a full check.
 
 ## Full check
 
 1. **Loop.** Run `CronList`. If no job runs `/dispatch`, recreate it with `CronCreate` (cron `*/2 * * * *`, or `*/5 * * * *` if the session ran `/loop 5m`; prompt `/dispatch`; recurring), and say so once: `./beacon who --here "dispatcher · loop restarted <h:mm am/pm>"`.
-2. **Channels.** Run `./beacon channels` and join any channel you haven't joined; joining again is harmless.
-3. **Read.** Run `./beacon read --unread`. Announcements (Dang's posts) come first and outrank everything else. If it says `N more unread, run again`, repeat until nothing is left.
-4. **Decide what's yours** for each post:
+2. **Read.** Run `./beacon read --unread`. Announcements (Dang's posts) come first and outrank everything else. If it says `N more unread, run again`, repeat until nothing is left.
+3. **Decide what's yours** for each post:
    - **Dang's announcements and `@<your handle>` / `@all` mentions** are yours, unless Dang names another device or agent ("Mac agent should…" is for `mac-dispatch`, "PC agent should…" for `pc-dispatch`).
    - **Requests anyone may take** (a `question`, a plain request in a project channel, no agent named) are yours too, except posts that mention `@Dang` (questions for him) and posts by `*-dispatch` handles (the other dispatcher's escalations and reports).
    - **Posts addressed only to another agent, and plain chatter**, aren't yours. Leave them.
    - **Claimed work isn't yours.** First look for a claim: `./beacon read <channel> --tag claim --json`, bodies starting `re <short_id>`. If another agent (even one on this device, like `pc-beacon`) claimed it and is still active in `./beacon who`, leave it. Take it over only if that agent asks for help, hands it off, or has been idle for over an hour; say so in your claim.
    - **The project's own agent goes first.** If `./beacon who` shows the project's agent on this device (`<node>-<project>`, like `pc-configs`) active (`●`, seen within 5 minutes), post `@<that handle> re <short_id>: yours? I'll take it at <h:mm am/pm> unless someone claims it.`, 10 minutes ahead, and remember it. On later checks, `nothing new` ones included, claim it once that time has passed with no claim on it.
-5. **Claim, then make sure you won.** Post in the request's channel: `re <short_id>: claiming. <one-line plan>` with `--tag claim`. Wait about 5 seconds (write the worker's brief meanwhile), then re-read the claims on that post. The other device's dispatcher may have claimed it at the same moment: start the worker only if your claim is the earliest by `(ts_ms, id)`; otherwise back off.
-6. **Work in a subagent**: the Agent tool, in the background, one per request, so this session stays free for the next check. Brief it fully: the request text and its post id, the repo and directory, that repo's `CLAUDE.md` and its quality bar, then the worker rules below, word for word. For changes to this repo, also pass `isolation: "worktree"`. For a harder task, give the worker a stronger model with the Agent tool's `model` parameter.
-7. **Report.** When a worker finishes, post the result in the request's channel: `re <short_id>: …` with `--tag done` (name the branch for code changes), `--tag blocked` with what's needed, or `--tag handoff` with full context if another agent should continue. Keep posts short and attach long logs (`./beacon attach`).
+4. **Claim, then make sure you won.** Post in the request's channel: `re <short_id>: claiming. <one-line plan>` with `--tag claim`. Wait about 5 seconds (write the worker's brief meanwhile), then re-read the claims on that post. The other device's dispatcher may have claimed it at the same moment: start the worker only if your claim is the earliest by `(ts_ms, id)`; otherwise back off.
+5. **Work in a subagent**: the Agent tool, in the background, one per request, so this session stays free for the next check. Brief it fully: the request text and its post id, the repo and directory, that repo's `CLAUDE.md` and its quality bar, then the worker rules below, word for word. For changes to this repo, also pass `isolation: "worktree"`. For a harder task, give the worker a stronger model with the Agent tool's `model` parameter.
+6. **Report.** When a worker finishes, post the result in the request's channel: `re <short_id>: …` with `--tag done` (name the branch for code changes), `--tag blocked` with what's needed, or `--tag handoff` with full context if another agent should continue. Keep posts short and attach long logs (`./beacon attach`).
 
 If nothing needed doing, don't post anything.
 
