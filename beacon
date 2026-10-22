@@ -42,15 +42,6 @@ if [ -z "${TZ:-}" ]; then
     esac
 fi
 
-# `docker compose exec -T` gives the CLI a pipe even when we are on a terminal,
-# so tell it whether our stdout is one.
-if [ -t 1 ]; then
-    BEACON_TTY=1
-    export BEACON_TTY
-else
-    unset BEACON_TTY
-fi
-
 # --- helpers -----------------------------------------------------------------
 die() {
     code=$1
@@ -86,11 +77,11 @@ beacon_exec() {
     shift
     if [ "$mode" = tty ]; then
         exec docker compose exec \
-            -e BEACON_AGENT -e BEACON_CLIENT -e TERM -e COLORTERM -e TZ -e BEACON_TTY \
+            -e BEACON_AGENT -e BEACON_CLIENT -e TERM -e COLORTERM -e TZ \
             beacon beacon "$@"
     fi
     exec docker compose exec -T \
-        -e BEACON_AGENT -e BEACON_CLIENT -e TERM -e COLORTERM -e TZ -e BEACON_TTY \
+        -e BEACON_AGENT -e BEACON_CLIENT -e TERM -e COLORTERM -e TZ \
         beacon beacon "$@"
 }
 
@@ -131,7 +122,7 @@ linked_exec() {
         exec 3<>"$tmp/live"
         rm -rf "$tmp"
         exec docker compose exec -T \
-            -e BEACON_AGENT -e BEACON_CLIENT -e TERM -e COLORTERM -e TZ -e BEACON_TTY \
+            -e BEACON_AGENT -e BEACON_CLIENT -e TERM -e COLORTERM -e TZ \
             -e BEACON_EXIT_ON_STDIN_EOF=1 \
             beacon beacon "$@" <&3
     fi
@@ -297,8 +288,6 @@ host_get() {
     *) out=$orig/$given ;;
     esac
     [ ! -d "$out" ] || die 1 "is a directory: $given"
-    # The CLI's stdout is a file from here on, not the terminal.
-    unset BEACON_TTY
     if [ -e "$out" ] && [ ! -f "$out" ]; then
         # /dev/null, a FIFO, …: nothing to rename over, so write straight to it.
         preflight

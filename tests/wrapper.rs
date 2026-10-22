@@ -29,8 +29,6 @@ const ENV_FLAGS: &[&str] = &[
     "COLORTERM",
     "-e",
     "TZ",
-    "-e",
-    "BEACON_TTY",
 ];
 
 const FAKE_DOCKER: &str = r#"#!/bin/sh
@@ -171,7 +169,6 @@ impl Sandbox {
             .env_remove("TZ")
             .env_remove("BEACON_AGENT")
             .env_remove("BEACON_CLIENT")
-            .env_remove("BEACON_TTY")
             .stdin(Stdio::null());
     }
 
@@ -363,33 +360,12 @@ fn no_args_runs_tui_with_tty() {
     expected.extend(s(ENV_FLAGS));
     expected.extend(s(&["beacon", "beacon", "tui"]));
     assert_eq!(sb.argv("exec"), expected);
-    assert_eq!(
-        sb.exec_env().get("BEACON_TTY").map(String::as_str),
-        Some("1")
-    );
 
     // `./beacon tui` is the same thing spelled out.
     let sb = Sandbox::new();
     let (code, _) = run_on_tty(sb.command(&["tui"]));
     assert_eq!(code, 0);
     assert_eq!(sb.argv("exec"), expected);
-}
-
-#[test]
-fn beacon_tty_is_only_set_when_stdout_is_a_terminal() {
-    let sb = Sandbox::new();
-    let mut cmd = sb.command(&["status"]);
-    cmd.env("BEACON_TTY", "1"); // stale value from the caller's environment
-    let run = sb.run(cmd);
-    assert_eq!(run.code, 0, "{}", run.stderr);
-    assert_eq!(sb.exec_env().get("BEACON_TTY"), None);
-
-    let (code, _) = run_on_tty(sb.command(&["status"]));
-    assert_eq!(code, 0);
-    assert_eq!(
-        sb.exec_env().get("BEACON_TTY").map(String::as_str),
-        Some("1")
-    );
 }
 
 #[test]
@@ -1181,25 +1157,6 @@ fn get_dash_o_writes_straight_to_special_files() {
         .file_name()
         .to_string_lossy()
         .starts_with(".beacon")));
-}
-
-#[test]
-fn get_dash_o_does_not_claim_a_terminal() {
-    // With -o the CLI's stdout is a file, so BEACON_TTY must not be set even
-    // though the wrapper itself is on a terminal.
-    let sb = Sandbox::new();
-    let out = sb.work.join("saved.bin");
-    let (code, stderr) = run_on_tty(sb.command(&["get", "01ABC", "-o", out.to_str().unwrap()]));
-    assert_eq!((code, stderr.as_str()), (0, ""));
-    assert_eq!(sb.exec_env().get("BEACON_TTY"), None);
-
-    // `-o -` goes to the terminal, which is a terminal.
-    let (code, _) = run_on_tty(sb.command(&["get", "01ABC", "-o", "-"]));
-    assert_eq!(code, 0);
-    assert_eq!(
-        sb.exec_env().get("BEACON_TTY").map(String::as_str),
-        Some("1")
-    );
 }
 
 #[test]
