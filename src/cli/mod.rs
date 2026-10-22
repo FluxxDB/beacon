@@ -387,8 +387,10 @@ async fn execute(cli: Cli) -> Result<(), Error> {
         Command::Who(args) => who(&ctx()?, args).await,
         Command::Join { channel } => join(&ctx()?, &channel, Membership::Join).await,
         Command::Leave { channel } => join(&ctx()?, &channel, Membership::Leave).await,
-        Command::Wait(args) => while_client_lives(wait(&ctx()?, args)).await,
-        Command::Watch => while_client_lives(watch(&ctx()?)).await,
+        // A `wait` its client left never gave anyone an answer: exit 3. A
+        // `watch` has no answer to give; stopping it is how it ends.
+        Command::Wait(args) => while_client_lives(wait(&ctx()?, args), true).await,
+        Command::Watch => while_client_lives(watch(&ctx()?), false).await,
     }
 }
 
@@ -397,14 +399,15 @@ async fn execute(cli: Cli) -> Result<(), Error> {
 const EXIT_ON_STDIN_EOF: &str = "BEACON_EXIT_ON_STDIN_EOF";
 
 /// Runs `work`, but stops when stdin reaches end of file, if the environment
-/// asks for that (see [`EXIT_ON_STDIN_EOF`]).
+/// asks for that (see [`EXIT_ON_STDIN_EOF`]). Stopping says `beacon: client went
+/// away` on stderr, and is an error (exit 3) if `fail_when_orphaned`.
 ///
 /// `docker compose exec` does not stop the program it started when its own
 /// client dies (Ctrl-C, an agent that was killed, a closed terminal): it only
 /// closes the program's stdin. A `watch` left running that way would go on for
 /// ever, saying its handle is here. Left alone, stdin means nothing: agents
 /// are often run with it closed.
-async fn while_client_lives<F>(work: F) -> Result<(), Error>
+async fn while_client_lives<F>(work: F, fail_when_orphaned: bool) -> Result<(), Error>
 where
     F: std::future::Future<Output = Result<(), Error>>,
 {
@@ -413,9 +416,19 @@ where
     }
     tokio::select! {
         done = work => done,
-        () = stdin_ended() => Ok(()),
+        () = stdin_ended() => {
+            if fail_when_orphaned {
+                Err(Error::Interrupted(CLIENT_WENT_AWAY.to_string()))
+            } else {
+                let _ = writeln!(std::io::stderr(), "beacon: {CLIENT_WENT_AWAY}");
+                Ok(())
+            }
+        }
     }
 }
+
+/// What a command stopped by its client's end says.
+const CLIENT_WENT_AWAY: &str = "client went away";
 
 /// Resolves when stdin is at end of file (or cannot be read); whatever is sent
 /// before that is thrown away.

@@ -4499,7 +4499,9 @@ async fn watch_ends_when_its_stdin_closes_if_asked() {
         drop(stdin);
     }
     let (code, _) = watch.finish_within(Duration::from_secs(5)).await;
+    // `watch` was stopped by its client, which is how it is meant to end.
     assert_eq!(code, 0, "stderr: {}", watch.stderr());
+    assert_eq!(watch.stderr(), "beacon: client went away\n");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4515,7 +4517,45 @@ async fn wait_ends_when_its_stdin_closes_if_asked() {
     assert!(wait.child.try_wait().unwrap().is_none(), "ended early");
     drop(stdin);
     let (code, _) = wait.finish_within(Duration::from_secs(5)).await;
+    // Nothing woke it and nothing timed out: the caller never got an answer,
+    // so it is not a success (exit 3, as for a connection that was lost).
+    assert_eq!(code, 3, "stderr: {}", wait.stderr());
+    assert_eq!(wait.stderr(), "beacon: client went away\n");
+}
+
+/// The variable must not change how `wait` ends while its client lives: with
+/// the stdin held open (as the wrapper's FIFO is) it times out by itself with
+/// exit 6, and a mention wakes it with 0. This also guards `main`'s
+/// `shutdown_background`: the read of stdin that is still blocked when `wait`
+/// is over must not keep the process from exiting.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_with_a_stdin_that_stays_open_ends_on_its_own() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "general").await;
+    let held = |timeout: &str| {
+        beacon(&node, &["wait", "--timeout", timeout, "--as", "pc-vllm"])
+            .env("BEACON_EXIT_ON_STDIN_EOF", "1")
+            .spawn_with_stdin(std::process::Stdio::piped())
+    };
+
+    let mut wait = held("2");
+    let _client = wait.child.stdin.take().expect("piped stdin");
+    let started = std::time::Instant::now();
+    let (code, stdout) = wait.finish_within(Duration::from_secs(8)).await;
+    assert_eq!(code, 6, "stderr: {}", wait.stderr());
+    assert_eq!(stdout, "");
+    assert_eq!(wait.stderr(), "no new posts in 2s\n");
+    assert!(started.elapsed() < Duration::from_secs(6));
+
+    let before = listeners(&node);
+    let mut wait = held("60");
+    let _client = wait.child.stdin.take().expect("piped stdin");
+    until_listening(&node, before).await;
+    post_as(&node, "pc-configs", "general", "@pc-vllm wake up").await;
+    let (code, stdout) = wait.finish_within(Duration::from_secs(8)).await;
     assert_eq!(code, 0, "stderr: {}", wait.stderr());
+    assert!(stdout.contains("@pc-vllm wake up"), "{stdout}");
+    assert_eq!(wait.stderr(), "");
 }
 
 /// Without the variable stdin means nothing: an agent harness runs commands

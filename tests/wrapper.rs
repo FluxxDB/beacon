@@ -361,11 +361,16 @@ fn wrapper_checks_the_service_is_running_before_exec() {
 
 #[test]
 fn exit_status_passes_through() {
-    for code in [1, 2, 3, 4, 5, 6] {
-        let sb = Sandbox::new();
-        let mut cmd = sb.command(&["wait", "--timeout", "1"]);
-        cmd.env("FAKE_EXEC_STATUS", code.to_string());
-        assert_eq!(sb.run(cmd).code, code);
+    // A plain command (exec'd straight away) and a linked one (wait, whose
+    // stdin is made by the wrapper) both hand the CLI's status on untouched.
+    let commands: &[&[&str]] = &[&["read", "general"], &["wait", "--timeout", "1"]];
+    for args in commands {
+        for code in [1, 2, 3, 4, 5, 6] {
+            let sb = Sandbox::new();
+            let mut cmd = sb.command(args);
+            cmd.env("FAKE_EXEC_STATUS", code.to_string());
+            assert_eq!(sb.run(cmd).code, code, "{args:?}");
+        }
     }
 }
 
