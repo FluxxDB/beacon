@@ -18,11 +18,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use jiff::tz::TimeZone;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::api::{
     ChannelAck, ChannelsJson, HealthJson, PeerJson, PostCreated, PostJson, PostsResponse,
-    StatusJson,
+    PresenceJson, StatusJson,
 };
 use crate::model::AuthorKind;
 use crate::timefmt::{age_short, clock_12h, day_label};
@@ -150,6 +151,33 @@ fn shell_word(s: &str) -> String {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// What the attachment `name`, which another machine chose, is called here:
+/// its last path component, whether the separator is `/` or `\`. A name that
+/// is nothing, `.` or `..` is `attachment`; control characters become `_`.
+/// `get -o DIR` saves under this name and suggestions name it, so a peer
+/// cannot point a download at a path of its choosing.
+pub fn safe_file_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
+    if matches!(last, "" | "." | "..") {
+        return "attachment".to_string();
+    }
+    last.chars()
+        .map(|c| if c.is_control() { '_' } else { c })
+        .collect()
+}
+
+/// `name` as the value of `-o` in a command to copy and paste: quoted if the
+/// shell would split or expand it, and kept from being read as an option if
+/// it starts with a dash.
+fn output_word(name: &str) -> String {
+    let word = shell_word(name);
+    if name.starts_with('-') {
+        format!("./{word}")
+    } else {
+        word
     }
 }
 
@@ -329,12 +357,12 @@ pub fn post_lines(p: &PostJson, clock: &Clock) -> Vec<String> {
         }
     }
     if let Some(a) = &p.attachment {
-        let name = clean_inline(&a.name);
+        let name = clean_inline(&safe_file_name(&a.name));
         lines.push(format!(
             "{indent}attachment: {name} ({})  →  ./beacon get {} -o {}",
             format_size(a.size),
             clean_inline(&p.short_id),
-            shell_word(&name)
+            output_word(&name)
         ));
     }
     lines
@@ -409,6 +437,13 @@ pub fn posted_text(created: &PostCreated) -> String {
         clean_inline(&created.post.short_id),
         clean_inline(&created.post.channel)
     );
+    if let Some(a) = &created.post.attachment {
+        line.push_str(&format!(
+            " · attached {} ({})",
+            clean_inline(&safe_file_name(&a.name)),
+            format_size(a.size)
+        ));
+    }
     if created.delivery.is_empty() {
         line.push_str(" · no peers yet");
     }
@@ -526,6 +561,103 @@ pub fn status_text(status: &StatusJson, now_ms: i64) -> String {
     } else {
         format!("{head}\n{}", peers_text(&status.peers, now_ms))
     }
+}
+
+// ------------------------------------------------- presence, joins, watching
+
+/// Who has been seen lately, one per line:
+/// `{●|○} {handle:<16} {client} · {node:<6} {age:>4}   {status}`, in the order
+/// given. `●` is active, `○` idle. The columns line up across lines: the
+/// handle and the `client · node` are padded to the widest.
+pub fn who_text(agents: &[PresenceJson], now_ms: i64) -> String {
+    if agents.is_empty() {
+        return "nobody has been seen lately".to_string();
+    }
+    let handles: Vec<String> = agents.iter().map(|a| clean_inline(&a.handle)).collect();
+    let whos: Vec<String> = agents
+        .iter()
+        .map(|a| {
+            format!(
+                "{} · {}",
+                clean_inline(&a.client),
+                pad(&clean_inline(&a.node), 6)
+            )
+        })
+        .collect();
+    let handle_width = handles
+        .iter()
+        .map(|h| display_width(h))
+        .fold(16, usize::max);
+    let who_width = whos.iter().map(|w| display_width(w)).max().unwrap_or(0);
+    let lines: Vec<String> = agents
+        .iter()
+        .zip(&handles)
+        .zip(&whos)
+        .map(|((agent, handle), who)| {
+            let dot = if agent.active { '●' } else { '○' };
+            let age = age_short(now_ms.saturating_sub(agent.last_seen_ms));
+            let status = clean_inline(agent.status.as_deref().unwrap_or(""));
+            let line = format!(
+                "{dot} {} {} {age:>4}   {status}",
+                pad(handle, handle_width),
+                pad(who, who_width)
+            );
+            line.trim_end().to_string()
+        })
+        .collect();
+    lines.join("\n")
+}
+
+/// `joined #beacon · wait and watch will wake you for posts here`.
+pub fn joined_text(channel: &str) -> String {
+    format!(
+        "joined #{} · wait and watch will wake you for posts here",
+        clean_inline(channel)
+    )
+}
+
+/// `left #beacon · mentions and announcements still wake you`.
+pub fn left_text(channel: &str) -> String {
+    format!(
+        "left #{} · mentions and announcements still wake you",
+        clean_inline(channel)
+    )
+}
+
+/// The longest first line of a post `watch` shows, in characters.
+pub const WATCH_BODY_MAX: usize = 200;
+
+/// One line for `watch`: `6:31 pm #beacon mac-juicebox: first line of the
+/// body`, cut to 200 characters (the last of them `…` when it was cut). A post
+/// without text shows its attachment.
+pub fn watch_line(p: &PostJson, clock: &Clock) -> String {
+    let body = p.body.trim_start();
+    let first = body
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .replace('\t', " ");
+    let mut text = clean_inline(&first);
+    if text.is_empty() {
+        if let Some(a) = &p.attachment {
+            text = format!(
+                "attachment: {} ({})",
+                clean_inline(&safe_file_name(&a.name)),
+                format_size(a.size)
+            );
+        }
+    }
+    let graphemes: Vec<&str> = text.graphemes(true).collect();
+    if graphemes.len() > WATCH_BODY_MAX {
+        text = format!("{}…", graphemes[..WATCH_BODY_MAX - 1].concat());
+    }
+    format!(
+        "{} #{} {}: {text}",
+        clock_12h(p.ts_ms, &clock.tz),
+        clean_inline(&p.channel),
+        clean_inline(&p.author)
+    )
 }
 
 // --------------------------------------------------------- small answers
