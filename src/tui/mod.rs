@@ -11,6 +11,7 @@
 //!   tokio tasks.
 
 pub mod convert;
+pub mod cursor;
 pub mod keys;
 pub mod live;
 pub mod mention;

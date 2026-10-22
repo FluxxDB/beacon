@@ -12,8 +12,7 @@
 //! │              │╭─────────────────────────── enter send · a attach ─╮│  composer
 //! │              ││ › text                                           ││
 //! │              │╰──────────────────────────────────────────────────╯│
-//! │              │                                                    │  blank
-//! ├──────────────┴────────────────────────────────────────────────────┤
+//! ├──────────────┴────────────────────────────────────────────────────┤  rule (right under the composer)
 //! │  ? help   tab focus   …                                           │  help row
 //! ╰───────────────────────────────────────────────────────────────────╯
 //! ```
@@ -38,8 +37,9 @@ pub const SIDEBAR_MIN_WIDTH: u16 = 80;
 pub const MIN_WIDTH: u16 = 40;
 /// Rows above the posts viewport: top border, blank/switcher, title, rule, padding.
 const ROWS_ABOVE_POSTS: u16 = 5;
-/// Rows below the composer: blank, separator, help, bottom border.
-const ROWS_BELOW_COMPOSER: u16 = 4;
+/// Rows below the composer: separator, help, bottom border. The composer
+/// sits right on the separator; the posts have the rest (Dang, 2026-10-22).
+const ROWS_BELOW_COMPOSER: u16 = 3;
 /// Shortest terminal the board is drawn in at all: one row of posts, the
 /// notice row and a one-line composer between the fixed rows.
 pub const MIN_HEIGHT: u16 = ROWS_ABOVE_POSTS + 1 + 1 + 3 + ROWS_BELOW_COMPOSER;

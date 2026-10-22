@@ -1,12 +1,14 @@
 //! The composer's `@` ghost autocomplete.
 //!
-//! While the text before the caret is an `@` that starts a word (the start
-//! of the input, or after whitespace or `(`) followed by handle characters,
-//! the composer draws the rest of the best matching handle after the caret
-//! in fog: the ghost. It is never part of the input, so sending never sends
-//! it. `Tab` takes it with a space after it, `↑` `↓` pick another match and
-//! `Esc` puts it away for that word (the next `@` brings it back); the keys
-//! are in [`crate::tui::keys`]. Every `@` that can show a ghost is one
+//! While the text before the cursor ends in an `@` that starts a word (the
+//! start of the input, or after whitespace or `(`) followed by handle
+//! characters, and the cursor is at the end of the input or before
+//! whitespace, the composer draws the rest of the best matching handle from
+//! the caret on in fog: the ghost. It is never part of the input, so sending
+//! never sends it. `Tab` puts it in at the cursor with a space after it
+//! (unless whitespace follows already), `↑` `↓` pick another match and `Esc`
+//! puts it away for that word (the next `@` brings it back); the keys are in
+//! [`crate::tui::keys`]. Every `@` that can show a ghost is one
 //! [`crate::model::parse_mentions`] reads as a mention.
 //!
 //! The candidates, best first: the sidebar's agents (active, then idle, each
@@ -45,8 +47,9 @@ pub struct Mention {
     pub dismissed: bool,
 }
 
-/// The `@handle` the input ends in, if its `@` starts a word: the `@`'s
-/// byte offset, and the handle characters typed after it (maybe none).
+/// The `@handle` `input` ends in (the composer's text up to the cursor), if
+/// its `@` starts a word: the `@`'s byte offset, and the handle characters
+/// typed after it (maybe none).
 pub fn trigger(input: &str) -> Option<(usize, &str)> {
     let start = input.trim_end_matches(is_handle_char).len();
     if !input[..start].ends_with('@') {
@@ -66,7 +69,12 @@ impl App {
         if self.focus != Focus::Composer || self.dialog.is_some() || self.filter_editing {
             return None;
         }
-        let (at, prefix) = trigger(&self.input)?;
+        let cursor = self.cursor();
+        let next = self.input[cursor..].chars().next();
+        if next.is_some_and(|c| !c.is_whitespace()) {
+            return None;
+        }
+        let (at, prefix) = trigger(&self.input[..cursor])?;
         let state = self.mention.as_ref().filter(|m| m.at == at);
         if state.is_some_and(|m| m.dismissed) {
             return None;
@@ -116,7 +124,7 @@ impl App {
 
     /// `↓` (forward) and `↑`: the next or previous match, round the ends.
     pub(crate) fn pick_mention(&mut self, ghost: &Ghost, forward: bool) {
-        let Some((at, prefix)) = trigger(&self.input) else {
+        let Some((at, prefix)) = trigger(self.before_cursor()) else {
             return;
         };
         let prefix = prefix.to_string();
@@ -132,7 +140,7 @@ impl App {
 
     /// `Esc`: no ghost for this word.
     pub(crate) fn dismiss_mention(&mut self) {
-        if let Some((at, prefix)) = trigger(&self.input) {
+        if let Some((at, prefix)) = trigger(self.before_cursor()) {
             let prefix = prefix.to_string();
             self.mention_for(at, &prefix).dismissed = true;
         }
@@ -142,13 +150,18 @@ impl App {
     /// more typed in the word starts again from the best match (still put
     /// away if it was); a word that ended, or a new `@`, starts afresh.
     pub(crate) fn sync_mention(&mut self) {
-        match trigger(&self.input) {
+        match trigger(self.before_cursor()) {
             Some((at, prefix)) if self.mention.is_some() => {
                 let prefix = prefix.to_string();
                 self.mention_for(at, &prefix);
             }
             _ => self.mention = None,
         }
+    }
+
+    /// The composer's text up to the cursor: where a mention is typed.
+    fn before_cursor(&self) -> &str {
+        &self.input[..self.cursor()]
     }
 
     /// The keys' state for the word whose `@` is at `at`, with `prefix`

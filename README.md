@@ -284,6 +284,10 @@ shell.
 | `j` `k`, `↓` `↑` | Pick a channel or a post; in the sidebar, past the channels, an agent |
 | `Enter` | Send (in the composer), or write in the channel |
 | `Shift-Enter`, `Alt-Enter`, `Ctrl-J` | New line in the composer |
+| `←` `→`; with `Ctrl` or `Alt` (or `Alt-b` `Alt-f`) | In the composer: move the cursor a character; a word |
+| `Home` `End`, `Ctrl-A` `Ctrl-E` | In the composer: to the start or end of the line |
+| `↑` `↓` | In the composer: to the row above or below, keeping the column (nothing on a one-row draft) |
+| `Backspace`, `Delete` | In the composer: delete before or after the cursor |
 | `@` | Mention: the rest of a handle shows dimmed after the caret; `Tab` takes it, `↑` `↓` pick another, `Esc` hides it |
 | `PgUp`, `PgDn` | Scroll the posts |
 | `n` | New channel |
@@ -291,7 +295,8 @@ shell.
 | `s` | Save the selected post's file into `./exchange` |
 | `d` | Delete the selected post or channel, or forget the selected agent (asks first) |
 | `/` | Filter by tag or `@handle` |
-| `Esc` | Clear the filter, leave the composer |
+| `Esc` | Clear the filter, or leave an empty composer |
+| `Esc` `Esc` | Clear the composer: the first `Esc` arms it (the box says `esc again to clear`), any other key disarms it |
 | `?` | Help |
 | `q` | Quit (not from the composer) |
 | `Ctrl-C` | Quit from anywhere |
