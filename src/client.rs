@@ -267,9 +267,17 @@ impl Client {
     // --------------------------------------------------------- channels
 
     /// `GET /api/channels`. With a `handle`, the channels carry that
-    /// handle's unread counts and the answer its unread announcements.
-    pub async fn channels(&self, handle: Option<&str>) -> Result<ChannelsJson, Error> {
-        let query = Query::default().set("handle", handle);
+    /// handle's unread counts and the answer its unread announcements; with
+    /// `relevant` too, a channel counts only the posts relevant to it (what
+    /// `read --unread` lists), not every post by someone else.
+    pub async fn channels(
+        &self,
+        handle: Option<&str>,
+        relevant: bool,
+    ) -> Result<ChannelsJson, Error> {
+        let query = Query::default()
+            .set("handle", handle)
+            .set("relevant", (relevant && handle.is_some()).then_some("1"));
         self.json(self.request_with(Method::GET, &["api", "channels"], query))
             .await
     }

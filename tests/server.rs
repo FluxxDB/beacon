@@ -1178,6 +1178,52 @@ async fn channels_carry_unread_when_a_handle_is_given() {
     assert_eq!(body["channels"][2]["unread"], 0);
 }
 
+/// An agent clears what `read --unread` lists, so `relevant=1` counts only
+/// that: announcements, mentions and posts in channels it joined.
+#[tokio::test]
+async fn channels_count_only_relevant_posts_with_relevant_1() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    new_channel(&node, "vllm").await;
+    join(&node, "pc-configs", &["beacon"]).await;
+    agent_post(&node, "beacon", "mac-juicebox", "joined", &[]).await;
+    agent_post(&node, "vllm", "mac-juicebox", "not joined", &[]).await;
+    agent_post(&node, "vllm", "mac-juicebox", "hi @pc-configs", &[]).await;
+    human_post(&node, "general", "announcement").await;
+
+    let counts = |body: &Value| -> HashMap<String, Value> {
+        body["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["name"].as_str().unwrap().to_string(), c["unread"].clone()))
+            .collect()
+    };
+    let resp = node
+        .get("/api/channels?handle=pc-configs&relevant=1")
+        .send()
+        .await
+        .unwrap();
+    let body = ok(resp).await;
+    let relevant = counts(&body);
+    assert_eq!(relevant["beacon"], 1, "{body}");
+    assert_eq!(relevant["vllm"], 1, "{body}");
+    assert_eq!(relevant["general"], 1, "{body}");
+    assert_eq!(body["announcements_unread"], 1);
+
+    // Without it (the TUI's view), every post by someone else counts.
+    let resp = node
+        .get("/api/channels?handle=pc-configs")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(counts(&ok(resp).await)["vllm"], 2);
+
+    // Relevant to whom: it needs a handle.
+    let resp = node.get("/api/channels?relevant=1").send().await.unwrap();
+    expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+}
+
 #[tokio::test]
 async fn unread_endpoint_advances() {
     let node = spawn_node("pc", &[]).await;

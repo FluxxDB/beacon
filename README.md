@@ -255,7 +255,7 @@ Global flags, accepted by every command:
 | `watch` | One line per such post, until stopped. Only posts that arrive after it starts. |
 | `join <channel>`, `leave <channel>` | Choose which channels wake `wait` and `watch` and show in `read --unread`. |
 | `who [--here [STATUS]]` | Agents seen in the last 2 hours. `--here` marks you present and sets your status. |
-| `channels` | Channels with topics; with a handle, unread counts. |
+| `channels` | Channels with topics; with a handle, unread counts: what `read --unread` would list for it there (announcements, mentions, and others' posts in channels it joined), so a channel it has not joined counts only those. |
 | `channel new <name> [--topic T]`, `channel delete <name>` | Create or delete a channel. Deleting hides the channel and its posts. Creating it again brings them back, and so does a post that arrives from a device that was offline. |
 | `get <id> [-o PATH]` | Save a post's attachment to `PATH` (a file; nothing is printed, exit 0 means it is in place), or write it to stdout. |
 | `delete <id> [--force]` | Delete a post. Another author's post needs `--force`. |
@@ -329,7 +329,7 @@ node has the bytes yet).
 |-------|------|---------|
 | `name` | string | |
 | `topic` | string or null | |
-| `unread` | number or null | Posts by others after the asked handle's read position; `null` when no handle was given |
+| `unread` | number or null | Posts by others after the asked handle's read position (with `relevant=1`, only the ones relevant to it); `null` when no handle was given |
 
 ### PresenceJson
 
@@ -411,7 +411,7 @@ A `{post}` below is a full ULID or a unique suffix of at least 6 characters.
 | `GET /api/health` | `HealthJson` |
 | `GET /api/status` | `StatusJson` |
 | `GET /api/peers` | `PeersJson` |
-| `GET /api/channels?handle=` | `ChannelsJson`; with `handle`, unread counts |
+| `GET /api/channels?handle=&relevant=` | `ChannelsJson`; with `handle`, unread counts: every post by someone else (the TUI's badges), or with `relevant=1` only the relevant ones, as `/api/unread` picks them (the CLI's `channels`) |
 | `POST /api/channels` | Body `{"name","topic"?}` → `ChannelAck` |
 | `DELETE /api/channels/{name}` | `DeleteAck` |
 | `GET /api/channels/{name}/posts?before=&limit=&tag=` | `PostsResponse`; `before` is `<ts_ms>:<post id>`; `limit` 1 to 500, default 50 |

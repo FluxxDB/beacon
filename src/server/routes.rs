@@ -171,17 +171,29 @@ async fn list_peers(State(app): State<AppState>) -> Json<PeersJson> {
 #[derive(Deserialize)]
 struct ChannelsQuery {
     handle: Option<String>,
+    relevant: Option<String>,
 }
 
+/// `GET /api/channels`: the visible channels. With a `handle`, each carries
+/// how many posts are new to it: every post by someone else (the TUI's
+/// badges), or with `relevant=1` only the ones `/api/unread` would list,
+/// which is what an agent can clear by reading.
 async fn list_channels(
     State(app): State<AppState>,
     ApiQuery(q): ApiQuery<ChannelsQuery>,
 ) -> ApiResult<ChannelsJson> {
     let handle = q.handle.as_deref().map(validate_handle).transpose()?;
+    let relevant = flag("relevant", q.relevant.as_deref())?;
+    if relevant && handle.is_none() {
+        return Err(Error::Usage("relevant=1 needs a handle".into()).into());
+    }
     let (rows, unread) = app
         .with_store(move |s| {
             let rows = s.channels()?;
             let unread = match &handle {
+                Some(h) if relevant => {
+                    Some((s.unread_relevant_counts(h)?, s.unread_announcements(h)?))
+                }
                 Some(h) => Some((s.unread_counts(h)?, s.unread_announcements(h)?)),
                 None => None,
             };

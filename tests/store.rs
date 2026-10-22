@@ -1125,6 +1125,17 @@ fn unread_agrees_with_is_relevant() {
         }
         wider |= want_counts.values().sum::<u32>() as usize > want.len();
         assert_eq!(a.unread_counts(handle).unwrap(), want_counts, "{handle}");
+
+        // An agent's counts take only what `unread` lists.
+        let mut want_relevant = std::collections::BTreeMap::new();
+        for p in &want {
+            *want_relevant.entry(p.channel.clone()).or_insert(0u32) += 1;
+        }
+        assert_eq!(
+            a.unread_relevant_counts(handle).unwrap(),
+            want_relevant,
+            "{handle}"
+        );
     }
     assert!(
         wider,

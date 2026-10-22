@@ -658,7 +658,8 @@ async fn peers(ctx: &Ctx) -> Result<(), Error> {
 
 async fn channels(ctx: &Ctx) -> Result<(), Error> {
     ctx.announce().await?;
-    let list = ctx.client.channels(ctx.handle.as_deref()).await?;
+    // An agent's counts: only what `read --unread` lists and so clears.
+    let list = ctx.client.channels(ctx.handle.as_deref(), true).await?;
     ctx.show(&list, || human::channels_text(&list))
 }
 
@@ -1157,7 +1158,7 @@ async fn join(ctx: &Ctx, channel: &str, change: Membership) -> Result<(), Error>
     // A channel has to exist to be joined; one that was deleted can still be left.
     let exists = ctx
         .client
-        .channels(None)
+        .channels(None, false)
         .await?
         .channels
         .iter()

@@ -612,7 +612,9 @@ impl Worker {
     }
 
     async fn channels(&self) -> Option<Msg> {
-        match self.client.channels(Some(&self.me)).await {
+        // The badges count every new post by someone else (R15), not only
+        // what is relevant to Dang: he reads by opening a channel.
+        match self.client.channels(Some(&self.me), false).await {
             Ok(list) => Some(Msg::Loaded(Loaded::Channels(list))),
             Err(Error::Auth) => Some(Msg::SecretRejected),
             // The feed shows the server as down; it reloads when it is back.

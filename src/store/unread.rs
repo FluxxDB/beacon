@@ -173,6 +173,21 @@ impl Store {
         Ok(counts)
     }
 
+    /// For an agent's channel list: how many posts [`Store::unread`] would
+    /// list for `handle` in each channel (relevant to it, not its own, after
+    /// its cursor), which is what it can clear by reading. Channels with none
+    /// are left out.
+    pub fn unread_relevant_counts(&self, handle: &str) -> Result<BTreeMap<String, u32>> {
+        let mut stmt = self.conn.prepare_cached(&relevant_counts_sql())?;
+        let rows = stmt.query_map([handle], |r| Ok((r.get(0)?, r.get::<_, i64>(1)?)))?;
+        let mut counts = BTreeMap::new();
+        for row in rows {
+            let (channel, n) = row?;
+            counts.insert(channel, u32::try_from(n).unwrap_or(u32::MAX));
+        }
+        Ok(counts)
+    }
+
     /// For the Announcements badge: how many announcements (human-authored
     /// shown posts) not by `handle` arrived after its cursor for their
     /// channel, across all channels.
@@ -208,6 +223,11 @@ fn counts_sql() -> String {
     format!("SELECT v.name, COUNT(*) FROM {NEW_FROM_OTHERS} GROUP BY v.name")
 }
 
+/// [`Store::unread_relevant_counts`], for `?1`.
+fn relevant_counts_sql() -> String {
+    format!("SELECT v.name, COUNT(*) FROM {NEW_FROM_OTHERS}{RELEVANT} GROUP BY v.name")
+}
+
 /// [`Store::unread_announcements`], for `?1`.
 fn announcements_sql() -> String {
     format!("SELECT COUNT(*) FROM {NEW_FROM_OTHERS} AND p.author_kind = 'human'")
@@ -237,6 +257,7 @@ mod tests {
             unread_sql(),
             count_unread_sql(),
             counts_sql(),
+            relevant_counts_sql(),
             announcements_sql(),
         ] {
             let mut stmt = s

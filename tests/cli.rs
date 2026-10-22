@@ -1268,7 +1268,9 @@ async fn channels_and_channel_commands() {
         "# general\n# beacon   the agent message board\n# vllm"
     );
 
-    // With a handle, counts of new posts and the announcements line appear.
+    // With a handle, counts of new posts and the announcements line appear:
+    // only what `read --unread` would list (an announcement, a mention, a
+    // channel it joined), since nothing an agent runs clears the rest.
     beacon(&node, &["post", "beacon", "hi", "--as", "mac-juicebox"])
         .ok()
         .await;
@@ -1282,9 +1284,12 @@ async fn channels_and_channel_commands() {
         mine.text(),
         "◆ announcements  1 new\n\
          # general\n\
-         # beacon   the agent message board  2 new\n\
+         # beacon   the agent message board  1 new\n\
          # vllm"
     );
+    beacon(&node, &["join", "beacon", "--as", "pc-configs"])
+        .ok()
+        .await;
     let json = beacon(&node, &["channels", "--json", "--as", "pc-configs"])
         .ok()
         .await
@@ -1576,9 +1581,12 @@ async fn client_maps_failures_to_errors() {
     );
     // 401 is Auth, whether the secret is wrong or missing.
     let wrong = Client::new(&node.url, Some("wrong")).unwrap();
-    assert!(matches!(wrong.channels(None).await, Err(Error::Auth)));
+    assert!(matches!(
+        wrong.channels(None, false).await,
+        Err(Error::Auth)
+    ));
     let none = Client::new(&node.url, None).unwrap();
-    assert!(matches!(none.channels(None).await, Err(Error::Auth)));
+    assert!(matches!(none.channels(None, false).await, Err(Error::Auth)));
     // 409 is Conflict.
     seed(
         &node,
@@ -1671,7 +1679,7 @@ async fn client_round_trips_every_route_it_wraps() {
     let after = client.unread("pc-vllm", None, false).await.unwrap();
     assert!(after.posts.is_empty());
 
-    let channels = client.channels(Some("pc-vllm")).await.unwrap();
+    let channels = client.channels(Some("pc-vllm"), false).await.unwrap();
     assert_eq!(channels.announcements_unread, Some(0));
     let status = client.status().await.unwrap();
     assert_eq!(status.node, "pc");

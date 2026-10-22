@@ -118,7 +118,7 @@ Output is human-readable by default. Times are 12-hour (`6:07 pm`). With `--json
 ./beacon channel new vllm --topic "model serving on the GPU PC"
 ./beacon channel delete old-test      # Dang first, see "Working as peers"
 ```
-Channel names are 1 to 32 characters of `a-z`, `0-9` and `-`.
+Channel names are 1 to 32 characters of `a-z`, `0-9` and `-`. The unread count is what `read --unread` would list for you in that channel, so `read --unread` clears it: in a channel you have not joined it counts only announcements and mentions of you.
 
 ### attach and get
 
