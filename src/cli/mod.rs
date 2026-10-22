@@ -28,7 +28,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWriteExt};
 
-use crate::api::{JoinAck, NewPostRequest, PostJson, StreamEvent, WhoRequest, V};
+use crate::api::{AttachmentJson, JoinAck, NewPostRequest, PostJson, StreamEvent, WhoRequest, V};
 use crate::client::{self, Client};
 use crate::config::Config;
 use crate::error::Error;
@@ -878,21 +878,15 @@ async fn get(ctx: &Ctx, args: GetArgs) -> Result<(), Error> {
             out.flush()
                 .await
                 .map_err(|e| io_error("cannot write to stdout", e))?;
+            // The bytes have gone by already; all that is left is to say so.
+            if !matches_post(&attachment, &got) {
+                return Err(mismatch());
+            }
             got
         }
-        Some(path) => save(&mut download, path).await?,
+        // Checked before the file is put in place.
+        Some(path) => save(&mut download, path, &attachment).await?,
     };
-    // The post names the file by its hash; the bytes either are that file or
-    // they are not. (To stdout, what was wrong has been written already.)
-    if size != attachment.size || sha256 != attachment.sha256 {
-        if let Some(path) = &target {
-            let _ = tokio::fs::remove_file(path).await;
-        }
-        return Err(Error::Internal(anyhow!(
-            "the download is not the file the post names ({size} bytes, sha256 {sha256}); \
-             try again"
-        )));
-    }
     let Some(path) = target else {
         return Ok(());
     };
@@ -937,35 +931,72 @@ async fn destination(path: &str, name: &str) -> Result<PathBuf, Error> {
     Ok(dest)
 }
 
-/// Writes `download` to `path` so that the file is there whole or not at all:
-/// into a hidden file next to it, renamed once it is complete. (Something that
-/// is not a regular file, like `/dev/null`, is written to directly.)
-async fn save(download: &mut client::Download, path: &Path) -> Result<(u64, String), Error> {
+/// Whether the bytes received are the file `attachment` says its post carries:
+/// the size and the SHA-256 (the post names the file by it).
+fn matches_post(attachment: &AttachmentJson, got: &(u64, String)) -> bool {
+    got.0 == attachment.size && got.1 == attachment.sha256
+}
+
+fn mismatch() -> Error {
+    Error::Internal(anyhow!(
+        "attachment doesn't match what its post describes (size or hash)"
+    ))
+}
+
+/// Writes `download` to `path` so that the file is there whole and right, or
+/// what was there stays: the bytes go into a hidden file next to it (with a
+/// name nobody can guess, made new), which is checked against `attachment`
+/// and only then renamed over `path`. If anything fails only that hidden file
+/// is removed. (Something that is not a regular file, like `/dev/null`, is
+/// written to directly and checked after.)
+async fn save(
+    download: &mut client::Download,
+    path: &Path,
+    attachment: &AttachmentJson,
+) -> Result<(u64, String), Error> {
     let direct = tokio::fs::metadata(path).await.is_ok_and(|m| !m.is_file());
     let temp = match path.parent() {
-        Some(dir) if !direct => dir.join(format!(".beacon-get.{}", std::process::id())),
+        Some(dir) if !direct => dir.join(format!(
+            ".beacon-get.{}.{}",
+            std::process::id(),
+            ulid::Ulid::generate()
+        )),
         _ => path.to_path_buf(),
     };
     let cannot = |e| io_error(&format!("cannot write {}", temp.display()), e);
-    let mut file = tokio::fs::File::create(&temp).await.map_err(cannot)?;
+    let mut file = if direct {
+        tokio::fs::File::create(&temp).await
+    } else {
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .await
+    }
+    .map_err(cannot)?;
     let written = async {
         let got = receive(download, &mut file).await?;
         file.flush().await.map_err(cannot)?;
-        Ok::<_, Error>(got)
+        if matches_post(attachment, &got) {
+            Ok(got)
+        } else {
+            Err(mismatch())
+        }
     }
     .await;
     drop(file);
     match written {
         Ok(got) if direct => Ok(got),
-        Ok(got) => {
-            tokio::fs::rename(&temp, path).await.map_err(|e| {
-                io_error(
+        Ok(got) => match tokio::fs::rename(&temp, path).await {
+            Ok(()) => Ok(got),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&temp).await;
+                Err(io_error(
                     &format!("cannot move the download to {}", path.display()),
                     e,
-                )
-            })?;
-            Ok(got)
-        }
+                ))
+            }
+        },
         Err(e) => {
             if !direct {
                 let _ = tokio::fs::remove_file(&temp).await;
@@ -1072,9 +1103,21 @@ const RECONNECT_FIRST: Duration = Duration::from_secs(1);
 const WATCH_RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// `wait` is back at the node soon, so it pauses less.
 const WAIT_RECONNECT_MAX: Duration = Duration::from_secs(5);
-/// `wait` asks the node for at most this long at a time, and tells the node it
-/// is still here between asks, so a long wait shows as active in `who`.
-const WAIT_SEGMENT: Duration = Duration::from_secs(120);
+/// How often `wait` (between its asks) and `watch` tell the node the handle is
+/// still here, so someone listening for hours shows as active in `who` (the
+/// node counts a handle as active for 5 minutes, idle for 2 hours). `wait`
+/// asks the node for at most this long at a time.
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(120);
+
+/// [`HEARTBEAT_EVERY`], or `BEACON_HEARTBEAT_SECS` seconds if that is set to a
+/// number above zero (so a test need not wait two minutes).
+fn heartbeat_every() -> Duration {
+    std::env::var("BEACON_HEARTBEAT_SECS")
+        .ok()
+        .and_then(|secs| secs.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(HEARTBEAT_EVERY, Duration::from_secs)
+}
 /// A connection that held this long was a good one: the next pause starts over.
 const STEADY: Duration = Duration::from_secs(10);
 
@@ -1108,12 +1151,6 @@ fn say_reconnecting() {
     let _ = writeln!(std::io::stderr(), "beacon: reconnecting…");
 }
 
-/// Whether `e` is the node going away or going quiet, which `wait` and `watch`
-/// wait out.
-fn is_outage(e: &Error) -> bool {
-    matches!(e, Error::Unreachable(_) | Error::Interrupted(_))
-}
-
 /// Blocks until a post worth waking for arrives and prints it, or `timeout`
 /// seconds pass (exit 6). The node being unreachable *when it starts* is exit
 /// 3; once it has answered, a node that goes away is waited for until the
@@ -1126,7 +1163,7 @@ async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<(), Error> {
     let mut away = false;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        let segment = left.min(WAIT_SEGMENT);
+        let segment = left.min(heartbeat_every());
         let asked_at = Instant::now();
         match ctx.client.wait(&handle, segment).await {
             Ok(Some(page)) => {
@@ -1151,7 +1188,7 @@ async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<(), Error> {
                 away = true;
                 tokio::time::sleep(pause.step().min(left)).await;
             }
-            Err(e) if is_outage(&e) => {
+            Err(e) if e.is_outage() => {
                 if !away {
                     say_reconnecting();
                 }
@@ -1178,10 +1215,16 @@ async fn watch(ctx: &Ctx) -> Result<(), Error> {
     let mut pause = Backoff::new(WATCH_RECONNECT_MAX);
     // The newest post shown, by the node's own arrival numbering.
     let mut shown: Option<i64> = None;
+    // Says "still here" now and then; it keeps counting across reconnections.
+    let every = heartbeat_every();
+    let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let connected_at = Instant::now();
-        match watch_once(ctx, &handle, &mut shown).await {
-            Err(e) if !is_outage(&e) => return Err(e),
+        match watch_once(ctx, &handle, &mut shown, &mut heartbeat).await {
+            // The node being away, or having a bad moment (it answered 5xx), is
+            // waited out; anything else (a wrong secret...) is not going to pass.
+            Err(e) if !(e.is_outage() || e.is_server_fault()) => return Err(e),
             _ => {}
         }
         if connected_at.elapsed() >= STEADY {
@@ -1193,7 +1236,12 @@ async fn watch(ctx: &Ctx) -> Result<(), Error> {
 }
 
 /// One connection's worth of `watch`; returns, with an error, when it ends.
-async fn watch_once(ctx: &Ctx, handle: &str, shown: &mut Option<i64>) -> Result<(), Error> {
+async fn watch_once(
+    ctx: &Ctx,
+    handle: &str,
+    shown: &mut Option<i64>,
+    heartbeat: &mut tokio::time::Interval,
+) -> Result<(), Error> {
     // Where "new" starts: what `watch` has shown, or the node's newest arrival
     // now. (A node that was reset numbers its arrivals from the start again.)
     let head = ctx.client.arrival_head().await?;
@@ -1215,10 +1263,19 @@ async fn watch_once(ctx: &Ctx, handle: &str, shown: &mut Option<i64>) -> Result<
     for post in &missed {
         show_watched(ctx, post, shown)?;
     }
-    while let Some(event) = events.next().await {
-        if let StreamEvent::Post(post) = event? {
-            if shown.is_none_or(|at| post.arrival > at) {
-                show_watched(ctx, &post, shown)?;
+    loop {
+        tokio::select! {
+            event = events.next() => {
+                let Some(event) = event else { break };
+                if let StreamEvent::Post(post) = event? {
+                    if shown.is_none_or(|at| post.arrival > at) {
+                        show_watched(ctx, &post, shown)?;
+                    }
+                }
+            }
+            _ = heartbeat.tick() => {
+                // If the node does not hear it, the stream will say so.
+                let _ = ctx.beat(handle, None).await;
             }
         }
     }

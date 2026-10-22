@@ -64,6 +64,21 @@ fn exit_codes() {
 }
 
 #[test]
+fn an_outage_is_a_node_that_is_away() {
+    // Not there at all, or there and gone quiet: wait and watch wait it out.
+    assert!(Error::Unreachable("x".into()).is_outage());
+    assert!(Error::Interrupted("x".into()).is_outage());
+    // Everything else is an answer, and an answer is not an outage.
+    assert!(!Error::Usage("x".into()).is_outage());
+    assert!(!Error::NotFound("x".into()).is_outage());
+    assert!(!Error::Ambiguous(vec![]).is_outage());
+    assert!(!Error::Auth.is_outage());
+    assert!(!Error::Conflict("x".into()).is_outage());
+    assert!(!Error::Timeout.is_outage());
+    assert!(!Error::Internal(anyhow::anyhow!("boom")).is_outage());
+}
+
+#[test]
 fn day_labels() {
     let tz = TimeZone::get("America/New_York").unwrap();
     let at = |s: &str| -> i64 {

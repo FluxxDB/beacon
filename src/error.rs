@@ -52,6 +52,27 @@ impl Error {
     }
 }
 
+/// What a 5xx answer from the node is carried as inside [`Error::Internal`],
+/// so a client can tell "the node is failing" from the CLI's own internal errors.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ServerFault(pub String);
+
+impl Error {
+    /// Whether the node is away: nothing accepted the connection
+    /// ([`Error::Unreachable`]) or it was reached and went quiet
+    /// ([`Error::Interrupted`]). What `wait` and `watch` wait out.
+    pub fn is_outage(&self) -> bool {
+        matches!(self, Error::Unreachable(_) | Error::Interrupted(_))
+    }
+
+    /// Whether the node answered 5xx: running, and failing at the moment. Still
+    /// an [`Error::Internal`] (exit 1) for a command that gives up on it.
+    pub fn is_server_fault(&self) -> bool {
+        matches!(self, Error::Internal(e) if e.downcast_ref::<ServerFault>().is_some())
+    }
+}
+
 impl From<rusqlite::Error> for Error {
     /// A database failure is never the user's doing.
     fn from(e: rusqlite::Error) -> Self {

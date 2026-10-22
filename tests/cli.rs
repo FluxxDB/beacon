@@ -256,8 +256,8 @@ async fn api_posts(node: &TestNode, channel: &str) -> Vec<Value> {
     body["posts"].as_array().unwrap().clone()
 }
 
-/// A free loopback port nothing listens on.
-fn closed_port() -> u16 {
+/// A free loopback port, for a node that is about to be started on it.
+fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
 }
@@ -730,7 +730,7 @@ async fn post_human_uses_beacon_human() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unreachable_exits_3_with_hint() {
-    let url = format!("http://127.0.0.1:{}", closed_port());
+    let url = format!("http://127.0.0.1:{}", refused_port());
     let node = spawn_node("pc", &[]).await;
     for args in [
         &["health"][..],
@@ -1370,7 +1370,7 @@ async fn commands_heartbeat_only_when_a_handle_is_known() {
 #[tokio::test(flavor = "multi_thread")]
 async fn serve_runs_a_node_until_sigterm() {
     let dir = tempfile::tempdir().unwrap();
-    let port = closed_port();
+    let port = free_port();
     let url = format!("http://127.0.0.1:{port}");
 
     let data = dir.path().to_path_buf();
@@ -1554,7 +1554,7 @@ async fn client_maps_failures_to_errors() {
     );
     assert_eq!(err.exit_code(), 5);
     // Nothing listening is Unreachable.
-    let nowhere = format!("http://127.0.0.1:{}", closed_port());
+    let nowhere = format!("http://127.0.0.1:{}", refused_port());
     let err = Client::new(&nowhere, Some(SECRET))
         .unwrap()
         .health()
@@ -3032,7 +3032,7 @@ async fn wait_and_watch_need_a_handle_and_a_node() {
         );
     }
     // With the node down, they say so at once (exit 3, with the hint).
-    let url = format!("http://127.0.0.1:{}", closed_port());
+    let url = format!("http://127.0.0.1:{}", refused_port());
     for args in [
         &["wait", "--timeout", "30", "--as", "pc-vllm"][..],
         &["watch", "--as", "pc-vllm"],
@@ -3221,7 +3221,7 @@ async fn skill_show_prints_the_embedded_skill() {
         out.stdout
     );
     // It needs no node and no handle.
-    let url = format!("http://127.0.0.1:{}", closed_port());
+    let url = format!("http://127.0.0.1:{}", refused_port());
     let out = beacon(&node, &["skill", "show"]).server(&url).ok().await;
     assert!(!out.stdout.is_empty());
 
@@ -3507,7 +3507,7 @@ async fn opening_a_stream_says_why_it_cannot() {
         "{err}"
     );
     // Nothing listening: the lazy form's only item is the error.
-    let nowhere = format!("http://127.0.0.1:{}", closed_port());
+    let nowhere = format!("http://127.0.0.1:{}", refused_port());
     let nobody = Client::new(&nowhere, Some(SECRET)).unwrap();
     let err = nobody.open_stream(None, false).await.err().unwrap();
     assert!(matches!(err, Error::Unreachable(_)), "{err}");
@@ -3942,4 +3942,402 @@ fn join_and_leave_lines() {
         human::left_text("beacon"),
         "left #beacon · mentions and announcements still wake you"
     );
+}
+
+// --------------------------------------------------- fix round 1: new tests
+
+/// A port nothing listens on and no test node can take: it is privileged, and
+/// nodes bind port 0 (a free port picked from the high range).
+fn refused_port() -> u16 {
+    1
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_port_is_refused() {
+    let err = tokio::net::TcpStream::connect(("127.0.0.1", refused_port()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+}
+
+/// All the files in `dir`, hidden ones included, sorted.
+fn names_in(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+const DOESNT_MATCH: &str = "attachment doesn't match what its post describes (size or hash)";
+
+/// A download is checked before it is put in place. Whatever is at the target
+/// when the check fails is still there afterwards, and nothing is left over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_that_does_not_match_its_post_leaves_the_target_alone() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let bytes = binary_blob(70_000);
+    let created = beacon(
+        &node,
+        &[
+            "attach",
+            "beacon",
+            "-",
+            "--name",
+            "data.bin",
+            "--as",
+            "pc-configs",
+            "--json",
+        ],
+    )
+    .stdin_bytes(bytes.clone())
+    .ok()
+    .await
+    .json();
+    let sha = created["post"]["attachment"]["sha256"].as_str().unwrap();
+    let good = created["post"]["short_id"].as_str().unwrap().to_string();
+
+    // A peer's post that says the same file is 1 byte long.
+    let mut event = remote_post(10, "PEER0010", "beacon", "from afar").event();
+    if let EventKind::PostCreated(post) = &mut event.kind {
+        post.attachment = Some(Attachment {
+            sha256: sha.to_string(),
+            name: "mine.txt".to_string(),
+            size: 1,
+        });
+    }
+    seed(&node, vec![event]).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dl = dir.path().join("dl");
+    std::fs::create_dir(&dl).unwrap();
+    let mine = dl.join("mine.txt");
+    std::fs::write(&mine, "precious").unwrap();
+
+    // To a path that exists: untouched, no temp file left behind.
+    let out = beacon(&node, &["get", "PEER0010", "-o", mine.to_str().unwrap()])
+        .run()
+        .await;
+    assert_eq!(out.code, 1, "{out:?}");
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr.trim_end(), format!("beacon: {DOESNT_MATCH}"));
+    assert_eq!(std::fs::read_to_string(&mine).unwrap(), "precious");
+    assert_eq!(names_in(&dl), ["mine.txt"]);
+
+    // Into a directory, where the attachment's own name is that file.
+    let out = beacon(&node, &["get", "PEER0010", "-o", dl.to_str().unwrap()])
+        .run()
+        .await;
+    assert_eq!(out.code, 1, "{out:?}");
+    assert_eq!(std::fs::read_to_string(&mine).unwrap(), "precious");
+    assert_eq!(names_in(&dl), ["mine.txt"]);
+
+    // To a path that does not exist: it still does not.
+    let fresh = dl.join("fresh.txt");
+    let out = beacon(&node, &["get", "PEER0010", "-o", fresh.to_str().unwrap()])
+        .run()
+        .await;
+    assert_eq!(out.code, 1, "{out:?}");
+    assert!(!fresh.exists());
+    assert_eq!(names_in(&dl), ["mine.txt"]);
+
+    // To stdout the bytes have gone by, so all there is to do is say so. This
+    // is not something to try again: the post will never match.
+    let out = beacon(&node, &["get", "PEER0010"]).run().await;
+    assert_eq!(out.code, 1, "{out:?}");
+    assert_eq!(out.stderr.trim_end(), format!("beacon: {DOESNT_MATCH}"));
+    assert!(!out.stderr.contains("try again"), "{}", out.stderr);
+
+    // The hash is checked as well as the size: a blob that changed on disk.
+    let blob = node.dir.path().join("files").join(sha);
+    let mut rotten = std::fs::read(&blob).unwrap();
+    rotten[1234] ^= 0xff;
+    std::fs::write(&blob, rotten).unwrap();
+    let out = beacon(&node, &["get", &good, "-o", mine.to_str().unwrap()])
+        .run()
+        .await;
+    assert_eq!(out.code, 1, "{out:?}");
+    assert_eq!(out.stderr.trim_end(), format!("beacon: {DOESNT_MATCH}"));
+    assert_eq!(std::fs::read_to_string(&mine).unwrap(), "precious");
+    assert_eq!(names_in(&dl), ["mine.txt"]);
+}
+
+/// ...and a download that does match replaces what was there, whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_good_download_replaces_the_target_without_a_trace() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let created = beacon(
+        &node,
+        &[
+            "attach",
+            "beacon",
+            "-",
+            "--name",
+            "a.txt",
+            "--as",
+            "pc-configs",
+            "--json",
+        ],
+    )
+    .stdin("new contents")
+    .ok()
+    .await
+    .json();
+    let id = created["post"]["short_id"].as_str().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("a.txt");
+    std::fs::write(&target, "old contents, and longer").unwrap();
+    beacon(&node, &["get", id, "-o", target.to_str().unwrap()])
+        .ok()
+        .await;
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new contents");
+    assert_eq!(names_in(dir.path()), ["a.txt"]);
+}
+
+/// `attach -` reads a stdin that may never end. When the command is over,
+/// the process is too, whatever stdin is still doing.
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_exits_when_it_has_failed_even_if_stdin_stays_open() {
+    use std::process::Stdio;
+    let node = spawn_node("pc", &[]).await;
+    let run = beacon(
+        &node,
+        &[
+            "attach",
+            "nosuch",
+            "-",
+            "--name",
+            "x.txt",
+            "--as",
+            "pc-configs",
+        ],
+    );
+    let mut cmd = tokio::process::Command::from(run.command());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().expect("start beacon");
+    // The producer is slow: the write end stays open and nothing comes.
+    let _slow_producer = child.stdin.take().unwrap();
+    let started = std::time::Instant::now();
+    let status = tokio::time::timeout(Duration::from_secs(4), child.wait())
+        .await
+        .expect("beacon exits at once, not when stdin does")
+        .unwrap();
+    assert_eq!(status.code(), Some(2));
+    assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+/// A TCP stand-in for a node, in front of `upstream`. It forwards everything,
+/// counts the heartbeats that pass, and can be told to answer requests with a
+/// 500 instead.
+struct Proxy {
+    url: String,
+    heartbeats: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    refuse: std::sync::Arc<std::sync::Mutex<Option<(String, usize)>>>,
+}
+
+impl Proxy {
+    async fn start(upstream: &str) -> Proxy {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Mutex};
+        let upstream = upstream.trim_start_matches("http://").to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let heartbeats = Arc::new(AtomicUsize::new(0));
+        let refuse = Arc::new(Mutex::new(None));
+        let (counted, refusing) = (heartbeats.clone(), refuse.clone());
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                tokio::spawn(Proxy::connection(
+                    client,
+                    upstream.clone(),
+                    counted.clone(),
+                    refusing.clone(),
+                ));
+            }
+        });
+        Proxy {
+            url,
+            heartbeats,
+            refuse,
+        }
+    }
+
+    /// Answers the next `times` requests that start with `request_line` (for
+    /// example `GET /api/events`) with a 500, and does not forward them.
+    fn answer_with_500(&self, request_line: &str, times: usize) {
+        *self.refuse.lock().unwrap() = Some((request_line.to_string(), times));
+    }
+
+    fn heartbeats(&self) -> usize {
+        self.heartbeats.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn connection(
+        client: tokio::net::TcpStream,
+        upstream: String,
+        heartbeats: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        refuse: std::sync::Arc<std::sync::Mutex<Option<(String, usize)>>>,
+    ) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else {
+            return;
+        };
+        let (mut from_client, to_client) = client.into_split();
+        let (mut from_server, mut to_server) = server.into_split();
+        let to_client = std::sync::Arc::new(tokio::sync::Mutex::new(to_client));
+        let back = {
+            let to_client = to_client.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    match from_server.read(&mut buf).await {
+                        Ok(n) if n > 0 => {
+                            if to_client.lock().await.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                let _ = to_client.lock().await.shutdown().await;
+            })
+        };
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = match from_client.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => break,
+            };
+            let head = String::from_utf8_lossy(&buf[..n.min(256)]).into_owned();
+            if head.starts_with("POST /api/who ") {
+                heartbeats.fetch_add(1, Ordering::SeqCst);
+            }
+            let refused = match refuse.lock().unwrap().as_mut() {
+                Some((prefix, times)) if *times > 0 && head.starts_with(prefix.as_str()) => {
+                    *times -= 1;
+                    true
+                }
+                _ => false,
+            };
+            if refused {
+                let body = r#"{"v":1,"error":"the store is on fire","code":"internal"}"#;
+                let reply = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                if to_client
+                    .lock()
+                    .await
+                    .write_all(reply.as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+            if to_server.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+        back.abort();
+    }
+}
+
+/// `watch` runs for hours. It says it is here as `wait` does, so the handle
+/// does not go idle in `who` and then disappear while someone is listening.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_tells_the_node_it_is_still_here() {
+    let node = spawn_node("pc", &[]).await;
+    let proxy = Proxy::start(&node.url).await;
+    let before = listeners(&node);
+    let watch = beacon(&node, &["watch", "--as", "pc-vllm"])
+        .server(&proxy.url)
+        .env("BEACON_HEARTBEAT_SECS", "1")
+        .spawn();
+    until_listening(&node, before).await;
+    for _ in 0..80 {
+        if proxy.heartbeats() >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        proxy.heartbeats() >= 3,
+        "watch sent {} heartbeats in 8 s; stderr: {}",
+        proxy.heartbeats(),
+        watch.stderr()
+    );
+    watch.kill().await;
+}
+
+/// The node answering 5xx is the node having a bad moment, which `watch`
+/// waits out like any other outage.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_waits_out_a_node_that_answers_with_a_500() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    join_channel(&node, "pc-vllm", "beacon").await;
+    let proxy = Proxy::start(&node.url).await;
+    proxy.answer_with_500("GET /api/events", 2);
+
+    let before = listeners(&node);
+    let mut watch = beacon(&node, &["watch", "--as", "pc-vllm"])
+        .server(&proxy.url)
+        .spawn();
+    // Two refusals, pauses of 1 s and 2 s, then it is connected.
+    for _ in 0..100 {
+        if listeners(&node) > before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        listeners(&node) > before,
+        "watch gave up; stderr: {}",
+        watch.stderr()
+    );
+    assert!(
+        watch.stderr().contains("beacon: reconnecting…"),
+        "{}",
+        watch.stderr()
+    );
+    post_as(&node, "pc-configs", "beacon", "after the bad moment").await;
+    assert!(watch
+        .line()
+        .await
+        .ends_with("beacon pc-configs: after the bad moment"));
+    watch.kill().await;
+}
+
+/// A 5xx is still an error (exit 1) for a command that is not waiting
+/// anything out, and the client can tell it from other internal errors.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_500_is_an_internal_error_the_client_can_recognize() {
+    let node = spawn_node("pc", &[]).await;
+    let proxy = Proxy::start(&node.url).await;
+    proxy.answer_with_500("GET /api/events", 1);
+    let client = Client::new(&proxy.url, Some(SECRET)).unwrap();
+    let err = client.arrival_head().await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Internal(_)) && err.is_server_fault(),
+        "{err:?}"
+    );
+    assert_eq!(err.exit_code(), 1);
+    assert!(err.to_string().contains("the store is on fire"), "{err}");
+    // Other internal errors, and other kinds of error, are not.
+    assert!(!Error::Internal(anyhow::anyhow!("boom")).is_server_fault());
+    assert!(!Error::Usage("x".into()).is_server_fault());
+    // The route works again afterwards.
+    assert!(client.arrival_head().await.unwrap() >= 0);
+    let out = beacon(&node, &["channels"]).server(&proxy.url).ok().await;
+    assert!(out.stdout.contains("general"), "{}", out.stdout);
 }

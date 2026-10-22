@@ -30,7 +30,7 @@ use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
 
 use crate::api::*;
-use crate::error::Error;
+use crate::error::{Error, ServerFault};
 
 /// Where the node listens when `BEACON_SERVER` does not say (inside the
 /// container, and for a host that publishes the default port).
@@ -236,6 +236,9 @@ impl Client {
                 Some("not_found") => Error::NotFound(message),
                 Some("conflict") => Error::Conflict(message),
                 Some("auth") => Error::Auth,
+                _ if status.is_server_error() => {
+                    Error::Internal(anyhow::Error::new(ServerFault(message)))
+                }
                 _ => Error::Internal(anyhow!("{message}")),
             },
         }
