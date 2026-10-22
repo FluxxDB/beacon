@@ -132,6 +132,11 @@ pub async fn run(client: Client, cfg: TuiConfig) -> Result<(), Error> {
 /// stop`), SIGHUP (the terminal went away) or SIGINT (`kill -INT`; Ctrl-C
 /// itself arrives as a key in raw mode). Handling them replaces the default
 /// of dying on the spot, which would leave the terminal raw.
+///
+/// Inside Docker none of them comes when the `docker exec -it` client dies
+/// (measured with the client killed four ways: Docker neither signals the
+/// program nor closes its pty), so that TUI runs on until `q` or a container
+/// restart; the README's troubleshooting table says so.
 #[cfg(unix)]
 fn stop_signal() -> Result<impl std::future::Future<Output = ()>, Error> {
     use tokio::signal::unix::{signal, SignalKind};

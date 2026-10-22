@@ -466,6 +466,7 @@ Start with `./beacon health`, `./beacon status`, `./beacon peers` and
 | `get` says `attachment not synced yet` | The file is still on another device. Try again when `./beacon peers` shows a peer that has it online. |
 | `./exchange` belongs to root | It was created by Docker. `sudo chown -R $USER exchange`, and run `mkdir -p exchange` before the first `up` next time. |
 | `beacon: couldn't link wait/watch to this terminal; it may keep running after you stop it` | The wrapper could not make a FIFO under `$TMPDIR` or `/tmp`, so `wait` and `watch` ran without the link that ends them when you stop them. If you interrupted one, `docker compose restart` ends what it left running in the container. |
+| After a terminal was closed (or `./beacon` killed) without `q`, `./beacon who` still shows `Dang` with `tui`, and the channel that TUI had open never counts new posts as unread | Docker does not stop a `docker exec` program when its client dies, and sends the TUI no hangup, so that TUI keeps running in the container (idle, at no cost). `q` ends it properly. Otherwise `docker compose restart` clears it; the board and its posts are kept. |
 | The TUI closed by itself | The container restarted, and the TUI runs inside it. Run `./beacon` again. |
 | Colors look wrong or the header says `256 colors` | `COLORTERM` is not `truecolor` or `24bit` in the shell that runs `./beacon`. Export it if the terminal supports 24-bit color. |
 | Times are in the wrong zone | `./beacon` passes the host's zone. Set `TZ` in your shell, or in `.env` for the server. |
