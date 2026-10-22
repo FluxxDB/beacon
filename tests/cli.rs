@@ -3323,6 +3323,63 @@ async fn wait_wakes_for_mentions_and_announcements_not_for_chatter() {
     assert!(stdout.contains("announcement"), "{stdout}");
 }
 
+/// An answer that starts `re <id>:` reaches the author of that post with no
+/// mention of it and no join: a waiting `wait`, `watch`, a peek, the channel
+/// count, and `read --unread`, which marks it read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_to_your_post_wakes_you_without_a_mention_or_a_join() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let me = "mac-dispatch";
+    let question = post_as(&node, me, "beacon", "is task G merged yet?").await;
+    let short = question["post"]["short_id"].as_str().unwrap().to_string();
+    post_as(&node, "pc-configs", "beacon", "just chatter").await;
+    let out = beacon(&node, &["wait", "--timeout", "0", "--as", me])
+        .run()
+        .await;
+    assert_eq!(out.code, 6, "{out:?}");
+
+    let before = listeners(&node);
+    let mut wait = beacon(&node, &["wait", "--timeout", "10", "--as", me]).spawn();
+    until_listening(&node, before).await;
+    let before = listeners(&node);
+    let mut watch = beacon(&node, &["watch", "--as", me]).spawn();
+    until_listening(&node, before).await;
+    let answer = format!("re {short}: not yet, @Dang has it");
+    post_as(&node, "pc-beacon", "beacon", &answer).await;
+
+    let (code, stdout) = wait.finish_within(Duration::from_secs(2)).await;
+    assert_eq!(code, 0, "stderr: {}", wait.stderr());
+    assert!(stdout.contains(&answer), "{stdout}");
+    assert!(!stdout.contains("just chatter"), "{stdout}");
+    let line = watch.line().await;
+    assert!(
+        line.ends_with(&format!(" #beacon pc-beacon: {answer}")),
+        "{line}"
+    );
+    watch.kill().await;
+
+    let peek = beacon(&node, &["wait", "--timeout", "0", "--json", "--as", me])
+        .ok()
+        .await
+        .json();
+    assert_eq!(peek["posts"].as_array().unwrap().len(), 1, "{peek}");
+    assert_eq!(peek["posts"][0]["body"], answer.as_str());
+    let channels = beacon(&node, &["channels", "--json", "--as", me])
+        .ok()
+        .await
+        .json();
+    assert_eq!(channels["channels"][1]["name"], "beacon");
+    assert_eq!(channels["channels"][1]["unread"], 1);
+
+    let read = beacon(&node, &["read", "--unread", "--as", me]).ok().await;
+    assert!(read.stdout.contains(&answer), "{}", read.stdout);
+    let out = beacon(&node, &["wait", "--timeout", "0", "--as", me])
+        .run()
+        .await;
+    assert_eq!(out.code, 6, "now it is read: {out:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_json_is_the_unread_page() {
     let node = spawn_node("pc", &[]).await;

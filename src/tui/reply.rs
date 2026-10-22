@@ -8,7 +8,8 @@
 //! spaces and a post id: a short id (the last 8 characters of a ULID) or a
 //! whole 26-character ULID, in Crockford base32 of any case; then maybe `:`
 //! or `,`, then whitespace or the end of the body. Only that first id
-//! counts. An 8-character id with no digit may just be a word
+//! counts. That is [`crate::model::parse_reply`], which the store reads
+//! replies with too. An 8-character id with no digit may just be a word
 //! (`re branches:`; about 1 in 20 real short ids has none), so its line
 //! shows only once the post it names is found.
 //!
@@ -27,18 +28,11 @@ use std::borrow::Cow;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::api::PostJson;
+use crate::model::names_post as names;
+pub use crate::model::{parse_reply as parse, Reply};
 use crate::tui::convert;
 use crate::tui::state::{App, Cmd, PostItem};
 use crate::tui::widgets::posts;
-
-/// What a reply's body says it answers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Reply<'a> {
-    /// The id it names, uppercase: 8 characters, or a whole ULID.
-    pub id: String,
-    /// The body after `re <id>:` and the whitespace that follows it.
-    pub rest: &'a str,
-}
 
 impl Reply<'_> {
     /// Whether the id has a digit, as every whole ULID and most short ids
@@ -51,63 +45,6 @@ impl Reply<'_> {
 /// Most graphemes of a quote kept: far more than any pane shows (the line
 /// is cut to it anyway), so one huge line does not sit in the cache whole.
 const QUOTE_MAX: usize = 1_000;
-
-/// Length of a short id, and of a whole ULID.
-const SHORT_ID: usize = 8;
-const ULID: usize = 26;
-
-/// The reply `body` is, if it is one.
-pub fn parse(body: &str) -> Option<Reply<'_>> {
-    let after_re = body
-        .get(..2)
-        .filter(|re| re.eq_ignore_ascii_case("re"))
-        .map(|_| &body[2..])?;
-    let at_id = after_re.trim_start_matches(' ');
-    if at_id.len() == after_re.len() {
-        return None;
-    }
-    let id_len = at_id
-        .find(|c: char| !c.is_ascii_alphanumeric())
-        .unwrap_or(at_id.len());
-    let (id, after_id) = at_id.split_at(id_len);
-    if !is_post_id(id) {
-        return None;
-    }
-    let after_mark = after_id.strip_prefix([':', ',']).unwrap_or(after_id);
-    let rest = after_mark.trim_start();
-    if !after_mark.is_empty() && rest.len() == after_mark.len() {
-        return None;
-    }
-    Some(Reply {
-        id: id.to_ascii_uppercase(),
-        rest,
-    })
-}
-
-/// A short id, or a whole ULID (whose first character is at most `7`).
-fn is_post_id(id: &str) -> bool {
-    let crockford = id.chars().all(|c| {
-        matches!(
-            c.to_ascii_uppercase(),
-            '0'..='9' | 'A'..='H' | 'J' | 'K' | 'M' | 'N' | 'P'..='T' | 'V'..='Z'
-        )
-    });
-    crockford
-        && match id.len() {
-            SHORT_ID => true,
-            ULID => id.starts_with(|c: char| ('0'..='7').contains(&c)),
-            _ => false,
-        }
-}
-
-/// Whether `reference`, an id a reply names (uppercase), names the post
-/// whose id is `id`: the same ULID, or its last 8 characters.
-fn names(reference: &str, id: &str) -> bool {
-    id.len()
-        .checked_sub(reference.len())
-        .and_then(|start| id.get(start..))
-        .is_some_and(|tail| tail.eq_ignore_ascii_case(reference))
-}
 
 /// What a reply's line says of the post it answers, ready to draw.
 #[derive(Debug, Clone, PartialEq, Eq)]

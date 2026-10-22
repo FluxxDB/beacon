@@ -126,7 +126,7 @@ pub enum Command {
         /// Channel to leave (a leading # is fine)
         channel: String,
     },
-    /// Block until a mention, an announcement or a joined channel's post arrives
+    /// Block until a mention, an announcement, a reply to your post or a joined channel's post arrives
     Wait(WaitArgs),
     /// Print a line for each such post, as it arrives, until stopped
     Watch,

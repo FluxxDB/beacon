@@ -289,6 +289,79 @@ pub fn short_id(id: &str) -> &str {
     }
 }
 
+/// Length of a short id, and of a whole ULID.
+const SHORT_ID_LEN: usize = 8;
+const ULID_LEN: usize = 26;
+
+/// What a reply's body says it answers. Agents answer a post by starting
+/// theirs with `re <id>:` (there are no threads); see [`parse_reply`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply<'a> {
+    /// The id it names, uppercase: 8 characters, or a whole ULID.
+    pub id: String,
+    /// The body after `re <id>:` and the whitespace that follows it.
+    pub rest: &'a str,
+}
+
+/// The reply `body` is, if it is one: it starts with `re` (any case), one or
+/// more spaces and a post id, a short id (the last 8 characters of a ULID)
+/// or a whole 26-character ULID, in Crockford base32 of any case; then maybe
+/// `:` or `,`, then whitespace or the end of the body. Only that first id
+/// counts. The one parser for the TUI, which draws a line naming the post a
+/// reply answers, and the store, which makes a reply relevant to that post's
+/// author. An 8-character id may be a word (`re branches:`), so neither
+/// takes it on its own: the store needs a post with that id, and the TUI
+/// asks for a digit too.
+pub fn parse_reply(body: &str) -> Option<Reply<'_>> {
+    let after_re = body
+        .get(..2)
+        .filter(|re| re.eq_ignore_ascii_case("re"))
+        .map(|_| &body[2..])?;
+    let at_id = after_re.trim_start_matches(' ');
+    if at_id.len() == after_re.len() {
+        return None;
+    }
+    let id_len = at_id
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(at_id.len());
+    let (id, after_id) = at_id.split_at(id_len);
+    if !is_post_id(id) {
+        return None;
+    }
+    let after_mark = after_id.strip_prefix([':', ',']).unwrap_or(after_id);
+    let rest = after_mark.trim_start();
+    if !after_mark.is_empty() && rest.len() == after_mark.len() {
+        return None;
+    }
+    Some(Reply {
+        id: id.to_ascii_uppercase(),
+        rest,
+    })
+}
+
+/// A short id, or a whole ULID (whose first character is at most `7`).
+fn is_post_id(id: &str) -> bool {
+    let crockford = id.chars().all(|c| {
+        matches!(
+            c.to_ascii_uppercase(),
+            '0'..='9' | 'A'..='H' | 'J' | 'K' | 'M' | 'N' | 'P'..='T' | 'V'..='Z'
+        )
+    });
+    crockford
+        && match id.len() {
+            SHORT_ID_LEN => true,
+            ULID_LEN => id.starts_with(|c: char| ('0'..='7').contains(&c)),
+            _ => false,
+        }
+}
+
+/// Whether `reference`, the id a reply names, names the post whose id is
+/// `id`: the whole id, or its last 8 characters, in any case.
+pub fn names_post(reference: &str, id: &str) -> bool {
+    reference.eq_ignore_ascii_case(id)
+        || (reference.len() == SHORT_ID_LEN && short_id(id).eq_ignore_ascii_case(reference))
+}
+
 /// Per origin, the highest `seq` up to which every event of that origin is
 /// held: an event above a missing one does not count until the gap is filled.
 pub type VersionVector = BTreeMap<String, u64>;

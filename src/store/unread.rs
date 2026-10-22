@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rusqlite::{params, Connection};
 
 use super::{post_row, sql_limit, PostRow, Result, Store, POST_COLUMNS};
-use crate::model::{mentions_handle, normalize_channel};
+use crate::model::{mentions_handle, names_post, normalize_channel, parse_reply, short_id};
 
 /// The shown posts (as in `SHOWN_POSTS`) that are new to handle `?1`: not its
 /// own (case-insensitive) and arrived after its cursor for the channel. Ends
@@ -33,14 +33,28 @@ const NEW_FROM_OTHERS: &str = "visible_channels AS v CROSS JOIN posts AS p ON p.
 /// Further conditions for the ones relevant to handle `?1`: the SQL twin of the
 /// rule in [`Store::is_relevant`] (its first clause, not own, is in
 /// [`NEW_FROM_OTHERS`]); a test keeps the two agreeing.
+///
+/// A reply (`p.reply_to`, the id it names) is relevant to the author of a
+/// post here, deleted or not, whose whole id it names or whose id ends in the
+/// short id it names. Finding that post is one lookup in
+/// `posts_by_short_id`, made only for the new posts that are replies.
 const RELEVANT: &str = concat!(
     "
     AND (p.author_kind = 'human'
          OR ",
     mentions_sql!("?1"),
     "
-         OR p.channel IN (SELECT j.channel FROM joins AS j WHERE j.handle = ?1))"
+         OR p.channel IN (SELECT j.channel FROM joins AS j WHERE j.handle = ?1)
+         OR (p.reply_to IS NOT NULL AND EXISTS (
+             SELECT 1 FROM posts AS answered
+             WHERE upper(substr(answered.id, -8)) = substr(p.reply_to, -8)
+               AND (length(p.reply_to) = 8 OR upper(answered.id) = p.reply_to)
+               AND lower(answered.author) = lower(?1))))"
 );
+
+/// The id and author of every post here, deleted or not, whose id ends in
+/// the short id `?1` (uppercase), from `posts_by_short_id`.
+const SAME_SHORT_ID: &str = "SELECT id, author FROM posts WHERE upper(substr(id, -8)) = ?1";
 
 /// A page of what is new for a handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,12 +116,36 @@ impl Store {
 
     /// Whether `p` is relevant to `handle`, who joined `joins`: not its own
     /// post (case-insensitive), and an announcement, a mention of it (or of
-    /// `@all`), or a post in a channel it joined.
-    pub fn is_relevant(&self, p: &PostRow, handle: &str, joins: &[String]) -> bool {
-        !p.author.eq_ignore_ascii_case(handle)
-            && (p.announcement()
-                || mentions_handle(&p.mentions, handle)
-                || joins.contains(&p.channel))
+    /// `@all`), a post in a channel it joined, or a reply to one of its
+    /// posts.
+    pub fn is_relevant(&self, p: &PostRow, handle: &str, joins: &[String]) -> Result<bool> {
+        if p.author.eq_ignore_ascii_case(handle) {
+            return Ok(false);
+        }
+        if p.announcement() || mentions_handle(&p.mentions, handle) || joins.contains(&p.channel) {
+            return Ok(true);
+        }
+        self.answers_a_post_by(p, handle)
+    }
+
+    /// Whether `p` is a reply (`re <id>`, read by [`parse_reply`]) to a post
+    /// here by `handle` (case-insensitive), deleted or not: one whose id is
+    /// the one it names, or ends in it when that is a short id. A post that
+    /// has not arrived yet is not here, so its replies count once it is (if
+    /// the cursor of their channel has not passed them by then).
+    fn answers_a_post_by(&self, p: &PostRow, handle: &str) -> Result<bool> {
+        let Some(reply) = parse_reply(&p.body) else {
+            return Ok(false);
+        };
+        let mut stmt = self.conn.prepare_cached(SAME_SHORT_ID)?;
+        let mut rows = stmt.query([short_id(&reply.id)])?;
+        while let Some(row) = rows.next()? {
+            let (id, author): (String, String) = (row.get(0)?, row.get(1)?);
+            if names_post(&reply.id, &id) && author.eq_ignore_ascii_case(handle) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The first `limit` unread posts for `handle`: shown posts that are
@@ -249,34 +287,58 @@ mod tests {
     use super::*;
 
     /// Every unread query reads posts through `posts_by_arrival`, past the
-    /// cursor, and never scans the whole table.
+    /// cursor, and never scans the whole table. The ones that pick what is
+    /// relevant find the post a reply answers with one index lookup.
     #[test]
     fn unread_queries_read_only_what_is_new() {
         let s = Store::open_in_memory("pc").unwrap();
-        for sql in [
-            unread_sql(),
-            count_unread_sql(),
-            counts_sql(),
-            relevant_counts_sql(),
-            announcements_sql(),
+        for (sql, relevant) in [
+            (unread_sql(), true),
+            (count_unread_sql(), true),
+            (counts_sql(), false),
+            (relevant_counts_sql(), true),
+            (announcements_sql(), false),
         ] {
-            let mut stmt = s
-                .conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                .unwrap();
-            let args: [&dyn rusqlite::ToSql; 2] = [&"h", &50];
-            let args = &args[..stmt.parameter_count()];
-            let plan: Vec<String> = stmt
-                .query_map(args, |r| r.get(3))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap();
-            let plan = plan.join("\n");
+            let plan = query_plan(&s, &sql);
             assert!(
                 plan.contains("SEARCH p USING INDEX posts_by_arrival (channel=? AND arrival>?)"),
                 "{sql}\n{plan}"
             );
             assert!(!plan.contains("SCAN p"), "{sql}\n{plan}");
+            assert_eq!(
+                plan.contains("SEARCH answered USING INDEX posts_by_short_id (<expr>=?)"),
+                relevant,
+                "{sql}\n{plan}"
+            );
+            assert!(!plan.contains("SCAN answered"), "{sql}\n{plan}");
         }
+    }
+
+    /// `Store::is_relevant` finds the posts a reply may answer with one
+    /// index lookup too: the relevant stream (`watch`) asks it per post.
+    #[test]
+    fn the_rust_rule_finds_the_answered_post_by_index() {
+        let s = Store::open_in_memory("pc").unwrap();
+        assert_eq!(
+            query_plan(&s, SAME_SHORT_ID),
+            "SEARCH posts USING INDEX posts_by_short_id (<expr>=?)"
+        );
+    }
+
+    /// SQLite's plan for `sql`, one step per line, with `?1` a handle and
+    /// `?2` (if any) a limit.
+    fn query_plan(s: &Store, sql: &str) -> String {
+        let mut stmt = s
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let args: [&dyn rusqlite::ToSql; 2] = [&"h", &50];
+        let args = &args[..stmt.parameter_count()];
+        let plan: Vec<String> = stmt
+            .query_map(args, |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        plan.join("\n")
     }
 }
