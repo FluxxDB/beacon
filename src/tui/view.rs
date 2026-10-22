@@ -29,9 +29,9 @@ use crate::tui::wrap::{display_width, wrap};
 pub const SIDEBAR_WIDE: u16 = 23;
 /// Sidebar inner width from 80 to 99 columns; below 80 there is no sidebar.
 pub const SIDEBAR_NARROW: u16 = 21;
-/// Narrowest terminal with a sidebar. Below it, and while `shift-e` hides
-/// the sidebar, the main pane takes the full width and the channel
-/// switcher row stands in for the sidebar.
+/// Narrowest terminal with a sidebar. Below it, and while `shift-e` or
+/// `space e` hides the sidebar, the main pane takes the full width and the
+/// channel switcher row stands in for the sidebar.
 pub const SIDEBAR_MIN_WIDTH: u16 = 80;
 /// Narrowest terminal the board is drawn in at all.
 pub const MIN_WIDTH: u16 = 40;
@@ -49,7 +49,7 @@ pub const MIN_HEIGHT: u16 = ROWS_ABOVE_POSTS + 1 + 1 + 3 + ROWS_BELOW_COMPOSER;
 pub struct Layout {
     pub area: Rect,
     /// The sidebar's inner columns over the body rows (none below 80
-    /// columns, or while `shift-e` hides it).
+    /// columns, or while `shift-e` or `space e` hides it).
     pub sidebar: Option<Rect>,
     /// The main pane's columns over the body rows.
     pub main: Rect,

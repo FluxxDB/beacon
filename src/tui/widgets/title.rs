@@ -1,6 +1,6 @@
 //! The main pane's title row (`# beacon   topic`) and its rule, and the
 //! one-line channel switcher that stands in for the sidebar below 80 columns
-//! or while `shift-e` hides it.
+//! or while `shift-e` or `space e` hides it.
 
 use crate::tui::state::{possessive, App, Focus, Selection};
 use crate::tui::theme::{palette, role, Ink};

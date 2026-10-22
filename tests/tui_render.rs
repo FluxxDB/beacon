@@ -1940,6 +1940,351 @@ mod behaviour {
         assert_eq!(app.input, "");
     }
 
+    // ------------------------------------------- space: the leader (XNPVKNHP)
+
+    /// What the footer says while `space` waits for the chord's next key.
+    const LEADER_HINT: &str = "e sidebar · esc cancel";
+
+    fn space() -> Msg {
+        ch(' ')
+    }
+
+    /// The footer's key row, drawn at the app's terminal size.
+    fn footer(app: &App) -> String {
+        let (width, height) = app.size;
+        row_text(
+            &render(app, TRUECOLOR, width, height),
+            layout_of(app).help_y,
+        )
+    }
+
+    /// The posts focused on the newest post, the sidebar shown.
+    fn in_the_posts() -> App {
+        let mut app = live_app();
+        app.update(key(KeyCode::Tab));
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Posts, false));
+        app
+    }
+
+    #[test]
+    fn space_in_the_posts_arms_the_leader_and_says_so_in_the_footer() {
+        let mut app = in_the_posts();
+        assert!(!footer(&app).contains(LEADER_HINT));
+        assert!(app.update(space()).is_empty());
+        assert_eq!(app.focus, Focus::Posts, "the composer stays out of it");
+        assert_eq!(app.input, "", "nothing typed");
+        assert!(sidebar_drawn(&app));
+        let foot = footer(&app);
+        assert!(foot.contains(LEADER_HINT), "|{foot}|");
+        // In the toast's place, two cells before the frame's corner, in the
+        // filter hint's ink: mist on the board, never the accent.
+        let buf = screen(&app);
+        let y = layout_of(&app).help_y;
+        let start = column_of(&buf, y, LEADER_HINT).unwrap();
+        let end = start + LEADER_HINT.chars().count() as u16;
+        assert_eq!(end, W - 3, "|{foot}|");
+        for x in start..end {
+            let cell = &buf[(x, y)];
+            assert_eq!(
+                (cell.fg, cell.bg),
+                (rgb(role::TEXT), rgb(role::MAIN_BG)),
+                "({x},{y})"
+            );
+        }
+        // A second space is just the leader again: still nothing typed.
+        app.update(space());
+        assert_eq!((app.focus, app.input.as_str()), (Focus::Posts, ""));
+        assert!(footer(&app).contains(LEADER_HINT));
+    }
+
+    #[test]
+    fn space_e_in_the_posts_shows_a_hidden_sidebar_and_goes_there() {
+        let mut app = live_app();
+        app.hide_sidebar = true;
+        app.update(key(KeyCode::Tab));
+        assert!(!sidebar_drawn(&app));
+        assert!(feed(&mut app, [space(), ch('e')]).is_empty());
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Sidebar, false));
+        assert!(sidebar_drawn(&app));
+        assert_eq!(app.input, "");
+        assert!(!footer(&app).contains(LEADER_HINT), "the chord is done");
+        // j/k move in it at once.
+        assert_eq!(
+            app.update(ch('j')),
+            [Cmd::LoadPosts {
+                channel: "beacon".to_string(),
+                before: None
+            }]
+        );
+    }
+
+    #[test]
+    fn space_e_in_the_posts_hides_a_shown_sidebar_and_stays_there() {
+        let mut app = in_the_posts();
+        let post = app.selected_post.clone();
+        assert!(post.is_some());
+        assert!(feed(&mut app, [space(), ch('e')]).is_empty());
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Posts, true));
+        assert!(!sidebar_drawn(&app));
+        assert_eq!(app.selected_post, post, "the same post selected");
+        assert_eq!(app.input, "");
+        assert!(!footer(&app).contains(LEADER_HINT));
+        // Still in the posts: j/k pick posts.
+        app.update(ch('k'));
+        assert_eq!(app.selected_post.as_deref(), Some(ulid(1).as_str()));
+    }
+
+    #[test]
+    fn space_e_hiding_the_sidebar_keeps_the_selected_post_in_view() {
+        // As with shift-e: the posts wrap anew at the full width, and the
+        // selection at the bottom of the pane must not drop out of view.
+        let mut app = at_the_oldest_of_long_posts();
+        for _ in 0..5 {
+            app.update(ch('j'));
+        }
+        assert!(app.scroll > 0);
+        feed(&mut app, [space(), ch('e')]);
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Posts, true));
+        let buf = screen(&app);
+        assert!(
+            (0..H).any(|y| buf[(1, y)].symbol() == "▍"),
+            "the selected post's edge is on screen:\n{}",
+            rows(&buf).join("\n")
+        );
+    }
+
+    #[test]
+    fn space_e_in_the_sidebar_hides_it_and_goes_to_the_composer() {
+        let mut app = in_the_posts();
+        app.update(shift_e());
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.update(space());
+        assert_eq!(app.focus, Focus::Sidebar, "space arms the leader here too");
+        assert!(footer(&app).contains(LEADER_HINT));
+        assert!(app.update(ch('e')).is_empty());
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Composer, true));
+        assert!(!sidebar_drawn(&app));
+        assert_eq!(app.input, "");
+        assert!(!footer(&app).contains(LEADER_HINT));
+    }
+
+    #[test]
+    fn space_capital_e_works_the_same() {
+        // With SHIFT, as crossterm reports it, and without, as some
+        // terminals send it.
+        for capital in [shift_e(), ch('E')] {
+            let mut app = in_the_posts();
+            // Shown: hidden, the posts keep the keys.
+            feed(&mut app, [space(), capital.clone()]);
+            assert_eq!((app.focus, app.hide_sidebar), (Focus::Posts, true));
+            // Hidden: shown, and the sidebar has the keys.
+            feed(&mut app, [space(), capital.clone()]);
+            assert_eq!((app.focus, app.hide_sidebar), (Focus::Sidebar, false));
+            // From the sidebar: hidden, on to the composer.
+            feed(&mut app, [space(), capital]);
+            assert_eq!((app.focus, app.hide_sidebar), (Focus::Composer, true));
+            assert_eq!(app.input, "");
+        }
+    }
+
+    #[test]
+    fn space_esc_cancels_and_does_nothing_else() {
+        let mut app = live_app();
+        type_text(&mut app, "draft");
+        app.update(key(KeyCode::Tab));
+        feed(&mut app, [ch('/'), ch('@'), ch('p'), ch('c')]);
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.filter.as_deref(), Some("@pc"));
+        assert_eq!(app.focus, Focus::Posts);
+
+        feed(&mut app, [space(), key(KeyCode::Esc)]);
+        assert_eq!(app.filter.as_deref(), Some("@pc"), "the filter stays");
+        assert_eq!(
+            (app.focus, app.hide_sidebar, app.input.as_str()),
+            (Focus::Posts, false, "draft")
+        );
+        assert!(!app.clear_armed, "nothing armed in the composer");
+        assert!(!footer(&app).contains(LEADER_HINT), "the hint is gone");
+        // Cancelled: the next Esc is an Esc again.
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.filter, None);
+
+        // Back in the composer, one Esc only arms its clear, as always.
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Composer);
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.input, "draft");
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn space_j_cancels_then_moves_down() {
+        // The next post down (newer), as if space had not been pressed.
+        let mut app = in_the_posts();
+        app.update(ch('k'));
+        assert_eq!(app.selected_post.as_deref(), Some(ulid(1).as_str()));
+        feed(&mut app, [space(), ch('j')]);
+        assert_eq!(app.selected_post.as_deref(), Some(ulid(2).as_str()));
+        assert_eq!((app.focus, app.input.as_str()), (Focus::Posts, ""));
+        assert!(!footer(&app).contains(LEADER_HINT));
+        // ...and in the sidebar, the next channel.
+        app.update(shift_e());
+        app.update(space());
+        assert_eq!(
+            app.update(ch('j')),
+            [Cmd::LoadPosts {
+                channel: "beacon".to_string(),
+                before: None
+            }]
+        );
+        assert!(!footer(&app).contains(LEADER_HINT));
+    }
+
+    #[test]
+    fn space_x_cancels_then_types_x_in_the_composer() {
+        // A stray key: it jumps to the composer and types itself, without
+        // the space before it.
+        let mut app = in_the_posts();
+        feed(&mut app, [space(), ch('x')]);
+        assert_eq!((app.focus, app.input.as_str()), (Focus::Composer, "x"));
+        assert!(!footer(&app).contains(LEADER_HINT));
+    }
+
+    #[test]
+    fn space_tab_cancels_then_moves_focus() {
+        let mut app = in_the_posts();
+        feed(&mut app, [space(), key(KeyCode::Tab)]);
+        assert_eq!((app.focus, app.input.as_str()), (Focus::Composer, ""));
+        assert!(!app.hide_sidebar);
+        assert!(!footer(&app).contains(LEADER_HINT));
+
+        // From the sidebar, shift-tab goes to the posts as always.
+        let mut app = in_the_posts();
+        app.update(shift_e());
+        feed(&mut app, [space(), key(KeyCode::BackTab)]);
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Posts, false));
+        assert!(!footer(&app).contains(LEADER_HINT));
+        // The chord is over: e is a stray e again.
+        app.update(ch('e'));
+        assert_eq!((app.focus, app.input.as_str()), (Focus::Composer, "e"));
+        assert!(!app.hide_sidebar);
+    }
+
+    #[test]
+    fn space_in_the_composer_types_a_space() {
+        for hidden in [false, true] {
+            let mut app = live_app();
+            app.hide_sidebar = hidden;
+            type_text(&mut app, "a b e");
+            assert_eq!(app.input, "a b e", "hidden: {hidden}");
+            assert_eq!((app.focus, app.hide_sidebar), (Focus::Composer, hidden));
+            assert!(!footer(&app).contains(LEADER_HINT));
+        }
+    }
+
+    #[test]
+    fn space_in_the_filter_is_left_out_as_before() {
+        // A tag or handle has no spaces, so the filter drops one; it never
+        // arms the leader, so the e after it is typed into the filter.
+        let mut app = in_the_posts();
+        feed(&mut app, [ch('/'), ch('c'), ch('l'), space(), ch('e')]);
+        assert!(app.filter_editing);
+        assert_eq!(app.filter.as_deref(), Some("cle"));
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Posts, false));
+        let foot = footer(&app);
+        assert!(
+            foot.contains("esc clear") && !foot.contains(LEADER_HINT),
+            "|{foot}|"
+        );
+    }
+
+    #[test]
+    fn space_in_a_dialog_never_arms_the_leader() {
+        // Any key closes the help, space too, and does nothing else.
+        let mut app = in_the_posts();
+        feed(&mut app, [ch('?'), space()]);
+        assert_eq!(app.dialog, None);
+        assert!(!footer(&app).contains(LEADER_HINT));
+        app.update(ch('e'));
+        assert_eq!((app.focus, app.input.as_str()), (Focus::Composer, "e"));
+        assert!(!app.hide_sidebar);
+    }
+
+    #[test]
+    fn below_80_columns_space_e_moves_to_and_from_the_switcher() {
+        // No sidebar to show or hide: like shift-e, space e goes to the
+        // switcher and on to the composer, and the hidden flag stays as it
+        // was, either way.
+        for hidden in [false, true] {
+            let mut app = live_app();
+            app.hide_sidebar = hidden;
+            app.update(Msg::Resize(79, 24));
+            let narrow = layout_of(&app);
+            assert_eq!(narrow.sidebar, None);
+            app.update(key(KeyCode::Tab));
+            app.update(space());
+            assert!(footer(&app).contains(LEADER_HINT), "|{}|", footer(&app));
+            app.update(ch('e'));
+            assert_eq!((app.focus, app.hide_sidebar), (Focus::Sidebar, hidden));
+            assert!(!footer(&app).contains(LEADER_HINT));
+            feed(&mut app, [space(), ch('e')]);
+            assert_eq!((app.focus, app.hide_sidebar), (Focus::Composer, hidden));
+            assert_eq!((app.input.as_str(), app.toast.as_deref()), ("", None));
+            assert_eq!(layout_of(&app), narrow);
+        }
+    }
+
+    #[test]
+    fn a_resize_while_armed_cancels_the_leader() {
+        let mut app = in_the_posts();
+        feed(&mut app, [space(), Msg::Resize(W, H)]);
+        assert!(!footer(&app).contains(LEADER_HINT));
+        app.update(ch('e'));
+        assert_eq!((app.focus, app.input.as_str()), (Focus::Composer, "e"));
+        assert!(!app.hide_sidebar);
+
+        // Across the 80-column line too.
+        let mut app = in_the_posts();
+        feed(&mut app, [space(), Msg::Resize(79, 24)]);
+        assert!(!footer(&app).contains(LEADER_HINT));
+        app.update(ch('e'));
+        assert_eq!((app.focus, app.input.as_str()), (Focus::Composer, "e"));
+    }
+
+    #[test]
+    fn a_paste_while_armed_cancels_the_leader() {
+        let mut app = in_the_posts();
+        feed(&mut app, [space(), Msg::Paste("hi".to_string())]);
+        assert_eq!((app.focus, app.input.as_str()), (Focus::Composer, "hi"));
+        assert!(!footer(&app).contains(LEADER_HINT));
+        app.update(ch('e'));
+        assert_eq!(app.input, "hie");
+        assert!(!app.hide_sidebar);
+    }
+
+    #[test]
+    fn focus_moving_while_armed_cancels_the_leader() {
+        // A channel made with n lands while space waits: the composer takes
+        // the keys, and e is typed there rather than hide the sidebar.
+        let mut app = in_the_posts();
+        app.update(space());
+        app.update(Msg::Created(Ok(ChannelAck {
+            v: 1,
+            ok: true,
+            created: true,
+            channel: ChannelJson {
+                name: "gpu-jobs".to_string(),
+                topic: None,
+                unread: None,
+            },
+        })));
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(!footer(&app).contains(LEADER_HINT));
+        app.update(ch('e'));
+        assert_eq!((app.input.as_str(), app.hide_sidebar), ("e", false));
+    }
+
     // ------------------------------------------------------------ sidebar
 
     #[test]
@@ -2253,10 +2598,12 @@ mod behaviour {
         }
         // The longest keys keep two spaces before what they do.
         assert!(text.contains("tab  shift-tab  posts, composer"), "{text}");
+        // space e and shift-e share a row, so the list still fits 80×24.
         assert!(
-            text.contains("shift-e         go to or hide the sidebar"),
+            text.contains("space e  E      show/hide sidebar; E: go to it"),
             "{text}"
         );
+        assert!(!text.contains("shift-e "), "{text}");
         assert!(accent_cells(&screen(&app)).len() <= 1, "no primary action");
         // At 80×24 it still fits, every row whole, sidebar shown or hidden,
         // and above the footer: its rule and key row stay whole.

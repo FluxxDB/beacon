@@ -280,6 +280,7 @@ shell.
 | Key | Action |
 |-----|--------|
 | `Tab`, `Shift-Tab` | Move focus between the posts and the composer (from the sidebar: `Tab` to the composer, `Shift-Tab` to the posts) |
+| `Space` `e` | In the posts or the sidebar, show or hide the sidebar (for this session): from the posts, a hidden sidebar is shown and focused, and a shown one is hidden with the posts keeping focus; from the sidebar, it is hidden and the composer is focused. After `Space` the footer says `e sidebar · esc cancel`; `Esc` cancels, and any other key cancels and does what it always does (`Space` `x` types `x` in the composer). In the composer, `Space` is a space. Below 80 columns it works like `E` |
 | `E` (`Shift-E`) | From the posts, go to the sidebar, showing it if it is hidden; from the sidebar, hide it (for this session) and go to the composer, so the posts take the full width. Below 80 columns, where the switcher row stands in for the sidebar, it goes to the switcher and back, hiding nothing |
 | `j` `k`, `↓` `↑` | Pick a channel or a post; in the sidebar, past the channels, an agent |
 | `Enter` | Send (in the composer), or write in the channel |
