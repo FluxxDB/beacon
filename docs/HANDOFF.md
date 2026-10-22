@@ -4,7 +4,7 @@ Beacon v1 is built, reviewed, merged into `main`, pushed to `FluxxDB/beacon`, an
 
 ## State
 
-- **Code:** one Rust crate, `main` (merged from `build/v1`). 466 tests pass (`cargo test`), clippy, fmt and shellcheck are clean. It was built task by task from
+- **Code:** one Rust crate, `main` (merged from `build/v1`). about 600 tests pass (`cargo test`), clippy, fmt and shellcheck are clean. It was built task by task from
   `docs/superpowers/plans/2026-10-21-beacon.md` with a spec + quality review per task, a whole-branch review on the strongest model, and one final fix wave that was re-reviewed clean.
 - **Running on the PC:** `docker compose up -d` stack `beacon` (node `pc`, userspace-Tailscale override, `127.0.0.1:7700`), image `beacon:local` ≈ 14 MB, healthy. `.env` is filled (gitignored). The board holds only smoke-test posts.
 - **PC Tailscale:** `--socks5-server=localhost:1055` was added to `~/.config/systemd/user/tailscaled.service` and the service restarted. Verified end to end: a request through the proxy to `http://soybean-wsl:7700/api/health` reaches beacon.
@@ -23,6 +23,15 @@ Beacon v1 is built, reviewed, merged into `main`, pushed to `FluxxDB/beacon`, an
    - **Still open:** Dang's visual check of the TUI side by side in iTerm2 and Windows Terminal.
 4. **Log in the `claude` CLI on the PC** if you want the real `claude -p` skill check (the subagent stand-in passed).
 5. ~~**Switch agent coordination to beacon.**~~ Done 2026-10-22: announced in Slack #bots and on beacon `#general`; `#beacon` created for beacon work; `CLAUDE.md` updated. Agents no longer use Slack at all, not even as a fallback (if beacon is down, tell Dang).
+
+7. **TUI requests from Dang on #beacon (2026-10-22), all done and on `main` `7b0a8a5`, live on the PC; the Mac was asked to update.**
+   - Blue accent #4099ff (SFRR8WM4), `@` ghost autocomplete (4WWPC2MT), forgetting stale agents (SQNNRGX8).
+   - A Discord-style reply line above `re <id>` posts (PV0QMR51). An 8-character id with no digit only draws once it resolves, so `re branches:` stays plain.
+   - A real cursor in the composer: arrows, Home/End, word jumps, editing at the cursor (PV0QMR51).
+   - The composer sits directly on the footer (A8ZNNG64). This is the third approved deviation from the mockup fixtures, noted in `docs/design/extract_mockup.py`.
+   - `Esc` `Esc` clears the composer (KW1WZ5B5).
+   - `Shift-E` is the only way into the sidebar and hides it (KW1WZ5B5, 4EGGVSTT, 9ZP1XCYP). Tab cycles posts ↔ composer only. The sidebar starts shown; say if it should start hidden.
+   - The help overlay is 14 rows, which is exactly what the board holds at 80×24. A guard test fails if a row is added: merge rows instead.
 
 6. **Dispatcher sessions** (added 2026-10-22, fixed after review the same day): on each device, `git pull` and `./beacon skill install all` first, so the device has the new command, scripts and skill. Then open a Claude Code session in the repo just for the dispatcher, in bypass permissions mode (or auto mode: workers are background subagents and get stuck on any permission prompt), ideally on Sonnet, and run `/loop 2m /dispatch` (`/loop 5m` is cheaper). Every device then always has an agent checking the board (README → "A dispatcher session per device").
 
