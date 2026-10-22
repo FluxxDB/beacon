@@ -2,6 +2,8 @@
 //! (unicode-width, via ratatui's [`CellWidth`] so they agree with the buffer),
 //! and text is only ever cut between grapheme clusters.
 
+use std::ops::Range;
+
 use ratatui::buffer::CellWidth;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -32,22 +34,42 @@ fn cells(s: &str) -> usize {
 /// at a break; a word longer than a line starts on a fresh line and is broken
 /// between graphemes. Nothing but those spaces is dropped.
 pub fn wrap(text: &str, width: u16) -> Vec<String> {
+    wrap_ranges(text, width)
+        .into_iter()
+        .map(|line| text[line].to_string())
+        .collect()
+}
+
+/// The lines [`wrap`] makes, each as the bytes of `text` it shows. Between
+/// one line and the next there is nothing but the spaces dropped at a soft
+/// break, or a hard break's `\n` (and any indentation dropped after it). An
+/// empty line at the end of a paragraph sits at the paragraph's end.
+pub fn wrap_ranges(text: &str, width: u16) -> Vec<Range<usize>> {
     let width = usize::from(width.max(1));
     let mut lines = Vec::new();
+    let mut start = 0;
     for paragraph in text.split('\n') {
-        wrap_paragraph(paragraph, width, &mut lines);
+        wrap_paragraph(paragraph, start, width, &mut lines);
+        start += paragraph.len() + 1;
     }
     lines
 }
 
-fn wrap_paragraph(paragraph: &str, width: usize, lines: &mut Vec<String>) {
-    let mut line = String::new();
+/// Wraps one paragraph that starts at byte `base` of the text.
+fn wrap_paragraph(paragraph: &str, base: usize, width: usize, lines: &mut Vec<Range<usize>>) {
+    // The line being filled, as bytes of the paragraph; empty while nothing
+    // is on it.
+    let mut line = 0..0;
     let mut line_w = 0usize;
     // Whether `line` started at a soft break: spaces there are dropped.
     let mut after_break = false;
     // `split(' ')` yields an empty word for each extra space, which keeps
     // runs of spaces inside a line.
+    let mut word_start = 0;
     for (i, word) in paragraph.split(' ').enumerate() {
+        let start = word_start;
+        let end = start + word.len();
+        word_start = end + 1;
         let at_break = after_break && line.is_empty();
         if at_break && word.is_empty() {
             continue;
@@ -55,45 +77,53 @@ fn wrap_paragraph(paragraph: &str, width: usize, lines: &mut Vec<String>) {
         let word_w = cells(word);
         let gap = usize::from(i > 0 && !at_break);
         if line_w + gap + word_w <= width {
-            if gap == 1 {
-                line.push(' ');
+            // The gap is the space just before the word.
+            if line.is_empty() {
+                line.start = start - gap;
             }
-            line.push_str(word);
+            line.end = end;
             line_w += gap + word_w;
             continue;
         }
         // The word goes on a new line; a line of nothing but indentation is
         // dropped rather than left blank.
-        if line.trim_start_matches(' ').is_empty() {
-            line.clear();
+        if paragraph[line.clone()].trim_start_matches(' ').is_empty() {
+            line = 0..0;
         } else {
-            push_line(lines, &mut line);
+            push_line(paragraph, base, lines, &mut line);
             after_break = true;
         }
         line_w = 0;
         if word_w <= width {
-            line.push_str(word);
+            line = start..end;
             line_w = word_w;
             continue;
         }
         // Longer than a whole line: break it between graphemes.
-        for g in word.graphemes(true) {
+        for (offset, g) in word.grapheme_indices(true) {
             let g_w = usize::from(grapheme_width(g));
             if line_w + g_w > width && !line.is_empty() {
-                push_line(lines, &mut line);
+                push_line(paragraph, base, lines, &mut line);
                 line_w = 0;
             }
-            line.push_str(g);
+            if line.is_empty() {
+                line.start = start + offset;
+            }
+            line.end = start + offset + g.len();
             line_w += g_w;
         }
     }
-    lines.push(line);
+    if line.is_empty() {
+        line = paragraph.len()..paragraph.len();
+    }
+    lines.push(base + line.start..base + line.end);
 }
 
-fn push_line(lines: &mut Vec<String>, line: &mut String) {
-    let trimmed = line.trim_end_matches(' ').len();
-    line.truncate(trimmed);
-    lines.push(std::mem::take(line));
+/// Ends `line` (without its trailing spaces) and starts an empty one.
+fn push_line(paragraph: &str, base: usize, lines: &mut Vec<Range<usize>>, line: &mut Range<usize>) {
+    let kept = paragraph[line.clone()].trim_end_matches(' ').len();
+    lines.push(base + line.start..base + line.start + kept);
+    *line = 0..0;
 }
 
 /// `s` cut to at most `width` cells, ending in `…` when anything was cut.

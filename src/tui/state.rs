@@ -84,6 +84,21 @@ pub struct App {
     pub me: String,
     /// The composer's text.
     pub input: String,
+    /// Where the composer's cursor is, as how many bytes of `input` come
+    /// after it (0: at the end, where typing appends). Counted from the end
+    /// so that text leaving the front (a post once sent) or a whole new
+    /// `input` leaves it in place. Read and set it with [`App::cursor`] and
+    /// [`App::set_cursor`].
+    pub cursor_from_end: usize,
+    /// The column `↑` `↓` aim for through rows of different lengths; any
+    /// other key forgets it.
+    pub cursor_goal: Option<u16>,
+    /// The first input row the composer shows when there are more than fit:
+    /// it scrolls only as far as it must to keep the cursor in view.
+    pub composer_top: usize,
+    /// One `Esc` in a composer with text arms a clear, and the next one
+    /// empties it; any other key disarms it.
+    pub clear_armed: bool,
     /// What the keys did to the `@handle` being typed (its ghost).
     pub mention: Option<Mention>,
     pub focus: Focus,
@@ -161,6 +176,10 @@ impl App {
             last_sync_ms: None,
             me: me.into(),
             input: String::new(),
+            cursor_from_end: 0,
+            cursor_goal: None,
+            composer_top: 0,
+            clear_armed: false,
             mention: None,
             focus: Focus::Composer,
             dialog: None,
@@ -508,6 +527,7 @@ impl App {
         let agent_at = self.selected_agent_index();
         let mut cmds = self.apply(msg);
         self.sync_mention();
+        self.keep_cursor_in_view();
         self.keep_agent_cursor(agent_at);
         // Back down at the newest (by a key, a resize, a deletion or a sent
         // post), or the filter gone: what was out of sight is seen now.

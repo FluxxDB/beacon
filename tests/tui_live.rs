@@ -330,9 +330,10 @@ async fn attach_save_and_delete_through_the_keys() {
         })
         .await;
 
-        // Attach: the composer's text goes with the file.
+        // Attach: the composer's text goes with the file. Shift-Tab leaves
+        // for the posts with it kept (Esc would arm a clear).
         tui.type_text("my notes");
-        tui.press(KeyCode::Esc);
+        tui.press(KeyCode::BackTab);
         tui.press(KeyCode::Char('a'));
         tui.until(Duration::from_secs(5), "the picker", |s| {
             s.contains("Attach a file") && s.contains("notes.txt")

@@ -1742,7 +1742,8 @@ mod behaviour {
     fn attach_picker_uploads_with_the_composer_text() {
         let mut app = live_app();
         type_text(&mut app, "the log");
-        app.update(key(KeyCode::Esc));
+        // To the posts with the text kept (Esc would arm a clear).
+        app.update(key(KeyCode::BackTab));
         assert_eq!(app.update(ch('a')), [Cmd::ListFiles]);
         assert!(screen_text(&app).contains("Reading ./exchange…"));
         let file = |name: &str, minutes_ago: i64| ExchangeFile {

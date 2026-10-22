@@ -4,9 +4,17 @@
 //! open dialog takes the key, then the `/` filter while it is being typed,
 //! then the focused pane:
 //!
-//! * **Composer:** printable keys type (so `q` is just a letter here);
-//!   `Enter` sends, `Shift-Enter`, `Alt-Enter` or `Ctrl-J` start a new line;
-//!   `Esc` leaves for the posts.
+//! * **Composer:** printable keys type at the cursor (so `q` is just a
+//!   letter here), and so does a paste; `←` `→` move the cursor a grapheme,
+//!   with `Ctrl` or `Alt` (or `Alt-b` `Alt-f`) a word; `Home` `End`
+//!   (`Ctrl-A` `Ctrl-E`) go to the ends of the line; `↑` `↓` go to the row
+//!   above or below, keeping the column (on one row they do nothing);
+//!   `Backspace` and `Delete` take the grapheme before and after it
+//!   ([`crate::tui::cursor`]). `Enter` sends the whole text; `Shift-Enter`,
+//!   `Alt-Enter` or `Ctrl-J` start a new line. `Esc` with text arms a clear
+//!   (the box says `esc again to clear`) and a second `Esc` empties it; any
+//!   other key disarms it. In an empty composer `Esc` clears the filter, or
+//!   leaves for the posts.
 //! * **Sidebar and posts:** `j`/`k` and the arrows move (in the sidebar that
 //!   opens the channel; past the last channel the cursor goes on through the
 //!   agent rows, where `d` forgets one), `n` `a` `s` `d` `/` `?` `q` are
@@ -15,14 +23,16 @@
 //! * Anywhere: `Tab`/`Shift-Tab` cycle the focus, `PgUp`/`PgDn` scroll the
 //!   posts, `Esc` clears the filter.
 //! * **`@` ghost** ([`crate::tui::mention`]): while the composer shows one,
-//!   `Tab` takes it, `↑`/`↓` pick another match and `Esc` puts it away;
-//!   without one those keys do what they always do.
+//!   `Tab` takes it, `↑`/`↓` pick another match and `Esc` puts it away (that
+//!   `Esc` neither arms nor fires a clear); without one those keys do what
+//!   they always do.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::model::{normalize_channel, BODY_MAX, TOPIC_MAX};
 use crate::timefmt::{clock_12h, day_label};
+use crate::tui::cursor::Motion;
 use crate::tui::state::{
     possessive, App, AttachPicker, Cmd, ConfirmDialog, Dialog, Focus, FormField, NewChannelForm,
     Selection, CHANNEL_NAME_MAX, FILTER_MAX, NAME_RULE,
@@ -31,7 +41,7 @@ use crate::tui::widgets::posts::{self, Span};
 
 /// What every key in the help overlay does, in its order.
 /// Each description fits the dialog at 80 columns.
-pub const HELP: [(&str, &str); 14] = [
+pub const HELP: [(&str, &str); 15] = [
     ("tab  shift-tab", "channels, posts, composer"),
     ("j k  ↓ ↑", "pick a channel or a post"),
     ("enter", "send, or write in the channel"),
@@ -42,7 +52,8 @@ pub const HELP: [(&str, &str); 14] = [
     ("s", "save the post's file"),
     ("d", "delete, or forget an agent"),
     ("/", "filter by tag or @handle"),
-    ("esc", "clear filter, leave composer"),
+    ("esc", "filter off, leave empty composer"),
+    ("esc esc", "clear the composer"),
     ("?", "this help"),
     ("q", "quit (not from the composer)"),
     ("ctrl-c", "quit from anywhere"),
@@ -59,6 +70,8 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Vec::new();
         }
+        // Any key but a second `Esc` in the composer disarms its clear.
+        let armed = std::mem::take(&mut self.clear_armed);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && matches!(key.code, KeyCode::Char('c' | 'C')) {
             return vec![Cmd::Quit];
@@ -85,7 +98,7 @@ impl App {
             KeyCode::PageUp => return self.page(true),
             KeyCode::PageDown => return self.page(false),
             KeyCode::Esc => {
-                self.escape();
+                self.escape(armed);
                 return Vec::new();
             }
             _ => {}
@@ -99,6 +112,7 @@ impl App {
     /// Pasted text goes where typed text would, all of it at once: a paste
     /// with newlines never sends.
     pub(crate) fn on_paste(&mut self, text: &str) -> Vec<Cmd> {
+        self.clear_armed = false;
         match &mut self.dialog {
             Some(Dialog::NewChannel(form)) => {
                 for c in text.chars() {
@@ -123,6 +137,28 @@ impl App {
 
     fn composer_key(&mut self, key: &KeyEvent) -> Vec<Cmd> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let motion = match key.code {
+            KeyCode::Left if ctrl || alt => Some(Motion::WordLeft),
+            KeyCode::Right if ctrl || alt => Some(Motion::WordRight),
+            KeyCode::Left => Some(Motion::Left),
+            KeyCode::Right => Some(Motion::Right),
+            KeyCode::Home => Some(Motion::LineStart),
+            KeyCode::End => Some(Motion::LineEnd),
+            KeyCode::Up => Some(Motion::Up),
+            KeyCode::Down => Some(Motion::Down),
+            KeyCode::Char('a' | 'A') if ctrl => Some(Motion::LineStart),
+            KeyCode::Char('e' | 'E') if ctrl => Some(Motion::LineEnd),
+            // Readline's M-b and M-f, which macOS terminals often send for
+            // Option-← and Option-→.
+            KeyCode::Char('b') if alt && !ctrl => Some(Motion::WordLeft),
+            KeyCode::Char('f') if alt && !ctrl => Some(Motion::WordRight),
+            _ => None,
+        };
+        if let Some(motion) = motion {
+            self.move_cursor(motion);
+            return Vec::new();
+        }
         match key.code {
             KeyCode::Enter
                 if key
@@ -139,7 +175,11 @@ impl App {
             }
             KeyCode::Enter => self.send(),
             KeyCode::Backspace => {
-                pop_grapheme(&mut self.input);
+                self.delete_before_cursor();
+                Vec::new()
+            }
+            KeyCode::Delete => {
+                self.delete_after_cursor();
                 Vec::new()
             }
             _ => {
@@ -152,15 +192,19 @@ impl App {
     }
 
     /// `Tab`, `↑` `↓` and `Esc` while the composer shows a ghost: take it
-    /// (and a space), pick another match, put it away. Whether the key was
-    /// the ghost's.
+    /// (and a space, unless one follows already), pick another match, put
+    /// it away. Whether the key was the ghost's.
     fn ghost_key(&mut self, key: &KeyEvent) -> bool {
         let Some(ghost) = self.ghost() else {
             return false;
         };
         match key.code {
             KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.insert_text(&format!("{} ", ghost.rest));
+                if self.input[self.cursor()..].starts_with(' ') {
+                    self.insert_text(&ghost.rest);
+                } else {
+                    self.insert_text(&format!("{} ", ghost.rest));
+                }
             }
             KeyCode::Down => self.pick_mention(&ghost, true),
             KeyCode::Up => self.pick_mention(&ghost, false),
@@ -191,20 +235,24 @@ impl App {
         }]
     }
 
-    /// Adds `text` to the composer: line breaks as `\n`, no other control
-    /// characters but tabs, and no more than a post can hold.
+    /// Puts `text` in the composer at the cursor: line breaks as `\n`, no
+    /// other control characters but tabs, and no more than a post can hold.
     fn insert_text(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut room = BODY_MAX.saturating_sub(self.input.len());
+        let mut kept = String::new();
         for c in text.chars() {
             if c.is_control() && c != '\n' && c != '\t' {
                 continue;
             }
-            if self.input.len() + c.len_utf8() > BODY_MAX {
+            if c.len_utf8() > room {
                 self.error(BODY_FULL);
                 break;
             }
-            self.input.push(c);
+            room -= c.len_utf8();
+            kept.push(c);
         }
+        self.insert_at_cursor(&kept);
     }
 
     // ------------------------------------------------- sidebar and posts
@@ -418,8 +466,18 @@ impl App {
         }
     }
 
-    fn escape(&mut self) {
-        if self.filter.is_some() {
+    /// `Esc`: in a composer with text, arms a clear, or with one `armed`
+    /// empties it (Dang wanted `Esc` `Esc` to clear the box, as in Claude
+    /// Code); otherwise clears the filter, or leaves an empty composer for
+    /// the posts.
+    fn escape(&mut self, armed: bool) {
+        if self.focus == Focus::Composer && !self.input.is_empty() {
+            if armed {
+                self.clear_input();
+            } else {
+                self.clear_armed = true;
+            }
+        } else if self.filter.is_some() {
             self.set_filter(None);
         } else if self.focus == Focus::Composer {
             self.focus = Focus::Posts;

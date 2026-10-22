@@ -284,9 +284,14 @@ fn esc_puts_the_ghost_away_for_this_word() {
     type_text(&mut app, "@");
     assert_eq!(offered(&app).as_deref(), Some("pc-configs"));
 
-    // Esc without a ghost still leaves the composer.
+    // Esc without a ghost is the composer's own again: with text it arms a
+    // clear, then clears (tests/tui_composer.rs), and leaves an empty one.
     app.update(key(KeyCode::Esc));
     assert_eq!(app.focus, Focus::Composer);
+    app.update(key(KeyCode::Esc));
+    assert_eq!((app.focus, app.input.as_str()), (Focus::Composer, "@"));
+    app.update(key(KeyCode::Esc));
+    assert_eq!((app.focus, app.input.as_str()), (Focus::Composer, ""));
     app.update(key(KeyCode::Esc));
     assert_eq!(app.focus, Focus::Posts);
 }
