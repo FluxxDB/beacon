@@ -1,0 +1,97 @@
+<!doctype html>
+<!--
+  One frame of the TUI in a terminal, for docs/screenshots/render.sh.
+
+  frame.html?ans=PATH&cols=N&rows=N reads PATH, a frame the ignored
+  screenshot_frames test in tests/tui_render.rs wrote (24-bit ANSI), and
+  writes it into an xterm.js terminal of that size. Chromium lets a file://
+  page read another file only with --allow-file-access-from-files. Once the
+  frame is drawn the page shows it, sets <body data-size="W,H"> (its size in
+  CSS pixels) and data-viewport (the window's), and the title "ready"; a
+  failure goes in the title.
+
+  The terminal is the one docs/design/tui-mockup.html embeds, in vendor/:
+  @xterm/xterm 5.5.0 and @xterm/addon-canvas 0.7.0 (MIT), with the font
+  JetBrains Mono 2.304 (SIL OFL 1.1), Regular and SemiBold for bold.
+-->
+<meta charset="utf-8">
+<title>beacon frame</title>
+<link rel="stylesheet" href="vendor/xterm.css">
+<style>
+  @font-face {
+    font-family: "JetBrains Mono";
+    font-weight: 400;
+    src: url("vendor/JetBrainsMono-Regular.woff2") format("woff2");
+  }
+  @font-face {
+    font-family: "JetBrains Mono";
+    font-weight: 600;
+    src: url("vendor/JetBrainsMono-SemiBold.woff2") format("woff2");
+  }
+  html, body { margin: 0; background: #08090a; }
+  /* A terminal's own padding, in the board's background (void). */
+  #shot { display: inline-block; padding: 14px 20px; visibility: hidden; }
+  body.ready #shot { visibility: visible; }
+</style>
+<div id="shot"><div id="term"></div></div>
+<script src="vendor/xterm.js"></script>
+<script src="vendor/addon-canvas.js"></script>
+<script>
+  const FONT = 15;
+  const params = new URLSearchParams(location.search);
+
+  function frame(path) {
+    const xhr = new XMLHttpRequest();
+    xhr.open("GET", path, false);
+    xhr.overrideMimeType("text/plain; charset=utf-8");
+    xhr.send();
+    if (!xhr.responseText) throw new Error(`can't read ${path}`);
+    return xhr.responseText;
+  }
+
+  function ready() {
+    const shot = document.getElementById("shot").getBoundingClientRect();
+    document.body.dataset.size = `${Math.ceil(shot.width)},${Math.ceil(shot.height)}`;
+    document.body.dataset.viewport = `${innerWidth},${innerHeight}`;
+    document.body.classList.add("ready");
+    document.title = "ready";
+  }
+
+  async function show() {
+    const ansi = frame(params.get("ans"));
+    await document.fonts.load(`400 ${FONT}px "JetBrains Mono"`);
+    await document.fonts.load(`600 ${FONT}px "JetBrains Mono"`);
+    const term = new Terminal({
+      cols: Number(params.get("cols")),
+      rows: Number(params.get("rows")),
+      fontFamily: '"JetBrains Mono", monospace',
+      fontSize: FONT,
+      lineHeight: 1.12,
+      fontWeightBold: 600,
+      // Box drawing and blocks drawn to fill their cells, so rules join.
+      customGlyphs: true,
+      cursorBlink: false,
+      disableStdin: true,
+      theme: { background: "#08090a", foreground: "#d0d6e0", cursor: "#08090a", cursorAccent: "#08090a" },
+    });
+    term.open(document.getElementById("term"));
+    term.loadAddon(new CanvasAddon.CanvasAddon());
+    // Hide the cursor, write the frame (it ends on its last row), and show
+    // it once every row has been drawn. Not on a later animation frame:
+    // headless Chromium draws none until something changes.
+    term.write("\x1b[?25l" + ansi, () => {
+      let top = term.rows;
+      let bottom = -1;
+      const drawn = term.onRender(({ start, end }) => {
+        top = Math.min(top, start);
+        bottom = Math.max(bottom, end);
+        if (top === 0 && bottom === term.rows - 1) {
+          drawn.dispose();
+          ready();
+        }
+      });
+    });
+  }
+
+  show().catch((e) => { document.title = `error: ${e.message}`; });
+</script>

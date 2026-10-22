@@ -4263,3 +4263,283 @@ mod behaviour {
         assert!(text.contains("post 2"), "{text}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Screenshots for the README (docs/screenshots/render.sh)
+// ---------------------------------------------------------------------------
+
+mod screenshots {
+    use super::*;
+
+    use beacon::tui::state::Msg;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::Rect;
+    use ratatui::style::Style;
+
+    /// One screenshot: the board the README shows, at a terminal size.
+    struct Scene {
+        /// The PNG's name in `docs/screenshots/`.
+        name: &'static str,
+        width: u16,
+        height: u16,
+        app: App,
+    }
+
+    impl Scene {
+        fn new(name: &'static str, (width, height): (u16, u16), mut app: App) -> Scene {
+            app.update(Msg::Resize(width, height));
+            Scene {
+                name,
+                width,
+                height,
+                app,
+            }
+        }
+
+        fn buf(&self) -> Buffer {
+            render(&self.app, TRUECOLOR, self.width, self.height)
+        }
+
+        fn press(mut self, keys: &str) -> Scene {
+            for c in keys.chars() {
+                let code = match c {
+                    '\t' => KeyCode::Tab,
+                    c => KeyCode::Char(c),
+                };
+                self.app
+                    .update(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+            }
+            self
+        }
+    }
+
+    /// The mockup's board with one more post, pc-configs answering pc-vllm's
+    /// from further up with `re <id>:`, and nothing in the composer yet.
+    fn with_a_reply() -> App {
+        let mut app = mockup_app();
+        app.posts.push(post(
+            "01JAN0000000000000000000A7",
+            at(18, 38),
+            "pc-configs",
+            Some("claude-code"),
+            "pc",
+            "re 000000A5: build job is done, the GPU is yours",
+            &[],
+            &[],
+        ));
+        app.input.clear();
+        app
+    }
+
+    /// Every scene, in the README's order. Each starts from the mockup's
+    /// board (never the live one) and gets where it shows by keys.
+    fn scenes() -> Vec<Scene> {
+        let size = (104, 33);
+        vec![
+            // The approved mockup as it is.
+            Scene::new("board", size, mockup_app()),
+            // `tab` to the posts, `k` `k` up to the post with a file, `space` `e`.
+            Scene::new("sidebar-hidden", size, mockup_app()).press("\tkk e"),
+            // Dang starts an `@` mention under the reply.
+            Scene::new("reply-and-mention", size, with_a_reply()).press("@mac"),
+            // `tab` to the posts, `?`. At 80×24 the box covers nearly all
+            // of the posts; here the board shows around it.
+            Scene::new("help", size, mockup_app()).press("\t?"),
+        ]
+    }
+
+    /// The row of `buf` that holds `needle`.
+    fn row_with(buf: &Buffer, needle: &str) -> u16 {
+        (0..buf.area.height)
+            .find(|&y| row_text(buf, y).contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} is not on screen:\n{}", rows(buf).join("\n")))
+    }
+
+    /// The README's captions say what each screenshot shows; if a change to
+    /// the TUI makes one show something else, this fails rather than the
+    /// next `render.sh` quietly drawing it.
+    #[test]
+    fn the_screenshots_show_what_the_readme_says() {
+        let scenes = scenes();
+        let names: Vec<&str> = scenes.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            ["board", "sidebar-hidden", "reply-and-mention", "help"]
+        );
+        let [board, hidden, reply, help] = &scenes[..] else {
+            unreachable!()
+        };
+
+        // The board is the approved mockup, glyph for glyph and in its colors.
+        let buf = board.buf();
+        assert_eq!(rows(&buf), fixture_rows("board"));
+        assert_colors_match_fixture(&buf, "board", 0..33);
+
+        // `space e` hid the sidebar; the posts keep the keys, and the post
+        // with the file is selected.
+        let buf = hidden.buf();
+        let text = rows(&buf).join("\n");
+        assert!(hidden.app.hide_sidebar);
+        assert_eq!(hidden.app.focus, Focus::Posts);
+        assert_eq!(
+            hidden.app.selected_post.as_deref(),
+            Some("01JAN0000000000000000000A4")
+        );
+        assert!(
+            !text.contains("CHANNELS") && !text.contains("AGENTS"),
+            "{text}"
+        );
+        // The pane starts at the frame's edge: its first column is the edge rule.
+        let selected = row_with(&buf, "arm64 image builds");
+        assert_eq!(buf[(1, selected)].symbol(), "▍", "{text}");
+
+        // The reply's line names the post it answers, which is on screen
+        // above it; the composer shows `@mac` and the ghost of the rest.
+        let buf = reply.buf();
+        let text = rows(&buf).join("\n");
+        let line = row_with(&buf, "╭─ pc-vllm  vllm needs ~14 GB of VRAM");
+        assert!(
+            row_text(&buf, line + 1).contains("6:38 pm  pc-configs"),
+            "{text}"
+        );
+        assert!(
+            row_text(&buf, line + 2).contains(" build job is done"),
+            "{text}"
+        );
+        assert!(row_with(&buf, "6:33 pm  pc-vllm") < line, "{text}");
+        assert!(!text.contains("re 000000A5"), "{text}");
+        assert_eq!(reply.app.input, "@mac");
+        assert_eq!(
+            reply.app.ghost().map(|g| g.handle).as_deref(),
+            Some("mac-juicebox")
+        );
+        assert!(
+            text.contains("› @mac-juicebox") && text.contains(" tab complete "),
+            "{text}"
+        );
+
+        // `?` opened the help over the board.
+        let buf = help.buf();
+        let text = rows(&buf).join("\n");
+        assert_eq!(help.app.dialog, Some(Dialog::Help));
+        assert!(
+            text.contains("Keys") && text.contains("esc close"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# beacon   the agent message board"),
+            "{text}"
+        );
+
+        // Every one in 24-bit color, every cell painted, and the accent
+        // only where it may be: the active channel's and announcements'
+        // edges, the prompt and the caret (none behind the help).
+        for scene in &scenes {
+            let buf = scene.buf();
+            for (i, cell) in buf.content().iter().enumerate() {
+                let at = buf.pos_of(i);
+                assert!(matches!(cell.fg, Color::Rgb(..)), "{}: {at:?}", scene.name);
+                assert!(matches!(cell.bg, Color::Rgb(..)), "{}: {at:?}", scene.name);
+            }
+            let allowed: Cells = if scene.app.dialog.is_some() {
+                Cells::new()
+            } else {
+                let sites = accent_sites(&buf, &scene.app);
+                let carets = sites
+                    .carets
+                    .iter()
+                    .filter(|_| scene.app.focus == Focus::Composer);
+                sites
+                    .edges
+                    .iter()
+                    .chain(&sites.prompt)
+                    .chain(carets)
+                    .copied()
+                    .collect()
+            };
+            assert_eq!(accent_cells(&buf), allowed, "{}", scene.name);
+        }
+    }
+
+    /// Writes each scene's frame as `NAME.ans` (24-bit ANSI, for
+    /// `docs/screenshots/frame.html`) and `NAME.txt` (its text, to compare
+    /// the PNG with), and lists them in `scenes` as `NAME COLS ROWS` lines,
+    /// into `$BEACON_SCREENSHOTS_DIR` (by default `target/screenshots`).
+    #[test]
+    #[ignore = "writes the README's frames: docs/screenshots/render.sh runs it"]
+    fn screenshot_frames() {
+        let dir = std::env::var_os("BEACON_SCREENSHOTS_DIR").map_or_else(
+            || concat!(env!("CARGO_MANIFEST_DIR"), "/target/screenshots").into(),
+            std::path::PathBuf::from,
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut list = String::new();
+        for scene in scenes() {
+            let buf = scene.buf();
+            let file = |ext: &str| dir.join(format!("{}.{ext}", scene.name));
+            std::fs::write(file("ans"), ansi_frame(&buf)).unwrap();
+            std::fs::write(file("txt"), rows(&buf).join("\n") + "\n").unwrap();
+            list += &format!("{} {} {}\n", scene.name, scene.width, scene.height);
+        }
+        std::fs::write(dir.join("scenes"), list).unwrap();
+    }
+
+    /// `buf` as a terminal receives it: each run of cells in one style
+    /// starts with a full SGR (reset, bold, 24-bit foreground and
+    /// background), every row ends with a reset, and rows are joined by
+    /// CRLF. A cell a wide glyph covers is left out: the terminal fills it.
+    fn ansi_frame(buf: &Buffer) -> String {
+        let area = buf.area;
+        let rows: Vec<String> = (area.top()..area.bottom())
+            .map(|y| {
+                let mut row = String::new();
+                let mut ink = None;
+                let mut hidden = 0u16;
+                for x in area.left()..area.right() {
+                    let cell = &buf[(x, y)];
+                    if hidden == 0 {
+                        let style = (cell.fg, cell.bg, cell.modifier.contains(Modifier::BOLD));
+                        if ink != Some(style) {
+                            row.push_str(&sgr(style));
+                            ink = Some(style);
+                        }
+                        row.push_str(cell.symbol());
+                    }
+                    hidden = hidden.max(cell.symbol().cell_width()).saturating_sub(1);
+                }
+                row + "\x1b[0m"
+            })
+            .collect();
+        rows.join("\r\n")
+    }
+
+    /// The SGR that sets one cell's ink from scratch.
+    fn sgr((fg, bg, bold): (Color, Color, bool)) -> String {
+        let color = |c: Color, base: u8| match c {
+            Color::Rgb(r, g, b) => format!("{base};2;{r};{g};{b}"),
+            Color::Reset => (base + 1).to_string(),
+            other => panic!("screenshots are 24-bit, not {other:?}"),
+        };
+        let weight = if bold { "1;" } else { "" };
+        format!("\x1b[0;{weight}{};{}m", color(fg, 38), color(bg, 48))
+    }
+
+    #[test]
+    fn a_frame_is_24_bit_sgr_row_by_row() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 2));
+        let ink = Style::new().fg(Color::Rgb(1, 2, 3)).bg(Color::Rgb(4, 5, 6));
+        buf.set_string(0, 0, "ab", ink);
+        buf.set_string(2, 0, "c", ink.add_modifier(Modifier::BOLD));
+        // A wide glyph covers the cell after it, which the terminal fills.
+        buf.set_string(0, 1, "界", ink);
+        buf.set_string(2, 1, "d", ink);
+        assert_eq!(
+            ansi_frame(&buf),
+            "\x1b[0;38;2;1;2;3;48;2;4;5;6mab\x1b[0;1;38;2;1;2;3;48;2;4;5;6mc\x1b[0m\r\n\
+             \x1b[0;38;2;1;2;3;48;2;4;5;6m界d\x1b[0m"
+        );
+        // A cell left at the terminal's default colors says so.
+        let blank = Buffer::empty(Rect::new(0, 0, 2, 1));
+        assert_eq!(ansi_frame(&blank), "\x1b[0;39;49m  \x1b[0m");
+    }
+}
