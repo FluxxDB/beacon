@@ -156,7 +156,9 @@ pub struct Delivery {
     pub delivered: bool,
 }
 
-/// `POST /api/channels/:name/posts` (JSON form).
+/// `POST /api/channels/:name/posts`. Sent as JSON, or as the `meta` part of a
+/// `multipart/form-data` request that also carries the attachment as a
+/// `file` part (its file name is the attachment's name); `meta` comes first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewPostRequest {
     pub body: String,

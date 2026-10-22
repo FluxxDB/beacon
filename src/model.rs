@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::blobs::is_sha256;
 use crate::error::Error;
 
 /// One immutable change to the board, keyed by `(origin, seq)`.
@@ -84,6 +85,14 @@ const TAG_MAX: usize = 24;
 pub const BODY_MAX: usize = 64 * 1024;
 /// Longest attachment name, in bytes.
 pub const ATTACHMENT_NAME_MAX: usize = 255;
+/// Longest client name (`claude-code`, `tui`, ...), in bytes.
+pub const CLIENT_MAX: usize = 64;
+/// Longest presence status, in bytes.
+pub const STATUS_MAX: usize = 200;
+/// Longest channel topic, in bytes.
+pub const TOPIC_MAX: usize = 200;
+/// Most tags on one post.
+pub const TAGS_MAX: usize = 8;
 
 fn is_handle_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
@@ -131,6 +140,70 @@ pub fn validate_tag(s: &str) -> Result<String, Error> {
             "invalid tag {s:?}: use 1-{TAG_MAX} characters from a-z, 0-9 and '-'"
         )))
     }
+}
+
+/// Checks free text: at most `max` bytes (not characters), and no control
+/// character (Unicode category Cc) other than the ones in `allowed`.
+fn check_text(what: &str, text: &str, max: usize, allowed: &[char]) -> Result<(), Error> {
+    if text.len() > max {
+        return Err(Error::Usage(format!(
+            "{what} is {} bytes, over the {max}-byte limit",
+            text.len()
+        )));
+    }
+    if let Some(c) = text
+        .chars()
+        .find(|c| c.is_control() && !allowed.contains(c))
+    {
+        return Err(Error::Usage(format!(
+            "{what} contains a control character (U+{:04X})",
+            u32::from(c)
+        )));
+    }
+    Ok(())
+}
+
+/// Checks a client name: at most [`CLIENT_MAX`] bytes, no control characters.
+pub fn validate_client(s: &str) -> Result<(), Error> {
+    check_text("client", s, CLIENT_MAX, &[])
+}
+
+/// Checks a presence status: at most [`STATUS_MAX`] bytes, no control characters.
+pub fn validate_status(s: &str) -> Result<(), Error> {
+    check_text("status", s, STATUS_MAX, &[])
+}
+
+/// Checks a channel topic: at most [`TOPIC_MAX`] bytes, no control characters.
+pub fn validate_topic(s: &str) -> Result<(), Error> {
+    check_text("topic", s, TOPIC_MAX, &[])
+}
+
+/// Checks how many tags a post has: at most [`TAGS_MAX`].
+pub fn validate_tag_count(count: usize) -> Result<(), Error> {
+    if count > TAGS_MAX {
+        return Err(Error::Usage(format!(
+            "a post can have at most {TAGS_MAX} tags, not {count}"
+        )));
+    }
+    Ok(())
+}
+
+/// Checks a post body's characters: no control character but `\n` and `\t`.
+/// (The size limit, [`BODY_MAX`], is checked apart, because an API answers it
+/// differently.)
+pub fn validate_body_text(s: &str) -> Result<(), Error> {
+    check_text("post body", s, usize::MAX, &['\n', '\t'])
+}
+
+/// Checks an attachment name: 1 to [`ATTACHMENT_NAME_MAX`] bytes, no control
+/// characters.
+pub fn validate_attachment_name(s: &str) -> Result<(), Error> {
+    if s.is_empty() || s.len() > ATTACHMENT_NAME_MAX {
+        return Err(Error::Usage(format!(
+            "attachment name must be 1-{ATTACHMENT_NAME_MAX} bytes"
+        )));
+    }
+    check_text("attachment name", s, ATTACHMENT_NAME_MAX, &[])
 }
 
 /// Finds the `@handle` mentions in a post body: lowercased, deduplicated, in
@@ -215,8 +288,11 @@ pub fn format_vv(vv: &VersionVector) -> String {
 
 /// Checks an event against the rules local input is held to: `seq` from 1 to
 /// `i64::MAX`; channel names already normalized; handles, tags and lowercase
-/// mentions valid; a body of at most [`BODY_MAX`] bytes; an attachment name of
-/// 1 to [`ATTACHMENT_NAME_MAX`] bytes and a size SQLite can store.
+/// mentions valid; at most [`TAGS_MAX`] tags; a body of at most [`BODY_MAX`]
+/// bytes; an attachment name of 1 to [`ATTACHMENT_NAME_MAX`] bytes, a size
+/// SQLite can store and a hash that is 64 lowercase hex digits; and free text
+/// within its limit ([`CLIENT_MAX`], [`STATUS_MAX`], [`TOPIC_MAX`] bytes) with
+/// no control characters (a post body may hold `\n` and `\t`).
 pub fn validate_event(ev: &Event) -> Result<(), Error> {
     if ev.seq == 0 || i64::try_from(ev.seq).is_err() {
         return Err(Error::Usage(format!(
@@ -226,12 +302,18 @@ pub fn validate_event(ev: &Event) -> Result<(), Error> {
         )));
     }
     match &ev.kind {
-        EventKind::ChannelCreated { name, .. } | EventKind::ChannelDeleted { name } => {
-            check_channel(name)
+        EventKind::ChannelCreated { name, topic } => {
+            check_channel(name)?;
+            topic.as_deref().map_or(Ok(()), validate_topic)
         }
+        EventKind::ChannelDeleted { name } => check_channel(name),
         EventKind::PostCreated(post) => check_post(post),
         EventKind::PostDeleted { by, .. } => validate_handle(by).map(drop),
-        EventKind::AgentSeen(p) => validate_handle(&p.handle).map(drop),
+        EventKind::AgentSeen(p) => {
+            validate_handle(&p.handle)?;
+            validate_client(&p.client)?;
+            p.status.as_deref().map_or(Ok(()), validate_status)
+        }
         EventKind::PeerAnnounced { .. } => Ok(()),
     }
 }
@@ -250,6 +332,10 @@ fn check_channel(name: &str) -> Result<(), Error> {
 fn check_post(post: &NewPost) -> Result<(), Error> {
     check_channel(&post.channel)?;
     validate_handle(&post.author)?;
+    if let Some(client) = &post.client {
+        validate_client(client)?;
+    }
+    validate_tag_count(post.tags.len())?;
     for tag in &post.tags {
         validate_tag(tag)?;
     }
@@ -267,10 +353,14 @@ fn check_post(post: &NewPost) -> Result<(), Error> {
             post.body.len()
         )));
     }
+    validate_body_text(&post.body)?;
     if let Some(att) = &post.attachment {
-        if att.name.is_empty() || att.name.len() > ATTACHMENT_NAME_MAX {
+        validate_attachment_name(&att.name)?;
+        // The hash becomes a file name, so it must not be anything else.
+        if !is_sha256(&att.sha256) {
             return Err(Error::Usage(format!(
-                "attachment name must be 1-{ATTACHMENT_NAME_MAX} bytes"
+                "attachment hash {:?} is not 64 lowercase hex digits",
+                att.sha256
             )));
         }
         if i64::try_from(att.size).is_err() {

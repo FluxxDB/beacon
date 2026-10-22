@@ -310,3 +310,170 @@ fn iso8601_is_utc_with_millis() {
     assert_eq!(iso8601(1792620420123), "2026-10-21T22:07:00.123Z");
     assert_eq!(iso8601(-1), "1969-12-31T23:59:59.999Z");
 }
+
+#[test]
+fn validate_event_enforces_free_text_limits() {
+    let event = |kind: EventKind| Event {
+        origin: "mac~abcd1234".into(),
+        seq: 1,
+        id: "01JDB7K4TR0000000000000000".into(),
+        ts: 5,
+        kind,
+    };
+    let post = |edit: &dyn Fn(&mut NewPost)| {
+        let mut p = NewPost {
+            post_id: "01JDB7K4TR0000000000000000".into(),
+            channel: "builds".into(),
+            author: "mac-juicebox".into(),
+            author_kind: AuthorKind::Agent,
+            client: Some("codex".into()),
+            node: "mac".into(),
+            body: "done".into(),
+            tags: vec!["done".into()],
+            mentions: vec![],
+            attachment: Some(Attachment {
+                sha256: "ab".repeat(32),
+                name: "log.txt".into(),
+                size: 12,
+            }),
+        };
+        edit(&mut p);
+        event(EventKind::PostCreated(p))
+    };
+    let seen = |edit: &dyn Fn(&mut Presence)| {
+        let mut p = Presence {
+            handle: "mac-juicebox".into(),
+            kind: AuthorKind::Agent,
+            client: "codex".into(),
+            node: "mac".into(),
+            status: Some("reviewing".into()),
+        };
+        edit(&mut p);
+        event(EventKind::AgentSeen(p))
+    };
+    let topic = |t: &str| {
+        event(EventKind::ChannelCreated {
+            name: "builds".into(),
+            topic: Some(t.into()),
+        })
+    };
+    let accepts = |ev: Event, what: &str| {
+        assert!(validate_event(&ev).is_ok(), "should accept {what}");
+    };
+    let refuses = |ev: Event, what: &str| match validate_event(&ev) {
+        Err(Error::Usage(_)) => {}
+        other => panic!("should refuse {what}, got {other:?}"),
+    };
+
+    accepts(post(&|_| {}), "a plain post");
+
+    // client: 64 bytes, not characters.
+    accepts(
+        post(&|p| p.client = Some("c".repeat(64))),
+        "a 64-byte client",
+    );
+    refuses(
+        post(&|p| p.client = Some("c".repeat(65))),
+        "a 65-byte client",
+    );
+    refuses(
+        post(&|p| p.client = Some("é".repeat(33))),
+        "66 bytes in 33 characters",
+    );
+    refuses(
+        post(&|p| p.client = Some("co\u{1}dex".into())),
+        "a control character in client",
+    );
+    accepts(
+        seen(&|p| p.client = "c".repeat(64)),
+        "a 64-byte presence client",
+    );
+    refuses(
+        seen(&|p| p.client = "c".repeat(65)),
+        "a 65-byte presence client",
+    );
+    refuses(
+        seen(&|p| p.client = "tui\u{7f}".into()),
+        "DEL in a presence client",
+    );
+
+    // presence status: 200 bytes.
+    accepts(
+        seen(&|p| p.status = Some("s".repeat(200))),
+        "a 200-byte status",
+    );
+    refuses(
+        seen(&|p| p.status = Some("s".repeat(201))),
+        "a 201-byte status",
+    );
+    refuses(
+        seen(&|p| p.status = Some("é".repeat(101))),
+        "202 bytes in 101 characters",
+    );
+    refuses(
+        seen(&|p| p.status = Some("busy\u{0}".into())),
+        "NUL in a status",
+    );
+    accepts(seen(&|p| p.status = None), "no status");
+
+    // channel topic: 200 bytes.
+    accepts(topic(&"t".repeat(200)), "a 200-byte topic");
+    refuses(topic(&"t".repeat(201)), "a 201-byte topic");
+    refuses(topic("two\nlines"), "a newline in a topic");
+    accepts(
+        event(EventKind::ChannelCreated {
+            name: "builds".into(),
+            topic: None,
+        }),
+        "no topic",
+    );
+
+    // at most 8 tags.
+    let tags = |n: usize| (1..=n).map(|i| format!("t{i}")).collect::<Vec<_>>();
+    accepts(post(&|p| p.tags = tags(8)), "8 tags");
+    refuses(post(&|p| p.tags = tags(9)), "9 tags");
+
+    // bodies may hold \n and \t, and no other control character (Unicode Cc).
+    accepts(post(&|p| p.body = "one\n\ttwo\n".into()), "newline and tab");
+    accepts(
+        post(&|p| p.body = "zero\u{200b}width \u{1f600}".into()),
+        "invisible non-Cc",
+    );
+    for bad in [
+        "\u{0}",
+        "\u{1b}[31m",
+        "\u{7}",
+        "a\rb",
+        "\u{7f}",
+        "\u{85}",
+        "\u{9f}",
+    ] {
+        refuses(
+            post(&|p| p.body = format!("x{bad}y")),
+            &format!("{bad:?} in a body"),
+        );
+    }
+
+    // attachment names: no control characters (newline and tab included),
+    // and the hash must be one a file can be named after.
+    refuses(
+        post(&|p| p.attachment.as_mut().unwrap().name = "a\nb".into()),
+        "newline in a name",
+    );
+    refuses(
+        post(&|p| p.attachment.as_mut().unwrap().name = "a\tb".into()),
+        "tab in a name",
+    );
+    for sha in [
+        "",
+        "ab",
+        "AB".repeat(32).as_str(),
+        "../../etc/passwd",
+        &"g".repeat(64),
+    ] {
+        refuses(
+            post(&|p| p.attachment.as_mut().unwrap().sha256 = sha.to_string()),
+            &format!("attachment hash {sha:?}"),
+        );
+    }
+}

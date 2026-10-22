@@ -662,6 +662,32 @@ fn insert_post(tx: &Connection, post: &NewPost, ts: i64, arrival: i64) -> Result
     Ok(())
 }
 
+impl PostRow {
+    /// The row [`insert_post`] makes for `applied`, built from the event
+    /// instead of read back, so a caller that just stored a post can show it
+    /// without another query. `None` if the event is not a `post_created`.
+    /// Kept beside `insert_post` so the two list the same fields.
+    pub fn from_applied(applied: &Applied) -> Option<PostRow> {
+        let EventKind::PostCreated(p) = &applied.event.kind else {
+            return None;
+        };
+        Some(PostRow {
+            id: p.post_id.clone(),
+            channel: p.channel.clone(),
+            ts: applied.event.ts,
+            author: p.author.clone(),
+            author_kind: p.author_kind,
+            client: p.client.clone(),
+            node: p.node.clone(),
+            body: p.body.clone(),
+            tags: p.tags.clone(),
+            mentions: p.mentions.clone(),
+            attachment: p.attachment.clone(),
+            arrival: applied.arrival,
+        })
+    }
+}
+
 /// Starting from `have`, the highest seq of `origin` with no gap below it.
 fn gapless_from(tx: &Connection, origin: &str, mut have: u64) -> Result<u64> {
     let mut stmt =

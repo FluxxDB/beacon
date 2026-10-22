@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
+use axum::extract::multipart::{MultipartError, MultipartRejection};
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
@@ -27,7 +28,7 @@ use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
 use crate::api::{ApiError, V};
-use crate::blobs::Blobs;
+use crate::blobs::{Blobs, PutError};
 use crate::config::Config;
 use crate::error::Error;
 use crate::model::{validate_event, Event, EventKind};
@@ -107,9 +108,11 @@ impl AppState {
         F: FnOnce(&Store, i64) -> Result<bool, Error> + Send + 'static,
     {
         let arrivals = self.arrivals.clone();
-        let now = now_ms();
         let applied = self
             .with_store(move |store| {
+                // Read under the lock: a request that waited for it must not
+                // stamp its event with the time it started waiting.
+                let now = now_ms();
                 if !when(store, now)? {
                     return Ok(None);
                 }
@@ -214,11 +217,15 @@ pub async fn start(cfg: Config) -> Result<NodeHandle, Error> {
         .local_addr()
         .map_err(internal("cannot read the listen address".to_string()))?;
 
+    // Nothing is uploading yet, so any temp file is from a run that died.
+    let blobs = Blobs::new(files);
+    blobs.clear_temp();
+
     let (stop, stop_rx) = watch::channel(false);
     let (arrivals, _) = broadcast::channel(ARRIVALS_CAPACITY);
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
-        blobs: Blobs::new(files),
+        blobs,
         cfg: Arc::new(cfg),
         arrivals,
         sync: SyncHandle::new(),
@@ -397,6 +404,28 @@ impl From<QueryRejection> for ApiFailure {
 impl From<PathRejection> for ApiFailure {
     fn from(rejection: PathRejection) -> Self {
         unreadable(rejection.status(), rejection.body_text())
+    }
+}
+
+impl From<MultipartRejection> for ApiFailure {
+    fn from(rejection: MultipartRejection) -> Self {
+        unreadable(rejection.status(), rejection.body_text())
+    }
+}
+
+impl From<MultipartError> for ApiFailure {
+    fn from(error: MultipartError) -> Self {
+        unreadable(error.status(), error.body_text())
+    }
+}
+
+impl From<PutError> for ApiFailure {
+    /// An attachment over the limit is a 413; the rest is an ordinary error.
+    fn from(error: PutError) -> Self {
+        match error {
+            PutError::TooLarge { .. } => ApiFailure::too_large(error.to_string()),
+            PutError::Failed(e) => e.into(),
+        }
     }
 }
 

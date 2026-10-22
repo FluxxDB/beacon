@@ -4,15 +4,22 @@
 mod common;
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use beacon::api::{ChannelsJson, PostCreated, PostJson, PostsResponse, WhoJson};
 use beacon::config::Config;
 use beacon::error::Error;
-use beacon::model::{Event, EventKind, VersionVector};
-use beacon::server::secret_matches;
+use beacon::model::{AuthorKind, Event, EventKind, NewPost, VersionVector};
+use beacon::server::{now_ms, secret_matches};
 use common::*;
+use reqwest::multipart::{Form, Part};
 use reqwest::{Method, Response, StatusCode};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tokio::sync::broadcast::error::TryRecvError;
 
 /// The body of a response that must have status `status`.
@@ -146,6 +153,10 @@ async fn every_route_requires_the_secret() {
         (Method::GET, "/api/read-cursors/pc-configs"),
         (Method::PUT, "/api/read-cursors/pc-configs"),
         (Method::GET, "/api/unread/pc-configs"),
+        (
+            Method::GET,
+            "/api/files/abababababababababababababababababababababababababababababababab",
+        ),
         // Paths that do not exist must not reveal that either.
         (Method::GET, "/api/nope"),
         (Method::GET, "/"),
@@ -1324,6 +1335,769 @@ async fn data_survives_a_restart_on_the_same_dir_and_port() {
     // And it keeps taking writes under the same origin.
     agent_post(&node, "beacon", "pc-configs", "after", &[]).await;
     assert_eq!(channel_bodies(&node, "beacon").await, ["before", "after"]);
+}
+
+// ------------------------------------------------------------- attachments
+
+/// `len` bytes that look random but are the same on every run.
+fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The names in `<data dir>/files`, sorted.
+fn files_in(node: &TestNode) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(node.dir.path().join("files"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Polls `check` until it holds, failing the test after five seconds.
+async fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !check() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "gave up waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn post_meta(body: &str) -> Value {
+    json!({
+        "body": body, "tags": [], "author": "pc-configs",
+        "author_kind": "agent", "client": "claude-code", "create": false
+    })
+}
+
+fn meta_part(meta: &Value) -> Part {
+    Part::text(meta.to_string())
+        .mime_str("application/json")
+        .unwrap()
+}
+
+fn file_part(name: &str, bytes: Vec<u8>) -> Part {
+    Part::bytes(bytes).file_name(name.to_string())
+}
+
+/// Posts `meta` with a file attached, as the multipart form: meta first.
+async fn upload(
+    node: &TestNode,
+    channel: &str,
+    meta: &Value,
+    name: &str,
+    bytes: Vec<u8>,
+) -> Response {
+    let form = Form::new()
+        .part("meta", meta_part(meta))
+        .part("file", file_part(name, bytes));
+    send_form(node, channel, form).await
+}
+
+async fn send_form(node: &TestNode, channel: &str, form: Form) -> Response {
+    node.post(&format!("/api/channels/{channel}/posts"))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn upload_and_download_roundtrip() {
+    let node = spawn_node("pc", &[]).await;
+    let bytes = pseudo_random(1024 * 1024, 7);
+    let sha = sha256_hex(&bytes);
+
+    let meta = post_meta("full log attached");
+    let resp = upload(&node, "general", &meta, "build-log.txt", bytes.clone()).await;
+    let created: PostCreated = serde_json::from_value(ok(resp).await).unwrap();
+    let att = created.post.attachment.clone().expect("an attachment");
+    assert_eq!(att.name, "build-log.txt");
+    assert_eq!(att.size, 1024 * 1024);
+    assert_eq!(att.sha256, sha);
+    assert!(att.available);
+    assert_eq!(created.post.body, "full log attached");
+    assert_eq!(created.post.author, "pc-configs");
+
+    // The bytes come back identical.
+    let resp = node.get(&format!("/api/files/{sha}")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "application/octet-stream");
+    assert_eq!(resp.headers()["content-length"], "1048576");
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), bytes.as_slice());
+
+    // Read back, the post carries the same attachment; the blob is the only file.
+    let resp = node
+        .get(&format!("/api/posts/{}", created.post.id))
+        .send()
+        .await
+        .unwrap();
+    let post: PostJson = serde_json::from_value(ok(resp).await).unwrap();
+    assert_eq!(post.attachment, created.post.attachment);
+    assert_eq!(files_in(&node), [sha]);
+}
+
+#[tokio::test]
+async fn attachment_over_limit_413() {
+    let node = spawn_node_with("pc", &[], |cfg| cfg.max_attachment_mb = 1).await;
+    let meta = post_meta("too big");
+    let resp = upload(
+        &node,
+        "general",
+        &meta,
+        "big.bin",
+        pseudo_random(2 << 20, 3),
+    )
+    .await;
+    let message = expect_error(resp, StatusCode::PAYLOAD_TOO_LARGE, "usage").await;
+    assert!(message.contains("attachment is over 1 MB"), "{message}");
+    assert!(channel_bodies(&node, "general").await.is_empty());
+    assert_eq!(files_in(&node), Vec::<String>::new());
+
+    // Exactly at the limit is fine; one byte more is not.
+    let resp = upload(
+        &node,
+        "general",
+        &meta,
+        "fits.bin",
+        pseudo_random(1 << 20, 4),
+    )
+    .await;
+    ok(resp).await;
+    let resp = upload(
+        &node,
+        "general",
+        &meta,
+        "no.bin",
+        pseudo_random((1 << 20) + 1, 5),
+    )
+    .await;
+    expect_error(resp, StatusCode::PAYLOAD_TOO_LARGE, "usage").await;
+    assert_eq!(files_in(&node).len(), 1, "only the file that fit");
+    assert_eq!(channel_bodies(&node, "general").await.len(), 1);
+}
+
+#[tokio::test]
+async fn missing_blob_404() {
+    let node = spawn_node("pc", &[]).await;
+    let sha = "ab".repeat(32);
+    let resp = node.get(&format!("/api/files/{sha}")).send().await.unwrap();
+    let message = expect_error(resp, StatusCode::NOT_FOUND, "not_found").await;
+    assert!(message.contains(&sha), "names the attachment: {message}");
+}
+
+#[tokio::test]
+async fn file_names_that_are_not_a_sha256_are_400() {
+    let node = spawn_node("pc", &[]).await;
+    // A file the paths below would reach if they were let through.
+    std::fs::write(node.dir.path().join("beacon-secret"), b"nope").unwrap();
+    let bad = [
+        "not-a-hash".to_string(),
+        "AB".repeat(32),
+        "ab".repeat(31),
+        "ab".repeat(33),
+        "zz".repeat(32),
+        "..%2Fbeacon-secret".to_string(),
+        "..%2F..%2Fetc%2Fpasswd".to_string(),
+        format!("{}%2F..%2Fbeacon-secret", "ab".repeat(16)),
+    ];
+    for name in bad {
+        let resp = node
+            .get(&format!("/api/files/{name}"))
+            .send()
+            .await
+            .unwrap();
+        expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+    }
+}
+
+#[tokio::test]
+async fn identical_uploads_share_one_blob() {
+    let node = spawn_node("pc", &[]).await;
+    let bytes = pseudo_random(100_000, 11);
+    let sha = sha256_hex(&bytes);
+    let mut ids = Vec::new();
+    for name in ["first.log", "second.log"] {
+        let resp = upload(&node, "general", &post_meta(name), name, bytes.clone()).await;
+        let created = ok(resp).await;
+        assert_eq!(created["post"]["attachment"]["sha256"], sha);
+        assert_eq!(created["post"]["attachment"]["name"], name);
+        assert_eq!(created["post"]["attachment"]["available"], true);
+        ids.push(post_id(&created));
+    }
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(files_in(&node), [sha]);
+}
+
+#[tokio::test]
+async fn multipart_posts_follow_the_post_rules() {
+    let node = spawn_node("pc", &[]).await;
+    let bytes = pseudo_random(2048, 5);
+
+    // A file alone is a post (an empty body is fine with an attachment).
+    let resp = upload(&node, "general", &post_meta(""), "only.bin", bytes.clone()).await;
+    let created = ok(resp).await;
+    assert_eq!(created["post"]["body"], "");
+    assert_eq!(created["post"]["attachment"]["size"], 2048);
+
+    // Tags and mentions come from the meta part, like the JSON form.
+    let meta = json!({
+        "body": "see @dang", "tags": ["done", "done", "log"], "author": "pc-configs",
+        "author_kind": "agent", "client": null, "create": false
+    });
+    let created = ok(upload(&node, "general", &meta, "a.txt", bytes.clone()).await).await;
+    assert_eq!(created["post"]["tags"], json!(["done", "log"]));
+    assert_eq!(created["post"]["mentions"], json!(["dang"]));
+    assert_eq!(created["post"]["client"], Value::Null);
+
+    // `create` makes the channel, after the file has arrived.
+    let mut meta = post_meta("fresh");
+    meta["create"] = json!(true);
+    ok(upload(&node, "Fresh-Channel", &meta, "b.txt", bytes.clone()).await).await;
+    let names: Vec<String> = {
+        let resp = node.get("/api/channels").send().await.unwrap();
+        let channels: ChannelsJson = serde_json::from_value(ok(resp).await).unwrap();
+        channels.channels.into_iter().map(|c| c.name).collect()
+    };
+    assert_eq!(names, ["general", "fresh-channel"]);
+
+    // A form with no file is the plain post.
+    let form = Form::new().part("meta", meta_part(&post_meta("just text")));
+    let created = ok(send_form(&node, "general", form).await).await;
+    assert_eq!(created["post"]["attachment"], Value::Null);
+    // ...and still needs something to say.
+    let form = Form::new().part("meta", meta_part(&post_meta("  ")));
+    let resp = send_form(&node, "general", form).await;
+    expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+}
+
+#[tokio::test]
+async fn bad_uploads_are_refused_before_a_file_is_stored() {
+    let node = spawn_node("pc", &[]).await;
+    let bytes = || pseudo_random(64 * 1024, 9);
+    let meta = post_meta("x");
+    let with_meta = |key: &str, value: Value| {
+        let mut m = meta.clone();
+        m[key] = value;
+        m
+    };
+    let usage = StatusCode::BAD_REQUEST;
+
+    // (what is wrong, the form, the expected status and code)
+    let cases: Vec<(&str, Form, StatusCode, &str)> = vec![
+        (
+            "the file comes before the meta",
+            Form::new()
+                .part("file", file_part("a.bin", bytes()))
+                .part("meta", meta_part(&meta)),
+            usage,
+            "usage",
+        ),
+        (
+            "no meta at all",
+            Form::new().part("file", file_part("a.bin", bytes())),
+            usage,
+            "usage",
+        ),
+        (
+            "an unknown part",
+            Form::new()
+                .part("meta", meta_part(&meta))
+                .part("extra", Part::text("?"))
+                .part("file", file_part("a.bin", bytes())),
+            usage,
+            "usage",
+        ),
+        (
+            "meta twice",
+            Form::new()
+                .part("meta", meta_part(&meta))
+                .part("meta", meta_part(&meta))
+                .part("file", file_part("a.bin", bytes())),
+            usage,
+            "usage",
+        ),
+        (
+            "a file without a name",
+            Form::new()
+                .part("meta", meta_part(&meta))
+                .part("file", Part::bytes(bytes())),
+            usage,
+            "usage",
+        ),
+        (
+            "meta that is not JSON",
+            Form::new()
+                .part("meta", Part::text("{not json"))
+                .part("file", file_part("a.bin", bytes())),
+            usage,
+            "usage",
+        ),
+        (
+            "meta missing a field",
+            Form::new()
+                .part("meta", meta_part(&json!({ "body": "no author" })))
+                .part("file", file_part("a.bin", bytes())),
+            usage,
+            "usage",
+        ),
+        (
+            "a bad author handle",
+            Form::new()
+                .part("meta", meta_part(&with_meta("author", json!("bad handle"))))
+                .part("file", file_part("a.bin", bytes())),
+            usage,
+            "usage",
+        ),
+        (
+            "only BEACON_HUMAN may post as human",
+            Form::new()
+                .part("meta", meta_part(&with_meta("author_kind", json!("human"))))
+                .part("file", file_part("a.bin", bytes())),
+            usage,
+            "usage",
+        ),
+        (
+            "a client name over 64 bytes",
+            Form::new()
+                .part(
+                    "meta",
+                    meta_part(&with_meta("client", json!("c".repeat(65)))),
+                )
+                .part("file", file_part("a.bin", bytes())),
+            usage,
+            "usage",
+        ),
+        (
+            "a control character in the body",
+            Form::new()
+                .part("meta", meta_part(&with_meta("body", json!("a\u{1b}[0m"))))
+                .part("file", file_part("a.bin", bytes())),
+            usage,
+            "usage",
+        ),
+        (
+            "a name that reduces to nothing",
+            Form::new()
+                .part("meta", meta_part(&meta))
+                .part("file", file_part("some/dir/", bytes())),
+            usage,
+            "usage",
+        ),
+        (
+            "a file name over 255 bytes",
+            Form::new()
+                .part("meta", meta_part(&meta))
+                .part("file", file_part(&"n".repeat(256), bytes())),
+            usage,
+            "usage",
+        ),
+        (
+            "a channel that does not exist",
+            Form::new()
+                .part("meta", meta_part(&meta))
+                .part("file", file_part("a.bin", bytes())),
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+    ];
+    for (what, form, status, code) in cases {
+        // The channel case posts to a channel that is not there.
+        let channel = if status == StatusCode::NOT_FOUND {
+            "nowhere"
+        } else {
+            "general"
+        };
+        let resp = send_form(&node, channel, form).await;
+        expect_error(resp, status, code).await;
+        assert_eq!(files_in(&node), Vec::<String>::new(), "{what}");
+        assert!(channel_bodies(&node, "general").await.is_empty(), "{what}");
+    }
+
+    // A channel name that cannot exist is refused the same way.
+    let form = Form::new()
+        .part("meta", meta_part(&meta))
+        .part("file", file_part("a.bin", bytes()));
+    let resp = send_form(&node, "bad%20name", form).await;
+    expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+    assert_eq!(files_in(&node), Vec::<String>::new());
+
+    // `multipart/form-data` without a boundary is not a form.
+    let resp = node
+        .post("/api/channels/general/posts")
+        .header("content-type", "multipart/form-data")
+        .body("whatever")
+        .send()
+        .await
+        .unwrap();
+    expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+}
+
+#[tokio::test]
+async fn attachment_names_are_reduced_to_a_file_name() {
+    let node = spawn_node("pc", &[]).await;
+    let cases = [
+        ("report.pdf", "report.pdf"),
+        ("../../etc/passwd", "passwd"),
+        (r"C:\Users\dang\report.pdf", "report.pdf"),
+        ("dir/sub/log.txt", "log.txt"),
+        ("  spaced name.txt ", "spaced name.txt"),
+        ("résumé – 日本語.txt", "résumé – 日本語.txt"),
+        (".hidden", ".hidden"),
+    ];
+    for (sent, kept) in cases {
+        let resp = upload(&node, "general", &post_meta("n"), sent, vec![1, 2, 3]).await;
+        let created = ok(resp).await;
+        assert_eq!(created["post"]["attachment"]["name"], kept, "sent {sent:?}");
+    }
+    for sent in ["..", ".", "a/..", "/"] {
+        let resp = upload(&node, "general", &post_meta("n"), sent, vec![1, 2, 3]).await;
+        expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+    }
+}
+
+#[tokio::test]
+async fn json_posts_keep_their_2_mib_limit_and_the_upload_limit_is_per_node() {
+    // A raised limit for uploads must not let big JSON through.
+    let node = spawn_node_with("pc", &[], |cfg| cfg.max_attachment_mb = 8).await;
+    let post = json!({
+        "body": "x".repeat(3 * 1024 * 1024), "tags": [], "author": "pc-configs",
+        "author_kind": "agent", "client": null, "create": false
+    });
+    let resp = node
+        .post("/api/channels/general/posts")
+        .json(&post)
+        .send()
+        .await
+        .unwrap();
+    expect_error(resp, StatusCode::PAYLOAD_TOO_LARGE, "usage").await;
+    // Seven MB of file is fine on this node.
+    let resp = upload(
+        &node,
+        "general",
+        &post_meta("big"),
+        "big.bin",
+        vec![7; 7 << 20],
+    )
+    .await;
+    ok(resp).await;
+}
+
+#[tokio::test]
+async fn upload_cut_off_midway_leaves_nothing_behind() {
+    let node = spawn_node("pc", &[]).await;
+    let boundary = "----beacon-test-boundary";
+    let meta = post_meta("never finished").to_string();
+    let head = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"meta\"\r\n\
+         Content-Type: application/json\r\n\r\n{meta}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big.bin\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n"
+    );
+    // Promise 5 MB, send a quarter of one, then hang up.
+    let announced = head.len() + 5 * 1024 * 1024;
+    let request = format!(
+        "POST /api/channels/general/posts HTTP/1.1\r\nHost: {}\r\n\
+         Authorization: Bearer {SECRET}\r\n\
+         Content-Type: multipart/form-data; boundary={boundary}\r\n\
+         Content-Length: {announced}\r\n\r\n",
+        node.handle.addr
+    );
+    let mut socket = TcpStream::connect(node.handle.addr).await.unwrap();
+    socket.write_all(request.as_bytes()).await.unwrap();
+    socket.write_all(head.as_bytes()).await.unwrap();
+    socket.write_all(&vec![7u8; 256 * 1024]).await.unwrap();
+    socket.flush().await.unwrap();
+
+    // The server is holding the bytes it has so far.
+    let files = node.dir.path().join("files");
+    let in_progress = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .any(|e| e.unwrap().metadata().unwrap().len() > 0)
+    };
+    wait_until("the partial upload to reach the disk", || {
+        in_progress(&files)
+    })
+    .await;
+
+    drop(socket);
+    wait_until("the partial upload to be cleaned up", || {
+        files_in(&node).is_empty()
+    })
+    .await;
+    assert!(channel_bodies(&node, "general").await.is_empty());
+    // The node still works.
+    ok(upload(&node, "general", &post_meta("after"), "ok.bin", vec![1; 10]).await).await;
+}
+
+// ------------------------------------------------- free text and who posts
+
+/// Posts the JSON `body` to #general and returns the response.
+async fn post_json(node: &TestNode, channel: &str, body: &Value) -> Response {
+    node.post(&format!("/api/channels/{channel}/posts"))
+        .json(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn free_text_limits_are_400_at_the_edge() {
+    let node = spawn_node("pc", &[]).await;
+    let post = |edit: &dyn Fn(&mut Value)| {
+        let mut p = post_meta("hi");
+        edit(&mut p);
+        p
+    };
+    let refused = |resp: Response| expect_error(resp, StatusCode::BAD_REQUEST, "usage");
+
+    // client: at most 64 bytes (bytes, not characters), no control characters.
+    let p = post(&|p| p["client"] = json!("c".repeat(64)));
+    ok(post_json(&node, "general", &p).await).await;
+    let p = post(&|p| p["client"] = json!("c".repeat(65)));
+    let message = refused(post_json(&node, "general", &p).await).await;
+    assert!(message.contains("client"), "{message}");
+    let p = post(&|p| p["client"] = json!("é".repeat(33)));
+    refused(post_json(&node, "general", &p).await).await;
+    let p = post(&|p| p["client"] = json!("code\u{1}"));
+    refused(post_json(&node, "general", &p).await).await;
+
+    // tags: at most 8 per post.
+    let eight: Vec<String> = (1..=8).map(|i| format!("t{i}")).collect();
+    let p = post(&|p| p["tags"] = json!(eight));
+    ok(post_json(&node, "general", &p).await).await;
+    let nine: Vec<String> = (1..=9).map(|i| format!("t{i}")).collect();
+    let p = post(&|p| p["tags"] = json!(nine));
+    let message = refused(post_json(&node, "general", &p).await).await;
+    assert!(message.contains("tags"), "{message}");
+
+    // body: only \n and \t among the control characters (Unicode Cc).
+    let p = post(&|p| p["body"] = json!("line one\n\tline two\n"));
+    ok(post_json(&node, "general", &p).await).await;
+    for bad in [
+        "red \u{1b}[31m",
+        "nul\u{0}",
+        "bell\u{7}",
+        "del\u{7f}",
+        "c1\u{85}",
+        "a\r\nb",
+    ] {
+        let p = post(&|p| p["body"] = json!(bad));
+        let message = refused(post_json(&node, "general", &p).await).await;
+        assert!(message.contains("control character"), "{bad:?}: {message}");
+    }
+    // Other invisible characters are not control characters.
+    let p = post(&|p| p["body"] = json!("zero\u{200b}width and \u{1f600}"));
+    ok(post_json(&node, "general", &p).await).await;
+
+    // A refused post has no side effects: not even the channel it asked for.
+    let p = post(&|p| {
+        p["create"] = json!(true);
+        p["client"] = json!("c".repeat(65));
+    });
+    refused(post_json(&node, "fresh", &p).await).await;
+    let resp = node.get("/api/channels/fresh/posts").send().await.unwrap();
+    expect_error(resp, StatusCode::NOT_FOUND, "not_found").await;
+}
+
+#[tokio::test]
+async fn presence_and_topic_limits_are_400_at_the_edge() {
+    let node = spawn_node("pc", &[]).await;
+    let refused = |resp: Response| expect_error(resp, StatusCode::BAD_REQUEST, "usage");
+    let beat = |extra: Value| {
+        let mut b = json!({ "handle": "pc-configs", "kind": "agent" });
+        for (k, v) in extra.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        b
+    };
+    let heartbeat = |b: Value| node.post("/api/who").json(&b).send();
+
+    // status: at most 200 bytes.
+    let resp = heartbeat(beat(json!({ "status": "s".repeat(200) })))
+        .await
+        .unwrap();
+    assert_eq!(ok(resp).await["recorded"], true);
+    // Refused even though a heartbeat for this handle is not due yet.
+    let resp = heartbeat(beat(json!({ "status": "s".repeat(201) })))
+        .await
+        .unwrap();
+    let message = refused(resp).await;
+    assert!(message.contains("status"), "{message}");
+    let resp = heartbeat(beat(json!({ "status": "é".repeat(101) })))
+        .await
+        .unwrap();
+    refused(resp).await;
+    let resp = heartbeat(beat(json!({ "status": "busy\u{7}" })))
+        .await
+        .unwrap();
+    refused(resp).await;
+    // client: at most 64 bytes.
+    let resp = heartbeat(beat(json!({ "client": "c".repeat(64) })))
+        .await
+        .unwrap();
+    ok(resp).await;
+    let resp = heartbeat(beat(json!({ "client": "c".repeat(65) })))
+        .await
+        .unwrap();
+    refused(resp).await;
+    let resp = heartbeat(beat(json!({ "client": "co\u{0}dex" })))
+        .await
+        .unwrap();
+    refused(resp).await;
+
+    // topic: at most 200 bytes.
+    let new_channel = |name: &str, topic: &str| {
+        node.post("/api/channels")
+            .json(&json!({ "name": name, "topic": topic }))
+            .send()
+    };
+    ok(new_channel("a", &"t".repeat(200)).await.unwrap()).await;
+    let message = refused(new_channel("b", &"t".repeat(201)).await.unwrap()).await;
+    assert!(message.contains("topic"), "{message}");
+    refused(new_channel("b", &"é".repeat(101)).await.unwrap()).await;
+    refused(new_channel("b", "line\nbreak").await.unwrap()).await;
+    // Setting a bad topic on a channel that exists changes nothing either.
+    refused(new_channel("a", &"u".repeat(201)).await.unwrap()).await;
+    let resp = node.get("/api/channels").send().await.unwrap();
+    let channels: ChannelsJson = serde_json::from_value(ok(resp).await).unwrap();
+    let names: Vec<&str> = channels.channels.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["general", "a"]);
+    assert_eq!(channels.channels[1].topic, Some("t".repeat(200)));
+}
+
+#[tokio::test]
+async fn only_beacon_human_posts_as_human() {
+    let node = spawn_node("pc", &[]).await; // BEACON_HUMAN defaults to Dang
+    let as_human = |author: &str| {
+        let mut p = post_meta("announcement");
+        p["author"] = json!(author);
+        p["author_kind"] = json!("human");
+        p
+    };
+
+    let resp = post_json(&node, "general", &as_human("pc-configs")).await;
+    let message = expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+    assert_eq!(message, "only BEACON_HUMAN can post as human");
+    assert!(channel_bodies(&node, "general").await.is_empty());
+
+    // BEACON_HUMAN may, in any letter case.
+    for author in ["Dang", "dang", "DANG"] {
+        let created = ok(post_json(&node, "general", &as_human(author)).await).await;
+        assert_eq!(created["post"]["announcement"], true, "{author}");
+    }
+    // The same rule holds for the multipart form.
+    let resp = upload(
+        &node,
+        "general",
+        &as_human("mac-juicebox"),
+        "a.txt",
+        vec![1],
+    )
+    .await;
+    let message = expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+    assert_eq!(message, "only BEACON_HUMAN can post as human");
+    ok(upload(&node, "general", &as_human("dang"), "a.txt", vec![1]).await).await;
+
+    // The human is whoever this node is configured with.
+    let node = spawn_node_with("pc", &[], |cfg| cfg.human = "Alice".into()).await;
+    let resp = post_json(&node, "general", &as_human("Dang")).await;
+    expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+    ok(post_json(&node, "general", &as_human("alice")).await).await;
+
+    // Events from peers are not held to it: another device has its own human.
+    let id = ulid::Ulid::generate().to_string();
+    let remote = Event {
+        origin: "mac~abcd1234".into(),
+        seq: 1,
+        id: id.clone(),
+        ts: 1_000,
+        kind: EventKind::PostCreated(NewPost {
+            post_id: id,
+            channel: "general".into(),
+            author: "Dang".into(),
+            author_kind: AuthorKind::Human,
+            client: Some("tui".into()),
+            node: "mac".into(),
+            body: "from the mac".into(),
+            tags: vec![],
+            mentions: vec![],
+            attachment: None,
+        }),
+    };
+    assert!(node.state().ingest(remote).await.unwrap().is_some());
+    // (Its ts is older, so it sorts first.)
+    assert_eq!(
+        channel_bodies(&node, "general").await,
+        ["from the mac", "announcement"]
+    );
+}
+
+#[tokio::test]
+async fn commit_if_stamps_the_event_after_taking_the_lock() {
+    let node = spawn_node("pc", &[]).await;
+    let state = node.state().clone();
+    // Hold the store for 300 ms, then commit while it is held.
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let holder = tokio::spawn({
+        let state = state.clone();
+        async move {
+            state
+                .with_store(move |_| {
+                    let _ = locked_tx.send(());
+                    std::thread::sleep(Duration::from_millis(300));
+                    Ok(())
+                })
+                .await
+        }
+    });
+    locked_rx.await.unwrap();
+    let asked_at = now_ms();
+
+    let seen = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&seen);
+    let kind = EventKind::ChannelCreated {
+        name: "late".into(),
+        topic: None,
+    };
+    let applied = state
+        .commit_if(kind, move |_, now| {
+            *record.lock().unwrap() = Some(now);
+            Ok(true)
+        })
+        .await
+        .unwrap()
+        .expect("committed");
+    holder.await.unwrap().unwrap();
+
+    // The time handed to `when` and carried by the event is the time the lock
+    // was taken, not the time the request came in.
+    let now = seen.lock().unwrap().expect("when ran");
+    assert_eq!(applied.event.ts, now);
+    assert!(
+        now >= asked_at + 200,
+        "stamped {}ms after the request, before the lock was free",
+        now - asked_at
+    );
 }
 
 // ------------------------------------------------------------------ config

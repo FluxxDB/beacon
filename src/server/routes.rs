@@ -6,17 +6,25 @@
 //! answer to a post this node has just committed, whose event was validated
 //! on the way in.
 
-use axum::extract::State;
+use axum::body::Body;
+use axum::extract::multipart::Field;
+use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Request, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::Response;
 use axum::routing::{delete, get};
 use axum::{Json, Router};
+use futures_util::{StreamExt, TryStreamExt};
 use serde::Deserialize;
+use tokio_util::io::ReaderStream;
 
 use super::{now_ms, ApiFailure, ApiJson, ApiPath, ApiQuery, ApiResult, AppState};
 use crate::api::*;
+use crate::blobs::{is_sha256, PutError};
 use crate::error::Error;
 use crate::model::{
-    normalize_channel, parse_mentions, validate_handle, validate_tag, Attachment, EventKind,
-    NewPost, Presence, BODY_MAX,
+    normalize_channel, parse_mentions, validate_attachment_name, validate_body_text,
+    validate_client, validate_handle, validate_status, validate_tag, validate_tag_count,
+    validate_topic, Attachment, AuthorKind, EventKind, NewPost, Presence, BODY_MAX,
 };
 use crate::store::{Applied, PostQuery, PostRow, Store};
 
@@ -24,6 +32,15 @@ use crate::store::{Applied, PostQuery, PostRow, Store};
 const DEFAULT_LIMIT: usize = 50;
 /// The most posts a request may ask for.
 const MAX_LIMIT: usize = 500;
+/// Largest JSON request body. (Axum's own default, applied by hand because
+/// the posting route lifts the default for uploads.)
+const JSON_BODY_MAX: u64 = 2 * 1024 * 1024;
+/// Largest `meta` part of an upload.
+const META_MAX: usize = 256 * 1024;
+/// Room in an upload's body for the multipart framing around its parts.
+const FRAMING_MAX: u64 = 64 * 1024;
+/// How much of a file is read from disk at a time when serving it.
+const FILE_CHUNK: usize = 64 * 1024;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -33,8 +50,13 @@ pub fn router() -> Router<AppState> {
         .route("/api/channels/{name}", delete(delete_channel))
         .route(
             "/api/channels/{name}/posts",
-            get(channel_posts).post(create_post),
+            // A post is JSON or a multipart upload. `create_post` limits the
+            // body itself, by kind: the upload limit is the node's setting.
+            get(channel_posts)
+                .post(create_post)
+                .layer(DefaultBodyLimit::disable()),
         )
+        .route("/api/files/{sha256}", get(get_file))
         .route("/api/posts", get(cross_channel_posts))
         .route("/api/posts/{id}", get(get_post).delete(delete_post))
         .route("/api/who", get(who).post(heartbeat))
@@ -175,6 +197,9 @@ async fn create_channel(
 ) -> ApiResult<ChannelAck> {
     let name = normalize_channel(&req.name)?;
     let topic = clean(req.topic);
+    if let Some(topic) = &topic {
+        validate_topic(topic)?;
+    }
     let lookup = name.clone();
     let existing = app.with_store(move |s| s.channel(&lookup)).await?;
     // Asking again for a channel that is there changes nothing, unless it
@@ -284,9 +309,195 @@ async fn cross_channel_posts(
 async fn create_post(
     State(app): State<AppState>,
     ApiPath(name): ApiPath<String>,
-    ApiJson(req): ApiJson<NewPostRequest>,
+    req: Request,
 ) -> ApiResult<PostCreated> {
-    Ok(Json(post_to_channel(&app, &name, req, None).await?))
+    let multipart = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("multipart/form-data")
+        });
+    let created = if multipart {
+        post_with_upload(&app, &name, req).await?
+    } else {
+        let req = limit_body(req, JSON_BODY_MAX);
+        let ApiJson(body) = ApiJson::<NewPostRequest>::from_request(req, &app).await?;
+        post_to_channel(&app, &name, body, None).await?
+    };
+    Ok(Json(created))
+}
+
+/// `req` with its body cut off after `max` bytes (reading further fails with
+/// a length-limit error, which the extractors answer with 413).
+fn limit_body(req: Request, max: u64) -> Request {
+    let max = usize::try_from(max).unwrap_or(usize::MAX);
+    req.map(|body| Body::new(http_body_util::Limited::new(body, max)))
+}
+
+/// The multipart form of the posting route: a `meta` part (the JSON post
+/// request), then optionally a `file` part whose file name is the
+/// attachment's name. The file is streamed to disk, never held in memory.
+///
+/// `meta` must come first, so the post can be checked before a single byte
+/// of the file is kept: a request that would be refused is refused unread.
+async fn post_with_upload(
+    app: &AppState,
+    name: &str,
+    req: Request,
+) -> Result<PostCreated, ApiFailure> {
+    let max_bytes = app.cfg.max_attachment_bytes();
+    let body_max = max_bytes.saturating_add(META_MAX as u64 + FRAMING_MAX);
+    let mut form = Multipart::from_request(limit_body(req, body_max), app).await?;
+
+    let mut meta: Option<NewPostRequest> = None;
+    let mut attachment: Option<Attachment> = None;
+    while let Some(field) = form.next_field().await? {
+        match (field.name(), &meta, &attachment) {
+            (Some("meta"), None, None) => meta = Some(read_meta(field).await?),
+            (Some("file"), Some(meta), None) => {
+                let name_in_form = attachment_name(field.file_name())?;
+                // Everything that can be checked without the file, now.
+                prepare_post(app, name, meta, true).await?;
+                attachment = Some(store_upload(app, field, name_in_form, max_bytes).await?);
+            }
+            (Some("file"), None, None) => {
+                return Err(usage("send the meta part before the file part"));
+            }
+            (Some("meta" | "file"), _, _) => {
+                return Err(usage(
+                    "a post takes one meta part, then at most one file part",
+                ));
+            }
+            (other, _, _) => {
+                return Err(usage(format!("unexpected part {other:?} in the upload")));
+            }
+        }
+    }
+    let meta = meta.ok_or_else(|| usage("the upload needs a meta part"))?;
+    post_to_channel(app, name, meta, attachment).await
+}
+
+fn usage(message: impl Into<String>) -> ApiFailure {
+    Error::Usage(message.into()).into()
+}
+
+/// The `meta` part: the same JSON the plain form takes.
+async fn read_meta(mut field: Field<'_>) -> Result<NewPostRequest, ApiFailure> {
+    let mut json = Vec::new();
+    while let Some(chunk) = field.chunk().await? {
+        if json.len() + chunk.len() > META_MAX {
+            return Err(ApiFailure::too_large(format!(
+                "the meta part is over {} KB",
+                META_MAX / 1024
+            )));
+        }
+        json.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&json)
+        .map_err(|e| usage(format!("the meta part is not a post request: {e}")))
+}
+
+/// Streams a `file` part into the blob store.
+async fn store_upload(
+    app: &AppState,
+    field: Field<'_>,
+    name: String,
+    max_bytes: u64,
+) -> Result<Attachment, ApiFailure> {
+    let chunks = field.map_err(move |e| {
+        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            PutError::TooLarge { max_bytes }
+        } else {
+            PutError::Failed(Error::Usage(format!(
+                "upload interrupted: {}",
+                e.body_text()
+            )))
+        }
+    });
+    let (sha256, size) = app.blobs.put_stream(chunks, max_bytes).await?;
+    Ok(Attachment { sha256, name, size })
+}
+
+/// The attachment name for a file name from a form: just the file name, in
+/// case the client sent a path.
+fn attachment_name(raw: Option<&str>) -> Result<String, Error> {
+    let raw = raw.ok_or_else(|| Error::Usage("the file part needs a file name".into()))?;
+    let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw).trim();
+    if matches!(name, "" | "." | "..") {
+        return Err(Error::Usage(format!(
+            "{raw:?} is not a usable attachment name"
+        )));
+    }
+    validate_attachment_name(name)?;
+    Ok(name.to_string())
+}
+
+/// A post request that passed every check that needs no write.
+struct Prepared {
+    channel: String,
+    author: String,
+    tags: Vec<String>,
+    client: Option<String>,
+    channel_exists: bool,
+}
+
+/// Checks a post request and looks the channel up, changing nothing. The
+/// upload path runs it before it reads the file, and [`post_to_channel`] runs
+/// it again before it writes. `attached`: the post carries a file, so an
+/// empty body is fine.
+async fn prepare_post(
+    app: &AppState,
+    name: &str,
+    req: &NewPostRequest,
+    attached: bool,
+) -> Result<Prepared, ApiFailure> {
+    let channel = normalize_channel(name)?;
+    let author = validate_handle(&req.author)?;
+    if req.author_kind == AuthorKind::Human && !author.eq_ignore_ascii_case(&app.cfg.human) {
+        return Err(usage("only BEACON_HUMAN can post as human"));
+    }
+    let client = clean(req.client.clone());
+    if let Some(client) = &client {
+        validate_client(client)?;
+    }
+    let mut tags: Vec<String> = Vec::new();
+    for tag in &req.tags {
+        let tag = validate_tag(tag)?;
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+    validate_tag_count(tags.len())?;
+    if req.body.len() > BODY_MAX {
+        return Err(ApiFailure::too_large(format!(
+            "post body is {} bytes, over the {BODY_MAX}-byte limit",
+            req.body.len()
+        )));
+    }
+    validate_body_text(&req.body)?;
+    if req.body.trim().is_empty() && !attached {
+        return Err(usage("the post is empty: give it some text"));
+    }
+
+    let lookup = channel.clone();
+    let channel_exists = app.with_store(move |s| s.channel(&lookup)).await?.is_some();
+    if !channel_exists && !req.create {
+        return Err(Error::NotFound(format!(
+            "no channel #{channel}: create it with `./beacon channel new {channel}`, \
+             or post with --create"
+        ))
+        .into());
+    }
+    Ok(Prepared {
+        channel,
+        author,
+        tags,
+        client,
+        channel_exists,
+    })
 }
 
 /// Posts `req` (with `attachment`, if the bytes were already stored) to the
@@ -297,37 +508,10 @@ pub async fn post_to_channel(
     req: NewPostRequest,
     attachment: Option<Attachment>,
 ) -> Result<PostCreated, ApiFailure> {
-    let channel = normalize_channel(name)?;
-    let author = validate_handle(&req.author)?;
-    let mut tags: Vec<String> = Vec::new();
-    for tag in &req.tags {
-        let tag = validate_tag(tag)?;
-        if !tags.contains(&tag) {
-            tags.push(tag);
-        }
-    }
-    if req.body.len() > BODY_MAX {
-        return Err(ApiFailure::too_large(format!(
-            "post body is {} bytes, over the {BODY_MAX}-byte limit",
-            req.body.len()
-        )));
-    }
-    if req.body.trim().is_empty() && attachment.is_none() {
-        return Err(Error::Usage("the post is empty: give it some text".into()).into());
-    }
-
-    let lookup = channel.clone();
-    let exists = app.with_store(move |s| s.channel(&lookup)).await?.is_some();
-    if !exists {
-        if !req.create {
-            return Err(Error::NotFound(format!(
-                "no channel #{channel}: create it with `./beacon channel new {channel}`, \
-                 or post with --create"
-            ))
-            .into());
-        }
+    let prepared = prepare_post(app, name, &req, attachment.is_some()).await?;
+    if !prepared.channel_exists {
         let kind = EventKind::ChannelCreated {
-            name: channel.clone(),
+            name: prepared.channel.clone(),
             topic: None,
         };
         app.commit(kind).await?;
@@ -335,14 +519,14 @@ pub async fn post_to_channel(
 
     let post = NewPost {
         post_id: String::new(), // the event's id becomes the post's
-        channel,
-        author,
+        channel: prepared.channel,
+        author: prepared.author,
         author_kind: req.author_kind,
-        client: clean(req.client),
+        client: prepared.client,
         node: app.cfg.node.clone(),
         mentions: parse_mentions(&req.body),
         body: req.body,
-        tags,
+        tags: prepared.tags,
         attachment,
     };
     let applied = app.commit(EventKind::PostCreated(post)).await?;
@@ -358,26 +542,45 @@ pub async fn post_to_channel(
 /// The post a `post_created` event this node just committed made. Safe to
 /// render without asking the store: [`AppState::commit`] validated it.
 fn committed_post(applied: &Applied) -> Result<PostRow, Error> {
-    let EventKind::PostCreated(p) = &applied.event.kind else {
-        return Err(Error::Internal(anyhow::anyhow!(
+    PostRow::from_applied(applied).ok_or_else(|| {
+        Error::Internal(anyhow::anyhow!(
             "committed event {} is not a post",
             applied.event.id
-        )));
-    };
-    Ok(PostRow {
-        id: p.post_id.clone(),
-        channel: p.channel.clone(),
-        ts: applied.event.ts,
-        author: p.author.clone(),
-        author_kind: p.author_kind,
-        client: p.client.clone(),
-        node: p.node.clone(),
-        body: p.body.clone(),
-        tags: p.tags.clone(),
-        mentions: p.mentions.clone(),
-        attachment: p.attachment.clone(),
-        arrival: applied.arrival,
+        ))
     })
+}
+
+// ------------------------------------------------------------- attachments
+
+/// `GET /api/files/:sha256`: the attachment's bytes, streamed from disk.
+async fn get_file(
+    State(app): State<AppState>,
+    ApiPath(sha256): ApiPath<String>,
+) -> Result<Response, ApiFailure> {
+    if !is_sha256(&sha256) {
+        return Err(usage(format!(
+            "{sha256:?} is not a sha256: expected 64 lowercase hex digits"
+        )));
+    }
+    let Some((file, len)) = app.blobs.open(&sha256).await? else {
+        return Err(Error::NotFound(format!("no attachment {sha256} on this node")).into());
+    };
+    // A download does not outlive the node.
+    let shutdown = app.shutdown.clone();
+    let chunks = ReaderStream::with_capacity(file, FILE_CHUNK)
+        .take_until(async move { shutdown.triggered().await });
+    let mut response = Response::new(Body::from_stream(chunks));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok(response)
 }
 
 async fn get_post(
@@ -441,6 +644,12 @@ async fn heartbeat(
         node: app.cfg.node.clone(),
         status: clean(req.status),
     };
+    // Checked here, not left to the write: a heartbeat that is not due is
+    // dropped, and a bad one must be refused all the same.
+    validate_client(&presence.client)?;
+    if let Some(status) = &presence.status {
+        validate_status(status)?;
+    }
     let check = presence.clone();
     let recorded = app
         .commit_if(EventKind::AgentSeen(presence), move |s, now| {

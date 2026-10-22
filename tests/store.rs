@@ -1492,3 +1492,36 @@ fn cursors_and_joins_persist_across_reopen() {
     assert_eq!(a.joins("h").unwrap(), ["beacon"]);
     assert_eq!(unread_bodies(&a, "h", 50), ["two"]);
 }
+
+#[test]
+fn post_row_from_applied_is_the_row_the_store_derives() {
+    let (mut a, _) = pair();
+    let p = NewPost {
+        attachment: Some(Attachment {
+            sha256: "ab".repeat(32),
+            name: "log.txt".into(),
+            size: 1234,
+        }),
+        tags: vec!["done".into(), "log".into()],
+        client: None,
+        ..new_post("pc", "general", "see log @mac-agent")
+    };
+    let applied = a.append_local(EventKind::PostCreated(p), 10).unwrap();
+    let built = PostRow::from_applied(&applied).expect("a post_created event");
+    let stored = a.post(&built.id).unwrap();
+    assert_eq!(built, stored, "the two ways of making a PostRow agree");
+    assert_eq!(built.arrival, applied.arrival);
+    assert_eq!(built.ts, 10);
+
+    // Events that are not posts make no row.
+    let channel = a
+        .append_local(
+            EventKind::ChannelCreated {
+                name: "builds".into(),
+                topic: None,
+            },
+            11,
+        )
+        .unwrap();
+    assert_eq!(PostRow::from_applied(&channel), None);
+}
