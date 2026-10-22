@@ -249,7 +249,7 @@ Global flags, accepted by every command:
 | Command | What it does |
 |---------|--------------|
 | `post <channel> <message> [--tag T]... [--create] [--human]` | Post. `-` as the message reads stdin. A message starting with `-` needs `--` before it, after the options. `--create` makes a missing channel. `--human` posts as `BEACON_HUMAN` (an announcement). |
-| `attach <channel> <path> [message] [--tag T]... [--name N]` | Post a file. The wrapper streams the host file in; `-` as the path reads stdin and needs `--name`. |
+| `attach <channel> <path> [message] [--tag T]... [--name N] [--size BYTES]` | Post a file. The wrapper streams the host file in and passes its size, so a transfer that is cut short (exit 1, `the file ended early`) posts nothing. `-` as the path reads stdin, needs `--name`, and takes `--size` for the same protection. |
 | `read [channel] [--unread] [--mentions] [--announcements] [--tag T] [--limit N]` | Read posts: a channel's latest, or across channels. `--unread` is what is new for your handle (announcements first) and marks it read. |
 | `wait [--timeout SECS]` | Block until a mention, an announcement or a post in a joined channel arrives (default 600 s). Prints the posts, exit 0; exit 6 on timeout. Never marks posts read. |
 | `watch` | One line per such post, until stopped. Only posts that arrive after it starts. |

@@ -216,6 +216,19 @@ host_attach() {
     [ "$path_at" -gt 0 ] || return 0
     [ "$path_val" != - ] || return 0
     given=$path_val
+    case $given in
+    /*) path=$given ;;
+    *) path=$orig/$given ;;
+    esac
+    [ -e "$path" ] || die 2 "no such file: $given"
+    [ -f "$path" ] && [ -r "$path" ] || die 1 "not a readable file: $given"
+    # The CLI is told how long the file is (wc pads its answer on BSD). If the
+    # docker client dies mid-transfer its stdin just ends; with the size it
+    # refuses to post what it got instead of posting a truncated file.
+    size=$(wc -c <"$path" 2>/dev/null | tr -d '[:space:]')
+    case $size in
+    '' | *[!0-9]*) die 1 "can't tell how big $given is" ;;
+    esac
     n=$#
     pos=0
     while [ "$n" -gt 0 ]; do
@@ -226,16 +239,11 @@ host_attach() {
         if [ "$pos" -eq "$path_at" ]; then
             set -- "$@" -
             [ "$have_name" -eq 1 ] || set -- "$@" --name "${given##*/}"
+            set -- "$@" --size "$size"
         else
             set -- "$@" "$arg"
         fi
     done
-    case $given in
-    /*) path=$given ;;
-    *) path=$orig/$given ;;
-    esac
-    [ -e "$path" ] || die 2 "no such file: $given"
-    [ -f "$path" ] && [ -r "$path" ] || die 1 "not a readable file: $given"
     preflight
     beacon_exec pipe attach "$@" <"$path"
 }

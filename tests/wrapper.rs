@@ -410,11 +410,90 @@ fn attach_streams_host_file() {
             "-",
             "--name",
             "report (final).log",
+            "--size",
+            &bytes.len().to_string(),
             "see the \"log\"",
             "--tag",
             "done"
         ])
     );
+}
+
+#[test]
+fn attach_tells_the_cli_the_files_size() {
+    // R29: a stdin that ends early (the docker client was killed) must not
+    // become a truncated post, so the CLI is told how long the file is.
+    let sb = Sandbox::new();
+    let cases: &[(&str, Vec<u8>)] = &[
+        ("empty.txt", Vec::new()),
+        ("one.txt", b"x".to_vec()),
+        ("newline.txt", b"line\n".to_vec()),
+        ("blank lines.txt", b"\n\n\n".to_vec()),
+        ("binary.bin", (0..=255u8).cycle().take(100_003).collect()),
+    ];
+    for (name, bytes) in cases {
+        let file = sb.work.join(name);
+        fs::write(&file, bytes).unwrap();
+        let run = sb.run(sb.command(&["attach", "general", file.to_str().unwrap()]));
+        assert_eq!(run.code, 0, "{name}: {}", run.stderr);
+        assert_eq!(sb.exec_stdin(), *bytes, "{name}");
+        assert_eq!(
+            sb.argv("exec"),
+            exec_argv(&[
+                "attach",
+                "general",
+                "-",
+                "--name",
+                name,
+                "--size",
+                &bytes.len().to_string()
+            ]),
+            "{name}"
+        );
+    }
+}
+
+/// BSD's `wc -c` pads its answer with spaces; the size passed on has none.
+#[test]
+fn attach_size_survives_a_wc_that_pads_its_answer() {
+    let sb = Sandbox::new();
+    write_script(
+        &sb.bin.join("wc"),
+        "#!/bin/sh\nout=$(\"${REAL_WC:?}\" \"$@\") || exit $?\nprintf '%12s\\n' \"$out\"\n",
+    );
+    let file = sb.work.join("padded.txt");
+    fs::write(&file, b"twelve bytes").unwrap();
+    let mut cmd = sb.command(&["attach", "general", file.to_str().unwrap()]);
+    cmd.env("REAL_WC", find_on_path("wc"));
+    let run = sb.run(cmd);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(
+        sb.argv("exec"),
+        exec_argv(&[
+            "attach",
+            "general",
+            "-",
+            "--name",
+            "padded.txt",
+            "--size",
+            "12"
+        ])
+    );
+}
+
+#[test]
+fn attach_without_a_size_never_reaches_docker() {
+    let sb = Sandbox::new();
+    write_script(&sb.bin.join("wc"), "#!/bin/sh\necho 'no idea'\n");
+    let file = sb.work.join("f.txt");
+    fs::write(&file, b"bytes").unwrap();
+    let run = sb.run(sb.command(&["attach", "general", file.to_str().unwrap()]));
+    assert_eq!(run.code, 1);
+    assert_eq!(
+        run.stderr,
+        format!("can't tell how big {} is\n", file.to_str().unwrap())
+    );
+    assert!(!sb.called("exec"), "a file of unknown size was streamed");
 }
 
 #[test]
@@ -434,7 +513,15 @@ fn attach_relative_path_from_other_dir() {
     assert_eq!(sb.exec_stdin(), b"top level bytes");
     assert_eq!(
         sb.argv("exec"),
-        exec_argv(&["attach", "general", "-", "--name", "notes.txt"])
+        exec_argv(&[
+            "attach",
+            "general",
+            "-",
+            "--name",
+            "notes.txt",
+            "--size",
+            "15"
+        ])
     );
     assert_eq!(
         sb.exec_cwd(),
@@ -451,7 +538,7 @@ fn attach_relative_path_from_other_dir() {
     assert_eq!(sb.exec_stdin(), b"\x00deep\xff");
     assert_eq!(
         sb.argv("exec"),
-        exec_argv(&["attach", "general", "-", "--name", "deep.bin", "a note"])
+        exec_argv(&["attach", "general", "-", "--name", "deep.bin", "--size", "6", "a note"])
     );
 }
 
@@ -907,13 +994,13 @@ fn global_flags_before_attach_and_get() {
         (
             &["--as", "me", "attach", "general", "f.txt", "hi"],
             &[
-                "attach", "--as", "me", "general", "-", "--name", "f.txt", "hi",
+                "attach", "--as", "me", "general", "-", "--name", "f.txt", "--size", "10", "hi",
             ],
         ),
         (
             &["--json", "--strict", "attach", "general", "./f.txt"],
             &[
-                "attach", "--json", "--strict", "general", "-", "--name", "f.txt",
+                "attach", "--json", "--strict", "general", "-", "--name", "f.txt", "--size", "10",
             ],
         ),
         (
@@ -932,6 +1019,8 @@ fn global_flags_before_attach_and_get() {
                 "-",
                 "--name",
                 "f.txt",
+                "--size",
+                "10",
                 "--tag",
                 "done",
             ],
@@ -966,13 +1055,15 @@ fn attach_with_tag_before_and_between_positionals() {
         (
             &["--tag", "done", "general", "f.txt", "hi"],
             &[
-                "attach", "--tag", "done", "general", "-", "--name", "f.txt", "hi",
+                "attach", "--tag", "done", "general", "-", "--name", "f.txt", "--size", "10", "hi",
             ],
             true,
         ),
         (
             &["general", "--tag", "done", "f.txt"],
-            &["attach", "general", "--tag", "done", "-", "--name", "f.txt"],
+            &[
+                "attach", "general", "--tag", "done", "-", "--name", "f.txt", "--size", "10",
+            ],
             true,
         ),
         (
@@ -984,6 +1075,8 @@ fn attach_with_tag_before_and_between_positionals() {
                 "-",
                 "--name",
                 "f.txt",
+                "--size",
+                "10",
                 "msg",
                 "--tag",
                 "fyi",
@@ -993,12 +1086,27 @@ fn attach_with_tag_before_and_between_positionals() {
         // A name the user chose wins; the wrapper adds none of its own.
         (
             &["general", "f.txt", "--name", "custom.txt"],
-            &["attach", "general", "-", "--name", "custom.txt"],
+            &[
+                "attach",
+                "general",
+                "-",
+                "--size",
+                "10",
+                "--name",
+                "custom.txt",
+            ],
             true,
         ),
         (
             &["--name=custom.txt", "general", "f.txt"],
-            &["attach", "--name=custom.txt", "general", "-"],
+            &[
+                "attach",
+                "--name=custom.txt",
+                "general",
+                "-",
+                "--size",
+                "10",
+            ],
             true,
         ),
         // A message that looks like a flag, after `--`, is left alone.
@@ -1010,6 +1118,8 @@ fn attach_with_tag_before_and_between_positionals() {
                 "-",
                 "--name",
                 "f.txt",
+                "--size",
+                "10",
                 "--",
                 "-dash message",
             ],
