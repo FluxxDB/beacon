@@ -28,7 +28,7 @@
 //!   cancels; any other key cancels and does what it does without the space
 //!   (`space x` types `x` in the composer). A paste, a resize or the focus
 //!   moving cancels it too. In the composer, a dialog or the `/` filter,
-//!   `space` is just a space.
+//!   `space` never starts the chord and does what it always did there.
 //! * **`E` (shift-e)** is how you get into a shown sidebar: from the posts
 //!   it goes there, showing it first if it is hidden; from the sidebar it
 //!   hides it and goes to the composer. Below 80 columns `E` and `space e`
@@ -63,7 +63,7 @@ use crate::tui::widgets::posts::{self, Span};
 /// with `shift-e`.
 pub const HELP: [(&str, &str); 14] = [
     ("tab  shift-tab", "posts, composer"),
-    ("space e  E", "show/hide sidebar; E: go to it"),
+    ("space e", "sidebar on/off; shift-e: go in"),
     ("j k  ↓ ↑", "pick a channel or a post"),
     ("enter", "send, or write in the channel"),
     ("shift-enter", "new line (or alt-enter, ctrl-j)"),
@@ -148,6 +148,7 @@ impl App {
     /// with newlines never sends.
     pub(crate) fn on_paste(&mut self, text: &str) -> Vec<Cmd> {
         self.clear_armed = false;
+        self.leader = false;
         match &mut self.dialog {
             Some(Dialog::NewChannel(form)) => {
                 for c in text.chars() {
@@ -494,8 +495,9 @@ impl App {
     }
 
     /// `Tab` and `Shift-Tab`: between the posts and the composer, never into
-    /// the sidebar (`shift-e` and `space e` go there). From the sidebar,
-    /// `Tab` goes on to the composer and `Shift-Tab` back to the posts.
+    /// the sidebar (`shift-e` goes there, and so does `space e` when it
+    /// shows it). From the sidebar, `Tab` goes on to the composer and
+    /// `Shift-Tab` back to the posts.
     fn cycle_focus(&mut self, forward: bool) {
         self.focus = match (self.focus, forward) {
             (Focus::Posts, _) | (Focus::Sidebar, true) => Focus::Composer,

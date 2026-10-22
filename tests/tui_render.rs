@@ -2285,6 +2285,52 @@ mod behaviour {
         assert_eq!((app.input.as_str(), app.hide_sidebar), ("e", false));
     }
 
+    #[test]
+    fn live_updates_keep_the_chord() {
+        // The clock and the feed go on while space waits: neither ends it.
+        let mut app = in_the_posts();
+        app.update(space());
+        app.update(Msg::Tick(at(18, 42)));
+        app.update(Msg::Stream(StreamEvent::Post(api_post(
+            3,
+            "general",
+            "pc-configs",
+            "still here",
+        ))));
+        assert!(app.posts.iter().any(|p| p.body == "still here"));
+        assert!(footer(&app).contains(LEADER_HINT));
+        app.update(ch('e'));
+        assert_eq!(
+            (app.focus, app.hide_sidebar, app.input.as_str()),
+            (Focus::Posts, true, "")
+        );
+    }
+
+    #[test]
+    fn a_toast_behind_the_hint_shows_once_the_chord_ends() {
+        // A failure that lands while space waits is covered by the hint, and
+        // its time does not run out unseen: once the chord ends it shows,
+        // for as long as it would have.
+        let start = at(18, 40);
+        let mut app = in_the_posts();
+        app.update(space());
+        app.update(Msg::Notice("Not saved: disk full".to_string()));
+        app.update(Msg::Tick(start + 60_000));
+        let foot = footer(&app);
+        assert!(
+            foot.contains(LEADER_HINT) && !foot.contains("disk full"),
+            "the hint wins while armed: |{foot}|"
+        );
+        app.update(key(KeyCode::Esc));
+        let foot = footer(&app);
+        assert!(foot.contains("Not saved: disk full"), "|{foot}|");
+        app.update(Msg::Tick(start + 61_000));
+        assert!(footer(&app).contains("Not saved: disk full"));
+        // Then it goes, as any failure does after ten seconds on screen.
+        app.update(Msg::Tick(start + 71_000));
+        assert!(!footer(&app).contains("disk full"));
+    }
+
     // ------------------------------------------------------------ sidebar
 
     #[test]
@@ -2598,12 +2644,13 @@ mod behaviour {
         }
         // The longest keys keep two spaces before what they do.
         assert!(text.contains("tab  shift-tab  posts, composer"), "{text}");
-        // space e and shift-e share a row, so the list still fits 80×24.
+        // space e and shift-e share a row, so the list still fits 80×24:
+        // shift-e has no row of its own.
         assert!(
-            text.contains("space e  E      show/hide sidebar; E: go to it"),
+            text.contains("space e         sidebar on/off; shift-e: go in"),
             "{text}"
         );
-        assert!(!text.contains("shift-e "), "{text}");
+        assert!(!text.contains("shift-e  "), "{text}");
         assert!(accent_cells(&screen(&app)).len() <= 1, "no primary action");
         // At 80×24 it still fits, every row whole, sidebar shown or hidden,
         // and above the footer: its rule and key row stay whole.
@@ -3378,6 +3425,10 @@ mod behaviour {
     #[test]
     fn behaviour_states_render_at_every_size() {
         let mut apps = Vec::new();
+        // Space just pressed in the posts: the leader's hint in the footer.
+        let mut armed = live_app();
+        feed(&mut armed, [key(KeyCode::Tab), ch(' ')]);
+        apps.push(armed);
         let mut app = live_app();
         app.update(ch('?'));
         apps.push(app.clone());

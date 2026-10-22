@@ -124,7 +124,8 @@ pub struct App {
     pub toast_error: bool,
 
     // ------------------------------------------- remembered between frames
-    /// When the toast goes away (epoch ms); `None` keeps it up.
+    /// When the toast goes away (epoch ms); `None` keeps it up. Pushed back
+    /// while the leader's hint covers the toast.
     pub toast_until_ms: Option<i64>,
     /// The terminal's size, for paging and keeping the selected post in view.
     pub size: (u16, u16),
@@ -667,8 +668,15 @@ impl App {
     // -------------------------------------------------------------- time
 
     fn on_tick(&mut self, now_ms: i64) -> Vec<Cmd> {
+        let elapsed = now_ms.saturating_sub(self.now_ms);
         self.now_ms = now_ms;
-        if self.toast_until_ms.is_some_and(|until| now_ms >= until) {
+        if self.leader {
+            // The leader's hint covers the toast: its time doesn't run
+            // until it shows again.
+            if let Some(until) = &mut self.toast_until_ms {
+                *until = until.saturating_add(elapsed);
+            }
+        } else if self.toast_until_ms.is_some_and(|until| now_ms >= until) {
             self.toast = None;
             self.toast_error = false;
             self.toast_until_ms = None;
