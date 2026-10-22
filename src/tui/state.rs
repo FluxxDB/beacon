@@ -106,6 +106,12 @@ pub struct App {
     pub sending: Option<String>,
     /// A full page came back, so there may be older posts above the oldest.
     pub has_older: bool,
+    /// `(ts, id)` of the oldest post the pages brought: what the next older
+    /// page is asked for, and the line above which live posts are left for
+    /// paging to bring (a late-synced old post must not move it).
+    pub oldest_page: Option<(i64, String)>,
+    /// The node refused BEACON_SECRET: the down band says so.
+    pub secret_rejected: bool,
     /// A page of older posts is on its way.
     pub loading_older: bool,
     /// What the view structs leave out of each loaded post, by id.
@@ -149,6 +155,8 @@ impl App {
             confirm: None,
             sending: None,
             has_older: false,
+            oldest_page: None,
+            secret_rejected: false,
             loading_older: false,
             extras: HashMap::new(),
             arrivals: None,
@@ -212,8 +220,38 @@ pub enum Msg {
     ChannelDeleted(Result<String, String>),
     /// An attachment was saved to the exchange folder under this name.
     Saved(Result<String, String>),
-    /// A problem worth a toast (the server refused the secret, say).
+    /// A problem worth a toast.
     Notice(String),
+    /// The node answered 401: this device's BEACON_SECRET is not the node's.
+    SecretRejected,
+}
+
+/// Merges what one batch of messages asked for: one `MarkRead` per channel,
+/// at the highest arrival, where the first one was; one `LoadChannels`.
+/// Everything else is kept, in order. A burst of live posts then costs one
+/// cursor update, not one per post.
+pub fn coalesce(cmds: Vec<Cmd>) -> Vec<Cmd> {
+    let mut out: Vec<Cmd> = Vec::with_capacity(cmds.len());
+    for cmd in cmds {
+        match cmd {
+            Cmd::MarkRead { channel, arrival } => {
+                let earlier = out.iter_mut().find_map(|c| match c {
+                    Cmd::MarkRead {
+                        channel: seen,
+                        arrival: at,
+                    } if *seen == channel => Some(at),
+                    _ => None,
+                });
+                match earlier {
+                    Some(at) => *at = (*at).max(arrival),
+                    None => out.push(Cmd::MarkRead { channel, arrival }),
+                }
+            }
+            Cmd::LoadChannels if out.contains(&Cmd::LoadChannels) => {}
+            cmd => out.push(cmd),
+        }
+    }
+    out
 }
 
 /// An answer to a `Load…` command.
@@ -416,7 +454,15 @@ impl App {
     /// Applies `msg` and returns what the event loop should do next.
     pub fn update(&mut self, msg: Msg) -> Vec<Cmd> {
         match msg {
-            Msg::Key(key) => self.on_key(key),
+            Msg::Key(key) => {
+                let scrolled = self.scroll > 0;
+                let mut cmds = self.on_key(key);
+                // Back down at the newest: what came in meanwhile is seen.
+                if scrolled && self.scroll == 0 {
+                    cmds.extend(self.caught_up());
+                }
+                cmds
+            }
             Msg::Paste(text) => self.on_paste(&text),
             Msg::Resize(width, height) => {
                 self.size = (width, height);
@@ -463,6 +509,10 @@ impl App {
             }
             Msg::Notice(text) => {
                 self.error(text);
+                Vec::new()
+            }
+            Msg::SecretRejected => {
+                self.secret_rejected = true;
                 Vec::new()
             }
         }
@@ -529,6 +579,7 @@ impl App {
             Conn::Up => {
                 self.connection = Conn::Up;
                 self.live = true;
+                self.secret_rejected = false;
                 self.last_heartbeat_ms = Some(self.now_ms);
                 self.last_status_ms = Some(self.now_ms);
                 // Whatever happened while the feed was closed is read afresh.
@@ -561,6 +612,7 @@ impl App {
         self.selected_post = None;
         self.scroll = 0;
         self.has_older = false;
+        self.oldest_page = None;
         self.load_view()
     }
 
@@ -600,21 +652,38 @@ impl App {
             return Vec::new();
         };
         let name = name.clone();
-        if let Some(channel) = self.channels.iter_mut().find(|c| c.name == name) {
-            channel.unread = 0;
-        }
-        let newest = self
-            .posts
+        // What is on screen: the filter may hide some of the view.
+        let newest = posts::shown(self)
             .iter()
             .filter_map(|p| self.extras.get(&p.id))
             .map(|e| e.arrival)
             .max();
-        match newest {
-            Some(arrival) => vec![Cmd::MarkRead {
-                channel: name,
-                arrival,
-            }],
-            None => Vec::new(),
+        let Some(arrival) = newest else {
+            return Vec::new();
+        };
+        if let Some(channel) = self.channels.iter_mut().find(|c| c.name == name) {
+            channel.unread = 0;
+        }
+        vec![Cmd::MarkRead {
+            channel: name,
+            arrival,
+        }]
+    }
+
+    /// The view is back at the newest post: if posts came in while it was
+    /// scrolled up, they have now been seen.
+    fn caught_up(&mut self) -> Vec<Cmd> {
+        let Selection::Channel(name) = &self.selected else {
+            return Vec::new();
+        };
+        if self
+            .channels
+            .iter()
+            .any(|c| &c.name == name && c.unread > 0)
+        {
+            self.mark_read()
+        } else {
+            Vec::new()
         }
     }
 
@@ -683,6 +752,11 @@ impl App {
             return Vec::new();
         }
         let older = before.is_some();
+        // An older page fits only right above the oldest page post; one
+        // asked for before the view was reloaded would leave a gap.
+        if older && before != self.oldest_page {
+            return Vec::new();
+        }
         let page = match page {
             Ok(page) => page,
             Err(e) => {
@@ -705,11 +779,18 @@ impl App {
             self.extras
                 .insert(post.id.clone(), convert::post_extra(post));
         }
-        let items = page.posts.iter().map(convert::post_item);
+        let mut items: Vec<PostItem> = page.posts.iter().map(convert::post_item).collect();
+        sort_posts(&mut items);
+        // Where the next older page starts: set by pages only, never by a
+        // live post, however old its ts.
+        let page_oldest = items.first().map(|p| (p.ts_ms, p.id.clone()));
 
         if older {
             self.loading_older = false;
             self.has_older = full;
+            if page_oldest.is_some() {
+                self.oldest_page = page_oldest;
+            }
             for item in items {
                 if !self.posts.iter().any(|p| p.id == item.id) {
                     self.posts.push(item);
@@ -719,16 +800,26 @@ impl App {
             return Vec::new();
         }
 
+        let has_older = full && matches!(self.selected, Selection::Channel(_));
         let arrivals = self.arrivals.take().unwrap_or_default();
         let mut posts: Vec<PostItem> = items
+            .into_iter()
             .filter(|p| !arrivals.deleted.contains(&p.id))
             .collect();
         for post in arrivals.posts {
-            if !arrivals.deleted.contains(&post.id) && !posts.iter().any(|p| p.id == post.id) {
+            let above = has_older
+                && page_oldest
+                    .as_ref()
+                    .is_some_and(|c| before_cursor(&post, c));
+            if !above
+                && !arrivals.deleted.contains(&post.id)
+                && !posts.iter().any(|p| p.id == post.id)
+            {
                 posts.push(post);
             }
         }
         sort_posts(&mut posts);
+        self.oldest_page = page_oldest;
         self.posts = posts;
         let ids: HashSet<String> = self.posts.iter().map(|p| p.id.clone()).collect();
         self.extras.retain(|id, _| ids.contains(id));
@@ -740,7 +831,7 @@ impl App {
             self.selected_post = None;
         }
         self.loading = false;
-        self.has_older = full && matches!(self.selected, Selection::Channel(_));
+        self.has_older = has_older;
         self.clamp_scroll();
         // A channel on screen is a channel read.
         self.mark_read()
@@ -818,18 +909,13 @@ impl App {
         let on_screen = self.selected == Selection::Channel(item.channel.clone());
         let announcement = item.announcement;
         let channel = item.channel.clone();
-        if self.in_view(&item) {
-            self.extras
-                .insert(item.id.clone(), convert::post_extra(post));
-            if let Some(arrivals) = &mut self.arrivals {
-                arrivals.posts.push(item.clone());
-            }
-            self.insert_post(item);
-        }
+        let shown = posts::is_shown(self, &item);
+        let placed = self.add_to_view(item, convert::post_extra(post));
         if mine {
             return cmds;
         }
-        if on_screen {
+        // Read only if it is where Dang is looking: the bottom of the view.
+        if on_screen && placed && shown && self.scroll == 0 {
             cmds.push(Cmd::MarkRead {
                 channel,
                 arrival: post.arrival,
@@ -869,14 +955,9 @@ impl App {
             }
         }
         let item = convert::post_item(&created.post);
-        if self.in_view(&item) {
-            self.extras
-                .insert(item.id.clone(), convert::post_extra(&created.post));
-            if let Some(arrivals) = &mut self.arrivals {
-                arrivals.posts.push(item.clone());
-            }
-            self.insert_post(item);
-        }
+        self.add_to_view(item, convert::post_extra(&created.post));
+        // Down to the newest, to see it; what came in meanwhile is seen too.
+        let scrolled = self.scroll > 0;
         self.scroll = 0;
         let queued: Vec<&str> = created
             .delivery
@@ -887,7 +968,38 @@ impl App {
         if !queued.is_empty() {
             self.toast(format!("sent · queued for {} (offline)", queued.join(", ")));
         }
-        Vec::new()
+        if scrolled {
+            self.caught_up()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Puts a post that came outside a page (live, or just sent) into the
+    /// view, if it belongs there. One older than the oldest page post, with
+    /// more history above, is left for paging to bring in its place: shown
+    /// now, it would become the oldest post and the next page would be asked
+    /// for from it, skipping everything in between. Returns whether it is
+    /// now in the view.
+    fn add_to_view(&mut self, item: PostItem, extra: PostExtra) -> bool {
+        if !self.in_view(&item) {
+            return false;
+        }
+        // While the first page is on its way, the page decides (on_posts).
+        if let Some(arrivals) = &mut self.arrivals {
+            arrivals.posts.push(item.clone());
+        }
+        if self.has_older
+            && self
+                .oldest_page
+                .as_ref()
+                .is_some_and(|c| before_cursor(&item, c))
+        {
+            return false;
+        }
+        self.extras.insert(item.id.clone(), extra);
+        self.insert_post(item);
+        true
     }
 
     fn on_created(&mut self, result: Result<ChannelAck, String>) -> Vec<Cmd> {
@@ -921,19 +1033,36 @@ impl App {
         if self.posts.iter().any(|p| p.id == item.id) {
             return;
         }
-        let width = self.posts_width();
-        let before = width.map(|w| total_rows(&posts::spans(self, w)));
-        let id = item.id.clone();
         let at = self
             .posts
             .partition_point(|p| (p.ts_ms, p.id.as_str()) < (item.ts_ms, item.id.as_str()));
-        self.posts.insert(at, item);
-        if let (Some(width), Some(before), true) = (width, before, self.scroll > 0) {
-            let spans = posts::spans(self, width);
-            let below = spans.iter().find(|s| s.id == id).map(|s| s.bottom);
-            if below.is_some_and(|b| b < self.scroll) {
-                self.scroll += total_rows(&spans).saturating_sub(before);
+        // At the bottom nothing moves; measuring is only needed scrolled up.
+        let width = match self.posts_width() {
+            Some(width) if self.scroll > 0 => width,
+            _ => {
+                self.posts.insert(at, item);
+                return;
             }
+        };
+        if at == self.posts.len() {
+            // The usual case, a new newest post: it adds its own rows and
+            // the gap above it, below the view.
+            if posts::is_shown(self, &item) {
+                let above = posts::shown(self).last().map(|p| (*p).clone());
+                let gap = above.map_or(0, |p| posts::gap_rows(&p, &item, self));
+                self.scroll += gap + posts::post_rows(&item, self, width);
+            }
+            self.posts.push(item);
+            return;
+        }
+        // Somewhere in the middle (a late post): measure what moved.
+        let before = total_rows(&posts::spans(self, width));
+        let id = item.id.clone();
+        self.posts.insert(at, item);
+        let spans = posts::spans(self, width);
+        let below = spans.iter().find(|s| s.id == id).map(|s| s.bottom);
+        if below.is_some_and(|b| b < self.scroll) {
+            self.scroll += total_rows(&spans).saturating_sub(before);
         }
     }
 
@@ -987,6 +1116,11 @@ impl App {
             self.scroll = self.scroll.min(max);
         }
     }
+}
+
+/// Whether `post` sorts before the cursor `(ts, id)`.
+fn before_cursor(post: &PostItem, cursor: &(i64, String)) -> bool {
+    (post.ts_ms, post.id.as_str()) < (cursor.0, cursor.1.as_str())
 }
 
 /// Rows taken by everything laid out in `spans`.

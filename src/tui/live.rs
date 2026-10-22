@@ -48,7 +48,7 @@ use crate::error::Error;
 use crate::model::{validate_handle, AuthorKind};
 use crate::server::now_ms;
 use crate::tui::state::{
-    App, Cmd, Conn, ExchangeFile, Loaded, Msg, Selection, ANNOUNCEMENTS_LIMIT, PAGE,
+    coalesce, App, Cmd, Conn, ExchangeFile, Loaded, Msg, Selection, ANNOUNCEMENTS_LIMIT, PAGE,
 };
 use crate::tui::theme::{ColorMode, Theme};
 use crate::tui::view;
@@ -67,9 +67,6 @@ const TICK: Duration = Duration::from_secs(1);
 const BATCH: usize = 256;
 /// What the TUI posts as.
 const CLIENT_NAME: &str = "tui";
-/// Shown when the node refuses the secret.
-const AUTH_PROBLEM: &str =
-    "The server refused BEACON_SECRET: check it matches the server's .env, then restart";
 
 /// What the TUI needs besides the client.
 #[derive(Debug, Clone)]
@@ -123,12 +120,46 @@ static PANICKED: AtomicBool = AtomicBool::new(false);
 /// Runs the TUI on the real terminal until Dang quits.
 pub async fn run(client: Client, cfg: TuiConfig) -> Result<(), Error> {
     install_panic_hook();
-    let result = run_on_terminal(client, cfg).await;
+    // Listening before the terminal changes: a signal that comes at any
+    // point after that ends the TUI the way Ctrl-C does.
+    let stop = stop_signal()?;
+    let result = run_on_terminal(client, cfg, stop).await;
     restore_terminal();
     result
 }
 
-async fn run_on_terminal(client: Client, cfg: TuiConfig) -> Result<(), Error> {
+/// Resolves when the process is asked to stop: SIGTERM (`kill`, `docker
+/// stop`), SIGHUP (the terminal went away) or SIGINT (`kill -INT`; Ctrl-C
+/// itself arrives as a key in raw mode). Handling them replaces the default
+/// of dying on the spot, which would leave the terminal raw.
+#[cfg(unix)]
+fn stop_signal() -> Result<impl std::future::Future<Output = ()>, Error> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let listen = |kind| {
+        signal(kind).map_err(|e| Error::Internal(anyhow::anyhow!("cannot listen for signals: {e}")))
+    };
+    let mut term = listen(SignalKind::terminate())?;
+    let mut hangup = listen(SignalKind::hangup())?;
+    let mut interrupt = listen(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = hangup.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn stop_signal() -> Result<impl std::future::Future<Output = ()>, Error> {
+    Ok(std::future::pending())
+}
+
+async fn run_on_terminal(
+    client: Client,
+    cfg: TuiConfig,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<(), Error> {
     // Asking the terminal what it supports can wait on its answer.
     tokio::task::spawn_blocking(enter_terminal)
         .await
@@ -138,10 +169,12 @@ async fn run_on_terminal(client: Client, cfg: TuiConfig) -> Result<(), Error> {
         Terminal::new(CrosstermBackend::new(io::stdout())).map_err(terminal_error)?;
     terminal.hide_cursor().map_err(terminal_error)?;
     terminal.clear().map_err(terminal_error)?;
-    // A terminal that can no longer be read ends the TUI.
+    // A terminal that can no longer be read ends the TUI, and so does a
+    // stop signal: the input ends, and the loop with it.
     let input = EventStream::new()
         .take_while(|event| std::future::ready(event.is_ok()))
-        .filter_map(|event| std::future::ready(event.ok().and_then(input_msg)));
+        .filter_map(|event| std::future::ready(event.ok().and_then(input_msg)))
+        .take_until(stop);
     drive(&mut terminal, client, cfg, Box::pin(input), |_| {}).await
 }
 
@@ -292,7 +325,8 @@ where
                 Err(_) => break,
             }
         }
-        for cmd in cmds {
+        // A burst of live posts asks for one cursor update, not one each.
+        for cmd in coalesce(cmds) {
             match cmd {
                 Cmd::Quit => return Ok(()),
                 Cmd::LoadChannels
@@ -346,8 +380,9 @@ async fn live_feed(client: Client, me: String, tx: UnboundedSender<Msg>) {
                     }
                 }
             }
+            // The node is there but refuses the secret: the band says so.
             Err(Error::Auth) => {
-                if tx.send(Msg::Notice(AUTH_PROBLEM.to_string())).is_err() {
+                if tx.send(Msg::SecretRejected).is_err() {
                     return;
                 }
             }
@@ -497,7 +532,7 @@ impl Worker {
                     status: None,
                 };
                 match client.heartbeat(&beat).await {
-                    Err(Error::Auth) => Some(Msg::Notice(AUTH_PROBLEM.to_string())),
+                    Err(Error::Auth) => Some(Msg::SecretRejected),
                     _ => None,
                 }
             }
@@ -574,7 +609,7 @@ impl Worker {
     async fn channels(&self) -> Option<Msg> {
         match self.client.channels(Some(&self.me)).await {
             Ok(list) => Some(Msg::Loaded(Loaded::Channels(list))),
-            Err(Error::Auth) => Some(Msg::Notice(AUTH_PROBLEM.to_string())),
+            Err(Error::Auth) => Some(Msg::SecretRejected),
             // The feed shows the server as down; it reloads when it is back.
             Err(_) => None,
         }

@@ -38,7 +38,11 @@ impl Tui {
     /// Starts the TUI against `url` as Dang, at 104×33, with `exchange` as
     /// its exchange folder.
     fn start(url: &str, exchange: &Path) -> Tui {
-        let client = Client::new(url, Some(SECRET)).unwrap();
+        Tui::start_with_secret(url, SECRET, exchange)
+    }
+
+    fn start_with_secret(url: &str, secret: &str, exchange: &Path) -> Tui {
+        let client = Client::new(url, Some(secret)).unwrap();
         let cfg = TuiConfig {
             human: "Dang".to_string(),
             exchange: exchange.to_path_buf(),
@@ -433,4 +437,227 @@ async fn new_channel_from_the_keys() {
     })
     .await
     .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wrong_secret_shows_the_rejected_band() {
+    tokio::time::timeout(DEADLINE, async {
+        let node = spawn_node("pc", &[]).await;
+        let exchange = tempfile::tempdir().unwrap();
+        let mut tui = Tui::start_with_secret(&node.url, "not-the-secret", exchange.path());
+        let screen = tui
+            .until(Duration::from_secs(3), "the rejected band", |s| {
+                s.contains("The server rejected BEACON_SECRET.")
+            })
+            .await;
+        assert!(screen.contains("Check .env on this device."), "{screen}");
+        assert!(!screen.contains("docker compose"), "{screen}");
+        tui.quit().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+// ------------------------------------------------- the real binary on a pty
+
+mod pty {
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// A pty pair, 104×33.
+    fn open_pty() -> (OwnedFd, OwnedFd) {
+        let (mut master, mut slave) = (0, 0);
+        let size = libc::winsize {
+            ws_row: 33,
+            ws_col: 104,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: openpty writes two valid fds on success; the null pointers
+        // mean "default name and termios".
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &size,
+            )
+        };
+        assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+        // SAFETY: both fds are fresh and owned by nobody else.
+        unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
+    }
+
+    /// The terminal's local modes: canonical input and echo, as a shell has them.
+    fn cooked(fd: &OwnedFd) -> (bool, bool) {
+        // SAFETY: termios is plain data and tcgetattr fills it in.
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::tcgetattr(fd.as_raw_fd(), &mut t) };
+        assert_eq!(rc, 0, "tcgetattr: {}", std::io::Error::last_os_error());
+        (t.c_lflag & libc::ICANON != 0, t.c_lflag & libc::ECHO != 0)
+    }
+
+    /// Everything the program wrote, as it comes.
+    struct Output {
+        rx: mpsc::Receiver<Vec<u8>>,
+        seen: Vec<u8>,
+    }
+
+    impl Output {
+        /// Waits until the output (from `from` on) holds `needle`.
+        fn wait_for(&mut self, from: usize, needle: &[u8], within: Duration) {
+            let deadline = Instant::now() + within;
+            while !contains(&self.seen[from.min(self.seen.len())..], needle) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match self.rx.recv_timeout(left) {
+                    Ok(chunk) => self.seen.extend(chunk),
+                    Err(_) => panic!(
+                        "{:?} not written within {within:?}; got {:?}",
+                        String::from_utf8_lossy(needle),
+                        String::from_utf8_lossy(&self.seen)
+                    ),
+                }
+            }
+        }
+
+        fn drain(&mut self, for_: Duration) {
+            let deadline = Instant::now() + for_;
+            while let Ok(chunk) = self
+                .rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                self.seen.extend(chunk);
+            }
+        }
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// The child, killed if a failing test leaves it running.
+    struct Reaped(std::process::Child);
+
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    /// `beacon tui` on its own pty (its controlling terminal), with the
+    /// server unreachable; `signal` sent once it is running. The terminal
+    /// must come back: off the alternate screen, cursor shown, bracketed
+    /// paste off, canonical input and echo on.
+    fn signal_restores_the_terminal(signal: libc::c_int) {
+        let (master, slave) = open_pty();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_beacon"));
+        cmd.arg("tui")
+            .env("BEACON_SERVER", "http://127.0.0.1:1")
+            .env("BEACON_SECRET", "x")
+            .env("COLORTERM", "truecolor")
+            .env_remove("BEACON_HUMAN")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave.try_clone().unwrap()));
+        // SAFETY: only async-signal-safe calls between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                // A session of its own, with the pty as its terminal, so
+                // nothing reaches the terminal running the tests.
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = Reaped(cmd.spawn().unwrap());
+        drop(cmd);
+
+        let mut writer = File::from(master.try_clone().unwrap());
+        let mut reader = File::from(master);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut out = Output {
+            rx,
+            seen: Vec::new(),
+        };
+
+        // In the alternate screen, it asks the terminal two things, as a
+        // real one would be asked: its keyboard (answering only the device
+        // query means "nothing special") and where the cursor is.
+        out.wait_for(0, b"\x1b[?1049h", Duration::from_secs(10));
+        out.wait_for(0, b"\x1b[c", Duration::from_secs(5));
+        writer.write_all(b"\x1b[?62c").unwrap();
+        out.wait_for(0, b"\x1b[6n", Duration::from_secs(5));
+        writer.write_all(b"\x1b[1;1R").unwrap();
+        out.wait_for(0, b"Can't reach the beacon server", Duration::from_secs(10));
+        assert_eq!(cooked(&slave), (false, false), "raw mode while running");
+
+        let mark = out.seen.len();
+        // SAFETY: plain kill(2) on our own child.
+        assert_eq!(
+            unsafe { libc::kill(child.0.id() as libc::pid_t, signal) },
+            0
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "still running after signal {signal}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "signal {signal}: it exits, not dies"
+        );
+        out.drain(Duration::from_millis(200));
+        let after = &out.seen[mark..];
+        for (what, seq) in [
+            ("leaves the alternate screen", &b"\x1b[?1049l"[..]),
+            ("shows the cursor", b"\x1b[?25h"),
+            ("turns bracketed paste off", b"\x1b[?2004l"),
+        ] {
+            assert!(
+                contains(after, seq),
+                "signal {signal}: {what}; wrote {:?}",
+                String::from_utf8_lossy(after)
+            );
+        }
+        assert_eq!(
+            cooked(&slave),
+            (true, true),
+            "signal {signal}: cooked again"
+        );
+    }
+
+    #[test]
+    fn sigterm_restores_the_terminal() {
+        signal_restores_the_terminal(libc::SIGTERM);
+    }
+
+    #[test]
+    fn sighup_restores_the_terminal() {
+        signal_restores_the_terminal(libc::SIGHUP);
+    }
 }

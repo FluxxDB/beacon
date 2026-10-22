@@ -34,6 +34,7 @@ const BODY_MARGIN: u16 = 4;
 
 const SERVER_DOWN: &str =
     "Can't reach the beacon server. Start it with docker compose up -d. Retrying…";
+const SECRET_REJECTED: &str = "The server rejected BEACON_SECRET. Check .env on this device.";
 
 /// One row of the viewport: an optional band color across the pane (all but
 /// its last cell) and text runs at pane offsets.
@@ -57,7 +58,7 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
 
     let area = viewport(app, layout);
     if let Conn::Down { .. } = app.connection {
-        let band = server_down(full.width);
+        let band = server_down(app, full.width);
         draw_lines(
             canvas,
             Rect {
@@ -165,7 +166,7 @@ pub fn viewport(app: &App, layout: &Layout) -> Rect {
     let area = layout.posts;
     match app.connection {
         Conn::Down { .. } if area.width > INDENT + BODY_MARGIN => {
-            let used = (server_down(area.width).len() as u16 + 1).min(area.height);
+            let used = (server_down(app, area.width).len() as u16 + 1).min(area.height);
             Rect {
                 y: area.y + used,
                 height: area.height - used,
@@ -183,11 +184,27 @@ fn active_filter(app: &App) -> Option<&str> {
 
 /// The posts the pane shows: the view's posts that pass the filter, oldest first.
 pub fn shown(app: &App) -> Vec<&PostItem> {
-    let filter = active_filter(app);
-    app.posts
-        .iter()
-        .filter(|p| filter.is_none_or(|f| matches_filter(p, f)))
-        .collect()
+    app.posts.iter().filter(|p| is_shown(app, p)).collect()
+}
+
+/// Whether `post` passes the filter (all do when there is none).
+pub fn is_shown(app: &App, post: &PostItem) -> bool {
+    active_filter(app).is_none_or(|f| matches_filter(post, f))
+}
+
+/// Rows `post` takes in a pane `width` cells wide: header, body, attachment.
+pub fn post_rows(post: &PostItem, app: &App, width: u16) -> usize {
+    post_lines(post, app, width).len()
+}
+
+/// Rows between a post and the next newer one: a blank row, plus a day
+/// separator and another blank row when the day changes.
+pub fn gap_rows(older: &PostItem, newer: &PostItem, app: &App) -> usize {
+    if same_day(older.ts_ms, newer.ts_ms, app) {
+        1
+    } else {
+        3
+    }
 }
 
 /// Where one shown post sits in the laid-out pane, in rows counted up from
@@ -211,11 +228,7 @@ pub fn spans(app: &App, width: u16) -> Vec<Span> {
     let mut row = 0usize;
     for (i, post) in posts.iter().enumerate().rev() {
         if let Some(next) = posts.get(i + 1) {
-            row += if same_day(post.ts_ms, next.ts_ms, app) {
-                1
-            } else {
-                3
-            };
+            row += gap_rows(post, next, app);
         }
         let height = post_lines(post, app, width).len();
         out.push(Span {
@@ -275,11 +288,17 @@ fn day_separator(ts_ms: i64, app: &App, width: u16) -> Line {
     }
 }
 
-/// The band across the top while the local server is unreachable.
-fn server_down(width: u16) -> Vec<Line> {
+/// The band across the top while the local server is unreachable, or
+/// refuses this device's secret (starting it again would not help then).
+fn server_down(app: &App, width: u16) -> Vec<Line> {
     let band = role::LIFTED;
     let text_w = width.saturating_sub(BODY_MARGIN + 2);
-    let mut lines: Vec<Line> = wrap(SERVER_DOWN, text_w)
+    let copy = if app.secret_rejected {
+        SECRET_REJECTED
+    } else {
+        SERVER_DOWN
+    };
+    let mut lines: Vec<Line> = wrap(copy, text_w)
         .into_iter()
         .map(|text| Line {
             band: Some(band),

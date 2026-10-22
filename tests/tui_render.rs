@@ -2063,4 +2063,333 @@ mod behaviour {
             }
         }
     }
+
+    // ------------------------------------------------------ fix round 1
+
+    fn beacon_view() -> Selection {
+        Selection::Channel("beacon".to_string())
+    }
+
+    fn older_page(before: (i64, String), range: std::ops::Range<u32>) -> Msg {
+        Msg::Loaded(Loaded::Posts {
+            view: beacon_view(),
+            before: Some(before),
+            page: Ok(PostsResponse {
+                v: 1,
+                posts: range
+                    .map(|n| api_post(n, "beacon", "pc-configs", &format!("post {n}")))
+                    .collect(),
+                remaining: None,
+            }),
+        })
+    }
+
+    /// Pages up until the view asks for older posts; returns what it asked.
+    fn page_to_top(app: &mut App) -> Vec<Cmd> {
+        (0..300)
+            .flat_map(|_| app.update(key(KeyCode::PageUp)))
+            .collect()
+    }
+
+    fn ts_of(n: u32) -> i64 {
+        at(17, 0) + i64::from(n) * 60_000
+    }
+
+    fn unread_of(app: &App, name: &str) -> u32 {
+        app.channels.iter().find(|c| c.name == name).unwrap().unread
+    }
+
+    fn mark_reads(cmds: &[Cmd]) -> Vec<Cmd> {
+        cmds.iter()
+            .filter(|c| matches!(c, Cmd::MarkRead { .. }))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn a_late_synced_post_does_not_skip_history() {
+        let mut app = full_page_app();
+        // Written offline long ago, synced now: an old ts and a new arrival.
+        let mut late = api_post(500, "beacon", "pc-vllm", "written offline");
+        late.ts_ms = ts_of(10);
+        app.update(Msg::Stream(StreamEvent::Post(late.clone())));
+        // It belongs above the loaded page, which paging brings in order.
+        assert!(app.posts.iter().all(|p| p.id != ulid(500)));
+        assert_eq!(
+            page_to_top(&mut app),
+            [Cmd::LoadPosts {
+                channel: "beacon".to_string(),
+                before: Some((ts_of(100), ulid(100)))
+            }],
+            "the page before the oldest *page* post, not before the late one"
+        );
+
+        // The same while a fresh view's first page is on its way.
+        app.focus = Focus::Sidebar;
+        app.update(ch('j'));
+        let mut late_vllm = api_post(600, "vllm", "pc-vllm", "also offline");
+        late_vllm.ts_ms = ts_of(10);
+        app.update(Msg::Stream(StreamEvent::Post(late_vllm)));
+        let posts: Vec<PostJson> = (100..100 + PAGE)
+            .map(|n| api_post(n, "vllm", "pc-configs", &format!("v {n}")))
+            .collect();
+        app.update(Msg::Loaded(page(posts)));
+        assert!(app.posts.iter().all(|p| p.id != ulid(600)));
+        assert_eq!(app.posts.len(), PAGE as usize);
+
+        // Where the whole history is loaded, a late post goes in its place.
+        let mut app = live_app();
+        let mut late = api_post(700, "general", "pc-vllm", "late but complete");
+        late.ts_ms = ts_of(0) - 60_000;
+        app.update(Msg::Stream(StreamEvent::Post(late)));
+        assert_eq!(app.posts[0].id, ulid(700));
+    }
+
+    #[test]
+    fn an_older_page_from_before_a_switch_is_dropped() {
+        let mut app = full_page_app();
+        let asked = page_to_top(&mut app);
+        let Some(Cmd::LoadPosts {
+            before: Some(stale),
+            ..
+        }) = asked.first().cloned()
+        else {
+            panic!("asked {asked:?}")
+        };
+        // Away and back before that page comes: #beacon is loaded afresh,
+        // newer posts having arrived meanwhile.
+        app.focus = Focus::Sidebar;
+        app.update(ch('j'));
+        app.update(ch('k'));
+        assert_eq!(app.selected, beacon_view());
+        let fresh: Vec<PostJson> = (150..150 + PAGE)
+            .map(|n| api_post(n, "beacon", "pc-configs", &format!("post {n}")))
+            .collect();
+        app.update(Msg::Loaded(page(fresh)));
+        // The page asked for before the switch arrives now: it is not next to
+        // this view's oldest post, so it is dropped.
+        app.update(older_page(stale, 0..PAGE));
+        assert_eq!(app.posts.len(), PAGE as usize);
+        assert_eq!(app.posts[0].body, "post 150");
+        app.focus = Focus::Posts;
+        assert_eq!(
+            page_to_top(&mut app),
+            [Cmd::LoadPosts {
+                channel: "beacon".to_string(),
+                before: Some((ts_of(150), ulid(150)))
+            }]
+        );
+        // The page that is asked for is taken.
+        app.update(older_page((ts_of(150), ulid(150)), 50..150));
+        assert_eq!(app.posts.len(), 2 * PAGE as usize);
+        assert_eq!(app.posts[0].body, "post 50");
+    }
+
+    #[test]
+    fn d_and_s_never_act_on_a_post_the_filter_hides() {
+        let mut app = live_app();
+        let mut with_file = api_post(3, "general", "mac-juicebox", "report attached");
+        with_file.attachment = Some(AttachmentJson {
+            name: "r.txt".to_string(),
+            size: 3,
+            sha256: "ab".repeat(32),
+            available: true,
+        });
+        app.update(Msg::Stream(StreamEvent::Post(with_file)));
+        feed(&mut app, [key(KeyCode::Tab), key(KeyCode::Tab)]);
+        assert_eq!(app.selected_post.as_deref(), Some(ulid(3).as_str()));
+        // Filtering to pc-configs hides it: the selection moves to a shown post.
+        app.update(ch('/'));
+        type_text(&mut app, "@pc-configs");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.selected_post.as_deref(), Some(ulid(1).as_str()));
+        app.update(ch('d'));
+        assert_eq!(app.update(key(KeyCode::Enter)), [Cmd::DeletePost(ulid(1))]);
+        // A selection left on a hidden post is never acted on.
+        app.selected_post = Some(ulid(3));
+        assert!(app.update(ch('d')).is_empty());
+        assert!(app.dialog.is_none());
+        assert!(app.update(ch('s')).is_empty());
+        assert!(app
+            .toast
+            .as_deref()
+            .unwrap()
+            .starts_with("Select a post first"));
+    }
+
+    #[test]
+    fn s_asks_the_node_even_if_the_file_had_not_synced_at_load() {
+        let mut app = live_app();
+        let mut with_file = api_post(3, "general", "mac-juicebox", "report attached");
+        with_file.attachment = Some(AttachmentJson {
+            name: "r.txt".to_string(),
+            size: 3,
+            sha256: "ab".repeat(32),
+            available: false,
+        });
+        app.update(Msg::Stream(StreamEvent::Post(with_file)));
+        feed(&mut app, [key(KeyCode::Tab), key(KeyCode::Tab)]);
+        // The bytes may have come since: only the node knows.
+        assert_eq!(
+            app.update(ch('s')),
+            [Cmd::Save {
+                post_id: ulid(3),
+                sha: "ab".repeat(32),
+                name: "r.txt".to_string()
+            }]
+        );
+        app.update(Msg::Saved(Err(
+            "attachment not synced yet; try again when a peer that has it is online".to_string(),
+        )));
+        assert_eq!(
+            app.toast.as_deref(),
+            Some(
+                "Not saved: attachment not synced yet; try again when a peer that has it is online"
+            )
+        );
+    }
+
+    #[test]
+    fn a_burst_of_live_posts_is_cheap_and_marks_read_once() {
+        let mut app = full_page_app();
+        app.focus = Focus::Composer;
+        let started = std::time::Instant::now();
+        let mut cmds = Vec::new();
+        for n in 1000..1500 {
+            cmds.extend(app.update(Msg::Stream(StreamEvent::Post(api_post(
+                n, "beacon", "pc-vllm", "burst",
+            )))));
+        }
+        let cmds = beacon::tui::state::coalesce(cmds);
+        assert_eq!(
+            mark_reads(&cmds),
+            [Cmd::MarkRead {
+                channel: "beacon".to_string(),
+                arrival: 1499
+            }],
+            "one cursor update for the whole batch"
+        );
+        assert_eq!(app.posts.len(), PAGE as usize + 500);
+        // Scrolled up, a burst keeps the view still, and stays cheap too.
+        app.update(key(KeyCode::PageUp));
+        let before = pane_text(&screen(&app));
+        for n in 1500..2000 {
+            app.update(Msg::Stream(StreamEvent::Post(api_post(
+                n, "beacon", "pc-vllm", "burst",
+            ))));
+        }
+        assert_eq!(pane_text(&screen(&app)), before);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "1000 live posts took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn coalesce_keeps_one_cursor_per_channel_and_one_list() {
+        let mark = |channel: &str, arrival| Cmd::MarkRead {
+            channel: channel.to_string(),
+            arrival,
+        };
+        let cmds = vec![
+            mark("a", 3),
+            Cmd::LoadChannels,
+            mark("b", 9),
+            mark("a", 7),
+            Cmd::LoadChannels,
+            Cmd::Heartbeat,
+            mark("a", 5),
+        ];
+        assert_eq!(
+            beacon::tui::state::coalesce(cmds),
+            [
+                mark("a", 7),
+                Cmd::LoadChannels,
+                mark("b", 9),
+                Cmd::Heartbeat
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rejected_secret_gets_its_own_band() {
+        let mut app = live_app();
+        app.update(Msg::SecretRejected);
+        app.update(Msg::Connection(Conn::Down {
+            since_ms: at(18, 41),
+        }));
+        let text = pane_text(&screen(&app));
+        assert!(
+            text.contains("The server rejected BEACON_SECRET. Check .env on this device."),
+            "{text}"
+        );
+        assert!(!text.contains("docker compose"), "{text}");
+        // The edge rule is coral, as for the server-down band.
+        let buf = screen(&app);
+        let y = row_of(&buf, "The server rejected");
+        let (x0, _) = main_pane(W);
+        assert_eq!(buf[(x0, y)].fg, rgb(palette::CORAL));
+        // Once the feed opens again, it goes.
+        app.update(Msg::Connection(Conn::Up));
+        assert!(!pane_text(&screen(&app)).contains("rejected"));
+        // A plain outage after that is the ordinary band again.
+        app.update(Msg::Connection(Conn::Down {
+            since_ms: at(18, 50),
+        }));
+        assert!(pane_text(&screen(&app)).contains("docker compose up -d"));
+    }
+
+    #[test]
+    fn live_posts_are_read_only_at_the_bottom() {
+        let mut app = full_page_app();
+        app.update(key(KeyCode::PageUp));
+        assert!(app.scroll > 0);
+        let cmds = app.update(Msg::Stream(StreamEvent::Post(api_post(
+            300,
+            "beacon",
+            "pc-vllm",
+            "while scrolled up",
+        ))));
+        assert!(mark_reads(&cmds).is_empty(), "{cmds:?}");
+        assert_eq!(unread_of(&app, "beacon"), 1, "unread until seen");
+        // Back down to the newest: now it has been seen.
+        let cmds = feed(&mut app, (0..5).map(|_| key(KeyCode::PageDown)));
+        assert_eq!(app.scroll, 0);
+        assert_eq!(
+            mark_reads(&cmds),
+            [Cmd::MarkRead {
+                channel: "beacon".to_string(),
+                arrival: 300
+            }]
+        );
+        assert_eq!(unread_of(&app, "beacon"), 0);
+        // At the bottom, a live post is read as it arrives.
+        let cmds = app.update(Msg::Stream(StreamEvent::Post(api_post(
+            301,
+            "beacon",
+            "pc-vllm",
+            "at the bottom",
+        ))));
+        assert_eq!(
+            mark_reads(&cmds),
+            [Cmd::MarkRead {
+                channel: "beacon".to_string(),
+                arrival: 301
+            }]
+        );
+        // j down to the newest post counts as reaching the bottom too.
+        app.update(key(KeyCode::PageUp));
+        app.update(Msg::Stream(StreamEvent::Post(api_post(
+            302, "beacon", "pc-vllm", "again",
+        ))));
+        let cmds = feed(&mut app, (0..300).map(|_| ch('j')));
+        assert_eq!(
+            mark_reads(&cmds),
+            [Cmd::MarkRead {
+                channel: "beacon".to_string(),
+                arrival: 302
+            }]
+        );
+    }
 }

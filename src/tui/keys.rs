@@ -339,12 +339,13 @@ impl App {
         if !self.has_older || self.loading_older {
             return Vec::new();
         }
-        let Some(oldest) = self.posts.first() else {
+        // From where the pages end, not from the oldest post on screen.
+        let Some(cursor) = self.oldest_page.clone() else {
             return Vec::new();
         };
         let cmd = Cmd::LoadPosts {
             channel: channel.clone(),
-            before: Some((oldest.ts_ms, oldest.id.clone())),
+            before: Some(cursor),
         };
         self.loading_older = true;
         vec![cmd]
@@ -413,7 +414,7 @@ impl App {
             self.toast(PICK_POST_FROM_SIDEBAR);
             return Vec::new();
         }
-        let Some(id) = self.selected_post.clone() else {
+        let Some(id) = self.selected_shown() else {
             self.toast(PICK_POST);
             return Vec::new();
         };
@@ -422,17 +423,14 @@ impl App {
             .iter()
             .find(|p| p.id == id)
             .and_then(|p| p.attachment.clone());
-        let extra = self.extras.get(&id).cloned();
-        let (Some(attachment), Some(sha)) =
-            (attachment, extra.as_ref().and_then(|e| e.sha256.clone()))
-        else {
+        let sha = self.extras.get(&id).and_then(|e| e.sha256.clone());
+        let (Some(attachment), Some(sha)) = (attachment, sha) else {
             self.toast("This post has no file to save");
             return Vec::new();
         };
-        if !extra.is_some_and(|e| e.available) {
-            self.error("attachment not synced yet; try again when a peer that has it is online");
-            return Vec::new();
-        }
+        // Whether the bytes are here yet is the node's to say: they arrive
+        // after the post, and nothing here would hear of it. A node without
+        // them answers 404, which comes back as "not synced yet".
         self.error(format!("saving {}…", attachment.name));
         vec![Cmd::Save {
             post_id: id,
@@ -462,11 +460,8 @@ impl App {
                 )
             }
             _ => {
-                let Some(id) = self
-                    .selected_post
-                    .clone()
-                    .filter(|id| self.posts.iter().any(|p| &p.id == id))
-                else {
+                // Only a post on screen: never one the filter hides.
+                let Some(id) = self.selected_shown() else {
                     self.toast(PICK_POST);
                     return;
                 };
@@ -525,9 +520,27 @@ impl App {
     }
 
     /// A new filter shows different posts: back to the newest.
+    /// The selection stays only on a post the filter shows; in the posts
+    /// pane it moves to the newest one shown.
     fn set_filter(&mut self, filter: Option<String>) {
         self.filter = filter;
         self.scroll = 0;
+        if self.selected_shown().is_none() {
+            self.selected_post = None;
+            if self.focus == Focus::Posts {
+                self.pick_visible_post();
+            }
+        }
+    }
+
+    /// The selected post's id, if the post is on screen (shown by the
+    /// filter). `s` and `d` act on nothing else.
+    fn selected_shown(&self) -> Option<String> {
+        let id = self.selected_post.as_deref()?;
+        posts::shown(self)
+            .iter()
+            .any(|p| p.id == id)
+            .then(|| id.to_string())
     }
 
     // ----------------------------------------------------------- dialogs
