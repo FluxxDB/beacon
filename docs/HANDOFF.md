@@ -48,7 +48,7 @@ Every ruling is in the git history of the build. The ones that change behaviour 
 - Files the TUI saves to `./exchange` are root-owned on Linux (no `USER` in the image).
 - Presence heartbeats are permanent replicated events (~1.4k/day for an open TUI); plan compaction later.
 - Smaller items: settled collisions log at ERROR on every re-offer; the wrapper holds stderr until a plain command ends; one unanchored wrapper error pattern; the `watch` catch-up reads only the first 500 unread after a reconnect.
-- Upgrade every node together: older builds stall on event kinds they don't know.
+- Upgrade every node together. Builds from `3053d0d` on store and relay event kinds they don't know and apply them after upgrading; builds before it stall on them.
 
 ## All rulings made during the build (from the build ledger)
 
