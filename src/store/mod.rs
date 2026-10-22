@@ -486,6 +486,15 @@ impl Store {
         }
     }
 
+    /// The shown post whose id is exactly `id`, if there is one: unlike
+    /// [`Store::post`] it takes no suffix, so it works for any id an event
+    /// carries and is a primary-key lookup.
+    pub fn shown_post(&self, id: &str) -> Result<Option<PostRow>> {
+        let sql = format!("SELECT {POST_COLUMNS} FROM {SHOWN_POSTS} AND p.id = ?1");
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        Ok(stmt.query_row([id], post_row).optional()?)
+    }
+
     /// Handles seen within the last 2 hours, most recently seen first.
     pub fn who(&self, now_ms: i64) -> Result<Vec<PresenceRow>> {
         let mut stmt = self.conn.prepare_cached(
