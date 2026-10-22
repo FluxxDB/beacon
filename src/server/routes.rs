@@ -71,7 +71,7 @@ pub fn router() -> Router<AppState> {
 // ----------------------------------------------------------------- helpers
 
 /// A page size: 50 by default, at least 1, at most 500 (more is cut to 500).
-fn page_limit(limit: Option<u32>) -> Result<usize, Error> {
+pub(super) fn page_limit(limit: Option<u32>) -> Result<usize, Error> {
     match limit {
         None => Ok(DEFAULT_LIMIT),
         Some(0) => Err(Error::Usage("limit must be at least 1".into())),
@@ -80,7 +80,7 @@ fn page_limit(limit: Option<u32>) -> Result<usize, Error> {
 }
 
 /// A yes/no query parameter: `1`/`true`/`yes` or `0`/`false`/`no`.
-fn flag(name: &str, value: Option<&str>) -> Result<bool, Error> {
+pub(super) fn flag(name: &str, value: Option<&str>) -> Result<bool, Error> {
     match value {
         None | Some("0" | "false" | "no" | "") => Ok(false),
         Some("1" | "true" | "yes") => Ok(true),
@@ -110,7 +110,11 @@ fn clean(text: Option<String>) -> Option<String> {
     text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
-fn posts_json(app: &AppState, rows: &[PostRow], remaining: Option<u32>) -> PostsResponse {
+pub(super) fn posts_json(
+    app: &AppState,
+    rows: &[PostRow],
+    remaining: Option<u32>,
+) -> PostsResponse {
     PostsResponse {
         v: V,
         posts: rows

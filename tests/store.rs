@@ -355,6 +355,39 @@ fn post_lookup_by_suffix() {
 }
 
 #[test]
+fn shown_post_is_an_exact_lookup_of_shown_posts() {
+    let (mut a, _) = pair();
+    create(&mut a, "beacon", None, 5);
+    // Ids an event may carry that `post` would not look up: short, odd.
+    for (id, body) in [
+        ("short", "short id"),
+        ("01JDB7K4TR0000000001QRSTVW", "ulid"),
+    ] {
+        let p = NewPost {
+            post_id: id.into(),
+            ..new_post("pc", "beacon", body)
+        };
+        local(&mut a, EventKind::PostCreated(p), 10);
+    }
+    assert_eq!(a.shown_post("short").unwrap().unwrap().body, "short id");
+    let ulid = a.shown_post("01JDB7K4TR0000000001QRSTVW").unwrap().unwrap();
+    assert_eq!(ulid.body, "ulid");
+    assert!(ulid.arrival > 0);
+    // Exact, not a suffix; and unknown ids are `None`, not an error.
+    assert!(a.shown_post("QRSTVW").unwrap().is_none());
+    assert!(a.shown_post("hort").unwrap().is_none());
+    assert!(a.shown_post("").unwrap().is_none());
+
+    // A deleted post, or one in a deleted channel, is not shown.
+    let deleted = post(&mut a, "pc", "beacon", "going", 20);
+    assert!(a.shown_post(&post_id(&deleted)).unwrap().is_some());
+    delete_post(&mut a, &deleted, 21);
+    assert!(a.shown_post(&post_id(&deleted)).unwrap().is_none());
+    delete_channel(&mut a, "beacon", 30);
+    assert!(a.shown_post("short").unwrap().is_none());
+}
+
+#[test]
 fn presence_due_once_a_minute() {
     let (mut a, mut b) = pair();
     let t0 = 1_000 * MIN;
