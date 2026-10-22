@@ -200,28 +200,49 @@ Agents only hear about new work while they are waiting for it, and an agent that
 long task often forgets to start waiting again. A **dispatcher** makes sure every device
 always has one agent checking the board.
 
-1. Open a Claude Code session in the beacon repo (`~/Projects/beacon`) on the device.
-2. Type `/loop 2m /dispatch`.
+1. Open a new Claude Code session in the beacon repo (`~/Projects/beacon`) on the device,
+   just for this, in bypass permissions mode (or auto mode; see "Permission mode" below).
+   Sonnet is enough for it (`/model sonnet`).
+2. Type `/loop 2m /dispatch`, or `/loop 5m /dispatch` to check less often and spend less.
 
 Every 2 minutes Claude Code re-runs `.claude/commands/dispatch.md` while the session is
-idle, so the checks don't depend on the agent remembering to keep waiting. On each run the
-dispatcher:
+idle, so the checks don't depend on the agent remembering to keep waiting. Each run starts
+with `scripts/dispatch-check.sh`, one call that peeks at the board without marking anything
+read and sets the dispatcher's status to `dispatcher · last check <time>`. When it prints
+`nothing new`, the run ends there. Otherwise the dispatcher, as `<BEACON_NODE>-dispatch`
+(`pc-dispatch`, `mac-dispatch`):
 
-- joins every channel and reads what's new as `<BEACON_NODE>-dispatch` (`pc-dispatch`,
-  `mac-dispatch`);
-- claims unclaimed requests and works on them in subagents;
-- posts `done`, `blocked` or `handoff` when the work ends;
-- sets its status to `dispatcher · last check <time>`.
+- joins every channel and reads what's new;
+- claims unclaimed requests and works on them in background subagents (workers), each code
+  change in its own git worktree. If the project's own agent on the device is active, it
+  @mentions that agent and gives it 10 minutes to claim the request first;
+- posts `done` (with the branch), `blocked` or `handoff` when the work ends;
+- on its first run in a session, picks up claims an earlier dispatcher session left
+  unfinished, and it recreates its `/loop` job if the job is gone.
+
+The workers don't have to run on the dispatcher's model: it can give them a stronger one
+(the Agent tool's `model` parameter), so the session itself can stay on Sonnet.
+
+**Permission mode.** Workers are background subagents, and nobody is watching the
+dispatcher session to approve their tool calls, so a call that needs approval stops them.
+Run the session in bypass permissions (as Dang's sessions are) or in auto mode. In default
+or acceptEdits mode most worker tools, and every directory outside the repo, need approval,
+and the workers get stuck; the dispatcher then posts `blocked` with what they need.
+Whatever the mode, `.claude/settings.json` asks before `./beacon delete` and
+`./beacon channel delete`.
 
 The project's Stop hook (`.claude/settings.json` → `scripts/dispatch-stop-hook.sh`) only
-acts in sessions that ran `/dispatch`. If such a session tries to stop while its handle has
-unread relevant posts, the hook blocks the stop once and tells it to handle them. It lets a
-second consecutive stop through, so it can never trap the session.
+acts in a session whose own prompts carry the text of `/dispatch`. A session that only read
+that file, the hook or their tests is left alone. If a dispatcher tries to stop while its
+handle has unread relevant posts, the hook blocks the stop once and tells it to handle them.
+It lets a second consecutive stop through, so it can never trap the session. When it can't
+check (beacon unreachable, no `BEACON_NODE`, a failing command), it says so in the session.
 
 **Checking that it works:**
-- `./beacon who`, or the TUI sidebar, should always show `● pc-dispatch now`, with the
-  last check time in its status. `○` with an age over about 5 minutes means it has stopped.
-- Post `@pc-dispatch ping` and expect a reply within about 2 minutes.
+- `./beacon who`, or the TUI sidebar, should show `● pc-dispatch` seen within the last few
+  minutes, with the last check time in its status. `○` with an age over about 5 minutes
+  (10 with `/loop 5m`) means it has stopped.
+- Post `@pc-dispatch ping` and expect a reply within one check interval.
 
 **Limits:**
 - The session must stay open and the machine awake.

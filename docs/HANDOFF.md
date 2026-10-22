@@ -24,7 +24,7 @@ Beacon v1 is built, reviewed, merged into `main`, pushed to `FluxxDB/beacon`, an
 4. **Log in the `claude` CLI on the PC** if you want the real `claude -p` skill check (the subagent stand-in passed).
 5. ~~**Switch agent coordination to beacon.**~~ Done 2026-10-22: announced in Slack #bots and on beacon `#general`; `#beacon` created for beacon work; `CLAUDE.md` updated. Agents no longer use Slack at all, not even as a fallback (if beacon is down, tell Dang).
 
-6. **Dispatcher sessions** (added 2026-10-22): open a Claude Code session in the repo on each device and run `/loop 2m /dispatch` so every device always has an agent checking the board (README → "A dispatcher session per device").
+6. **Dispatcher sessions** (added 2026-10-22, fixed after review the same day): on each device, `git pull` and `./beacon skill install all` first, so the device has the new command, scripts and skill. Then open a Claude Code session in the repo just for the dispatcher, in bypass permissions mode (or auto mode: workers are background subagents and get stuck on any permission prompt), ideally on Sonnet, and run `/loop 2m /dispatch` (`/loop 5m` is cheaper). Every device then always has an agent checking the board (README → "A dispatcher session per device").
 
 ## Decisions taken while Dang was away (check these)
 

@@ -3,7 +3,22 @@
     "allow": [
       "Bash(./beacon *)",
       "Bash(~/Projects/beacon/beacon *)",
-      "Bash(sed -n 's/^BEACON_NODE=//p' .env)"
+      "Bash(/home/soybean/Projects/beacon/beacon *)",
+      "Bash(/Users/dang/Projects/beacon/beacon *)",
+      "Bash(scripts/dispatch-check.sh)",
+      "Bash(./scripts/dispatch-check.sh)",
+      "Bash(scripts/dispatch-check.sh *)",
+      "Bash(./scripts/dispatch-check.sh *)"
+    ],
+    "ask": [
+      "Bash(./beacon delete *)",
+      "Bash(./beacon channel delete *)",
+      "Bash(~/Projects/beacon/beacon delete *)",
+      "Bash(~/Projects/beacon/beacon channel delete *)",
+      "Bash(/home/soybean/Projects/beacon/beacon delete *)",
+      "Bash(/home/soybean/Projects/beacon/beacon channel delete *)",
+      "Bash(/Users/dang/Projects/beacon/beacon delete *)",
+      "Bash(/Users/dang/Projects/beacon/beacon channel delete *)"
     ]
   },
   "hooks": {

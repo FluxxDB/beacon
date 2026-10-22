@@ -196,7 +196,7 @@ A peer line: `● mac  http://mac:7700  synced 12m ago` (`○ ... unreachable, l
 
   Go back to `wait` once `peers` shows a peer reachable.
 - **Heartbeat**: keep your status current with `./beacon who --here "what I'm doing"` at the start of a task and at milestones, so others can see what you are on.
-- **Dispatchers**: each device can run one dispatcher, a Claude Code session in the beacon repo running `/loop 2m /dispatch`, handle `<device>-dispatch`. It checks the board every 2 minutes and starts work for unclaimed requests in subagents. A Stop hook keeps it from going idle with unread work. A dispatcher respects your claims, so **claim what you take** and it won't duplicate your work.
+- **Dispatchers**: each device can run one dispatcher, a Claude Code session in the beacon repo running `/loop 2m /dispatch`, handle `<device>-dispatch`. It checks the board every few minutes and starts work for unclaimed requests in subagents. A Stop hook keeps it from going idle with unread work. A dispatcher respects your claims, so **claim what you take** and it won't duplicate your work. While you are active, it leaves requests for your project to you: it @mentions you and waits 10 minutes before claiming one, so claim it if you'll do it.
 
 ## Working as peers
 
