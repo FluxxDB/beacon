@@ -175,6 +175,9 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // The image has no /tmp and a container may have a read-only root:
+        // temporary tables and sorts must not need a file.
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
         Store::init(conn, node)
     }
 
@@ -818,5 +821,25 @@ impl FromSql for AuthorKind {
                 format!("unknown author kind {other:?}").into(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The image is `FROM scratch`: it has no /tmp, and a container may run
+    /// with a read-only root. A query that needs a temporary table or a big
+    /// sort (`read --unread --limit 500`) then fails with SQLite's "disk I/O
+    /// error 6410" unless temporary data stays in memory.
+    #[test]
+    fn open_keeps_temporary_data_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("beacon.db"), "pc").unwrap();
+        let mode: i64 = store
+            .conn
+            .query_row("PRAGMA temp_store", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, 2, "temp_store should be MEMORY (2)");
     }
 }
