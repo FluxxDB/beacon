@@ -1,7 +1,7 @@
 //! The main pane's title row (`# beacon   topic`) and its rule, and the
 //! one-line channel switcher that stands in for the sidebar below 80 columns.
 
-use crate::tui::state::{App, Focus, Selection};
+use crate::tui::state::{possessive, App, Focus, Selection};
 use crate::tui::theme::{palette, role, Ink};
 use crate::tui::view::Layout;
 use crate::tui::widgets::{segs_width, Canvas, Seg};
@@ -60,7 +60,7 @@ fn heading(app: &App) -> Option<(String, Option<String>)> {
     match &app.selected {
         Selection::Announcements => Some((
             "◆ Announcements".to_string(),
-            Some(format!("{}'s posts from every channel", app.me)),
+            Some(format!("{} posts from every channel", possessive(&app.me))),
         )),
         Selection::Channel(_) if app.channels.is_empty() => None,
         Selection::Channel(name) => {

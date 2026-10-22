@@ -1209,3 +1209,12 @@ pub(crate) fn view_name(view: &Selection) -> String {
         Selection::Announcements => "announcements".to_string(),
     }
 }
+
+/// `Dang's`, but `pc-configs'`: a name ending in s takes only the apostrophe.
+pub(crate) fn possessive(name: &str) -> String {
+    if name.ends_with(['s', 'S']) {
+        format!("{name}'")
+    } else {
+        format!("{name}'s")
+    }
+}

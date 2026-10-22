@@ -19,8 +19,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::model::{normalize_channel, BODY_MAX, TOPIC_MAX};
 use crate::timefmt::{clock_12h, day_label};
 use crate::tui::state::{
-    App, AttachPicker, Cmd, ConfirmDialog, Dialog, Focus, FormField, NewChannelForm, Selection,
-    CHANNEL_NAME_MAX, FILTER_MAX, NAME_RULE,
+    possessive, App, AttachPicker, Cmd, ConfirmDialog, Dialog, Focus, FormField, NewChannelForm,
+    Selection, CHANNEL_NAME_MAX, FILTER_MAX, NAME_RULE,
 };
 use crate::tui::widgets::posts::{self, Span};
 
@@ -472,7 +472,7 @@ impl App {
                         let owner = if post.author.eq_ignore_ascii_case(&self.me) {
                             "Your".to_string()
                         } else {
-                            format!("{}'s", post.author)
+                            possessive(&post.author)
                         };
                         format!("{owner} post from {}", self.when(post.ts_ms))
                     }

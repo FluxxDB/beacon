@@ -2766,6 +2766,40 @@ mod behaviour {
     }
 
     #[test]
+    fn a_handle_ending_in_s_takes_only_an_apostrophe() {
+        // pc-configs wrote the first post of the board.
+        let mut app = live_app();
+        app.focus = Focus::Posts;
+        app.selected_post = Some(ulid(1));
+        app.update(ch('d'));
+        let Some(Dialog::Confirm(confirm)) = &app.dialog else {
+            panic!("{:?}", app.dialog)
+        };
+        assert_eq!(
+            confirm.message,
+            "pc-configs' post from 5:01 pm disappears on every device."
+        );
+        assert!(screen_text(&app).contains("pc-configs' post from 5:01 pm"));
+        assert!(!screen_text(&app).contains("pc-configs's"));
+
+        // The same rule for the Announcements heading, whoever `me` is.
+        let mut app = live_app();
+        app.me = "Jess".to_string();
+        app.selected = Selection::Announcements;
+        let heading = rows(&screen(&app)).join("\n");
+        assert!(
+            heading.contains("Jess' posts from every channel"),
+            "{heading}"
+        );
+        app.me = "Dang".to_string();
+        let heading = rows(&screen(&app)).join("\n");
+        assert!(
+            heading.contains("Dang's posts from every channel"),
+            "{heading}"
+        );
+    }
+
+    #[test]
     fn the_focused_sidebar_says_which_keys_move_in_it() {
         let mut app = live_app();
         let channels_row = |app: &App| {
