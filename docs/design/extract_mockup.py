@@ -15,8 +15,8 @@ For every screen this writes two fixtures into the output directory:
                     null when unset), bold is a boolean. Adjacent runs with
                     identical style are merged.
 
-Three committed fixtures carry two approved substitutions that the mockup
-HTML does not:
+Three committed screens (board, mac, modal) carry three approved deviations
+that the mockup HTML does not: two colour substitutions and one layout change.
 
   1. the ash metadata grey #62666d is #787d85 (lifted for contrast, Dang,
      2026-10-22);
@@ -24,8 +24,24 @@ HTML does not:
      the highlight from this yellowish color to a fitting blue"), on the
      active-channel edge, the input caret(s), an announcement's edge rule and
      a dialog's primary action. Only the colour changed, not where it is used.
+  3. the composer sits directly on the footer's rule (Dang, 2026-10-22,
+     A8ZNNG64: "Put the composer directly above the footer so the message
+     list gets those rows back"). The mockup's blank row between the
+     composer's bottom border and the rule above the help row is gone: in
+     the main pane's columns, every row from the first posts row (row 5)
+     down to the composer's bottom border sits one row lower, and the posts
+     viewport is one row taller, so the bottom-anchored posts show one more
+     line at the top. That line is blank on board and modal (nothing is
+     older than the announcement); on mac it is pc-configs' first body line,
+     `on it. scaffolding the rust crate now. @mac-juicebox`, inked as the
+     board inks it. The new-channel dialog, centred on the posts viewport,
+     moves down with them. Sidebar columns do not move. This touches both
+     NAME.txt and NAME.colors.json:
 
-The three fixtures are
+       board, modal (104 x 33): rows 5-28 -> 6-29, columns 25-102
+       mac (94 x 30):           rows 5-25 -> 6-26, columns 23-92
+
+Substitutions 1 and 2 are in
 
   tests/fixtures/mockup/board.colors.json
   tests/fixtures/mockup/mac.colors.json
@@ -38,8 +54,12 @@ swap both again in those three files, and only those, before committing:
   sed -i -e 's/#62666d/#787d85/g' -e 's/#e4f222/#4099ff/g' \
     board.colors.json mac.colors.json modal.colors.json
 
-(on macOS: sed -i ''). tests/fixtures/mockup/cli.colors.json is not used by
-the TUI tests and keeps #62666d (it has no accent cells).
+(on macOS: sed -i ''). It also brings back the blank row under the composer
+in board, mac and modal (.txt and .colors.json): move those rows down again
+as deviation 3 says, or restore the six files from git. The cli screen has
+no composer, so tests/fixtures/mockup/cli.* take none of the three
+deviations; cli.colors.json is not used by the TUI tests and keeps #62666d
+(it has no accent cells).
 
 Usage (Python standard library only):
 

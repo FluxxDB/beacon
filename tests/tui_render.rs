@@ -779,6 +779,43 @@ fn narrow_79_cols_collapses_sidebar() {
     }
 }
 
+/// Dang, 2026-10-22 (A8ZNNG64): no blank band between the composer and the
+/// footer; the posts get that row. At every width, with a one-line and a
+/// three-line input, the row under the composer's bottom border is the rule
+/// above the help row, and the newest post line sits just above the notice
+/// row over the composer.
+#[test]
+fn the_composer_sits_directly_above_the_footer() {
+    for (width, height) in [(104, 33), (94, 30), (80, 24), (79, 24), (60, 20), (40, 16)] {
+        for input in ["on my way", "one\ntwo\nthree"] {
+            let mut app = mockup_app();
+            app.input = input.to_string();
+            let buf = render(&app, TRUECOLOR, width, height);
+            let label = format!("{width}x{height} {input:?}");
+            let x0 = if width >= 80 { main_pane(width).0 } else { 1 };
+            let bottom = (1..height)
+                .find(|&y| buf[(x0, y)].symbol() == "╰")
+                .unwrap_or_else(|| panic!("{label}: no composer\n{}", rows(&buf).join("\n")));
+            assert_eq!(
+                buf[(0, bottom + 1)].symbol(),
+                "├",
+                "{label}: the footer rule is right under the composer\n{}",
+                rows(&buf).join("\n")
+            );
+            assert_eq!(bottom + 4, height, "{label}: rule, help row, border");
+            let lines = input.lines().count() as u16;
+            let notice = bottom - lines - 2;
+            // Inside the pane, clear of its edge column and the frame.
+            let pane = |y: u16| region_text(&buf, y, x0 + 1, x0 + 30).trim().to_string();
+            assert!(
+                !pane(notice - 1).is_empty() && pane(notice).is_empty(),
+                "{label}: posts end on the row above the notice row\n{}",
+                rows(&buf).join("\n")
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wrapping
 // ---------------------------------------------------------------------------
@@ -809,9 +846,9 @@ fn wraps_wide_and_long_tokens() {
     let buf = render(&app, TRUECOLOR, width, height);
 
     // Posts viewport rows: below the title, rule and padding row; above the
-    // padding row and the three-row composer.
+    // notice row, the three-row composer and the footer's three rows.
     let (x0, pane_w) = main_pane(width);
-    let viewport = 5..height - 8;
+    let viewport = 5..height - 7;
     let header = viewport
         .clone()
         .find(|&y| row_text(&buf, y).contains("6:09 pm"))
@@ -889,10 +926,10 @@ fn wraps_a_body_wider_than_u16() {
     )];
     let buf = render(&app, TRUECOLOR, 104, 33);
     let (x0, pane_w) = main_pane(104);
-    let last = region_text(&buf, 24, x0, x0 + pane_w);
+    let last = region_text(&buf, 25, x0, x0 + pane_w);
     let tail = 65_534 % 63;
     assert_eq!(last.trim(), "x".repeat(tail), "|{last}|");
-    let full = region_text(&buf, 23, x0, x0 + pane_w);
+    let full = region_text(&buf, 24, x0, x0 + pane_w);
     assert_eq!(full.trim(), "x".repeat(63), "|{full}|");
 }
 
@@ -911,16 +948,16 @@ fn trailing_whitespace_adds_no_row() {
     let buf = render(&app, TRUECOLOR, 104, 33);
     let (x0, pane_w) = main_pane(104);
     let pane = |y: u16| region_text(&buf, y, x0, x0 + pane_w).trim().to_string();
-    // Bottom-anchored on row 24, with nothing but a blank between the posts.
-    assert_eq!(pane(24), "x".repeat(63));
+    // Bottom-anchored on row 25, with nothing but a blank between the posts.
+    assert_eq!(pane(25), "x".repeat(63));
     assert!(
-        pane(23).starts_with("6:12 pm  mac-juicebox"),
+        pane(24).starts_with("6:12 pm  mac-juicebox"),
         "{}",
-        pane(23)
+        pane(24)
     );
-    assert_eq!(pane(22), "");
-    assert_eq!(pane(21), "hello");
-    assert!(pane(20).starts_with("6:09 pm  pc-configs"), "{}", pane(20));
+    assert_eq!(pane(23), "");
+    assert_eq!(pane(22), "hello");
+    assert!(pane(21).starts_with("6:09 pm  pc-configs"), "{}", pane(21));
 }
 
 // ---------------------------------------------------------------------------
