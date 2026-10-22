@@ -885,11 +885,14 @@ struct Fake {
     pushes: Vec<Vec<(String, u64)>>,
     /// How many pulls it answered.
     pulls: usize,
-    /// If set, its answers (pulls and pushes) alternate between `node` and
-    /// this name, as two nodes answering at one address would.
-    alias: Option<String>,
-    /// How many answers it gave, to alternate names by.
-    answers: usize,
+    /// Its pulls answer with this head plus every event it took (at least
+    /// 1), so its head grows as it stores and never goes back.
+    head: i64,
+    /// How many pushed events it stored, in all.
+    taken: i64,
+    /// If set, push answers take turns through these as its `have`
+    /// instead of the truth.
+    push_answers: Vec<VersionVector>,
 }
 
 impl Fake {
@@ -907,19 +910,23 @@ impl Fake {
         }
         have
     }
-
-    /// The name the next answer carries.
-    fn answer_as(&mut self) -> String {
-        let n = self.answers;
-        self.answers += 1;
-        match &self.alias {
-            Some(alias) if n % 2 == 1 => alias.clone(),
-            _ => self.node.clone(),
-        }
-    }
 }
 
 type Script = Arc<Mutex<Fake>>;
+
+/// `n` events of node `node`'s own database `origin`, seqs 1 to `n`.
+fn events_of(node: &str, origin: &str, n: u64) -> Vec<Event> {
+    (1..=n)
+        .map(|seq| {
+            let mut ev = foreign(seq, &format!("{node} {seq}"));
+            ev.origin = origin.into();
+            if let EventKind::PostCreated(post) = &mut ev.kind {
+                post.node = node.into();
+            }
+            ev
+        })
+        .collect()
+}
 
 /// Serves `fake` as a peer; returns its URL and the handle to script it.
 async fn fake_peer(fake: Fake) -> (String, Script) {
@@ -940,9 +947,16 @@ struct PullParams {
     after: Option<String>,
 }
 
-async fn fake_pull(State(script): State<Script>, Query(q): Query<PullParams>) -> impl IntoResponse {
-    // A short long poll, so the node's puller does not spin.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+/// A short long poll, so the node's puller does not spin.
+const FAKE_POLL: Duration = Duration::from_millis(200);
+
+async fn fake_pull(State(script): State<Script>, query: Query<PullParams>) -> impl IntoResponse {
+    tokio::time::sleep(FAKE_POLL).await;
+    answer_pull(&script, query)
+}
+
+/// What `script` answers to a pull, at once.
+fn answer_pull(script: &Script, Query(q): Query<PullParams>) -> impl IntoResponse {
     let after = parse_vv(q.after.as_deref().unwrap_or("")).unwrap();
     let mut fake = script.lock().unwrap();
     fake.pulls += 1;
@@ -956,10 +970,10 @@ async fn fake_pull(State(script): State<Script>, Query(q): Query<PullParams>) ->
         v: 1,
         events,
         have: fake.claimed.clone().unwrap_or_else(|| fake.have()),
-        head: 1,
+        head: (fake.head + fake.taken).max(1),
         more: false,
     };
-    ([("x-beacon-node", fake.answer_as())], Json(page))
+    ([("x-beacon-node", fake.node.clone())], Json(page))
 }
 
 async fn fake_push(
@@ -987,12 +1001,69 @@ async fn fake_push(
             applied += 1;
         }
     }
+    fake.taken += applied as i64;
+    let have = match fake.push_answers.len() {
+        0 => fake.have(),
+        n => fake.push_answers[fake.pushes.len() % n].clone(),
+    };
     let answer = PushResponse {
         v: 1,
         applied: applied as u64,
-        have: fake.have(),
+        have,
     };
-    ([("x-beacon-node", fake.answer_as())], Json(answer))
+    ([("x-beacon-node", fake.node.clone())], Json(answer))
+}
+
+/// Two scripted peers answering at one address, taking turns request by
+/// request (pulls and pushes alike), as two nodes behind one URL would.
+#[derive(Clone)]
+struct Turns {
+    faces: [Script; 2],
+    next: Arc<AtomicUsize>,
+}
+
+impl Turns {
+    fn take_turn(&self) -> Script {
+        let k = self.next.fetch_add(1, Ordering::SeqCst) % 2;
+        Arc::clone(&self.faces[k])
+    }
+}
+
+async fn turn_pull(
+    State(turns): State<Turns>,
+    query: Query<PullParams>,
+) -> axum::response::Response {
+    // The turn is taken when it answers, so the pushes meanwhile alternate.
+    tokio::time::sleep(FAKE_POLL).await;
+    answer_pull(&turns.take_turn(), query).into_response()
+}
+
+async fn turn_push(
+    State(turns): State<Turns>,
+    body: Json<PushRequest>,
+) -> axum::response::Response {
+    fake_push(State(turns.take_turn()), body)
+        .await
+        .into_response()
+}
+
+/// Serves `first` and `second` at one address; returns its URL and the
+/// handles to script each.
+async fn two_at_one_address(first: Fake, second: Fake) -> (String, [Script; 2]) {
+    let faces = [Arc::new(Mutex::new(first)), Arc::new(Mutex::new(second))];
+    let turns = Turns {
+        faces: faces.clone(),
+        next: Arc::new(AtomicUsize::new(0)),
+    };
+    let app = axum::Router::new()
+        .route("/api/events", get(turn_pull).post(turn_push))
+        .with_state(turns);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (url, faces)
 }
 
 /// How many pushes `script` has received.
@@ -1103,17 +1174,7 @@ async fn pulled_events_are_not_pushed_back() {
 
     // fakeb writes a burst, which a pulls.
     let origin = "fakeb~bbbbbbbb";
-    let burst: Vec<Event> = (1..=20)
-        .map(|seq| {
-            let mut ev = foreign(seq, &format!("burst {seq}"));
-            ev.origin = origin.into();
-            if let EventKind::PostCreated(post) = &mut ev.kind {
-                post.node = "fakeb".into();
-            }
-            ev
-        })
-        .collect();
-    script.lock().unwrap().own = burst;
+    script.lock().unwrap().own = events_of("fakeb", origin, 20);
     eventually(5, "a to pull the burst", || async {
         version_vector(&a).await.get(origin) == Some(&20)
     })
@@ -1387,32 +1448,127 @@ async fn a_pull_that_holds_less_is_believed_and_shows_as_queued() {
     .await;
 }
 
+/// What two nodes behind one address got, in all, from a node peered with
+/// them.
+struct Traffic {
+    /// Pushes in the node's first second, while it starts and posts.
+    first_second: usize,
+    /// Pushes and pulls in the seconds after that.
+    pushes: usize,
+    pulls: usize,
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn a_url_that_keeps_changing_names_stays_quiet() {
-    // Two names at one address, holding nothing and taking nothing: each
-    // change of name makes a start over, which must not become a loop.
+async fn push_answers_that_take_turns_end_the_round() {
+    // One peer whose push answers take turns between two version vectors,
+    // each holding something the other lacks, so every answer looks like a
+    // loss; the bigger one also leaves the smaller batch. The round must end
+    // however they move.
     let mut fake = Fake::named("x");
-    fake.alias = Some("y".into());
     fake.take_per_push = Some(0);
     let (url, script) = fake_peer(fake).await;
+    let a = spawn_node_with("a", &[url.as_str()], quick).await;
+    let origin = own_origin(&a).await;
+    eventually(5, "a to reach x", || async { reaches(&a, "x").await }).await;
+    script.lock().unwrap().push_answers = vec![
+        [(origin.clone(), 2)].into(),
+        [("q~qqqqqqqq".to_string(), 1)].into(),
+    ];
+    let before = pushes(&script);
+    for i in 0..3 {
+        let kind = EventKind::ChannelCreated {
+            name: format!("turns-{i}"),
+            topic: None,
+        };
+        a.state().commit(kind).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let sent = pushes(&script) - before;
+    assert!(sent <= 15, "{sent} pushes for 3 writes");
+}
+
+/// A node peered with two nodes behind one address (`x` and `y`, taking
+/// turns request by request) starts and writes a post; what they got in its
+/// first second, and in the `secs` seconds after.
+async fn traffic_from_two_at_one_address(x: Fake, y: Fake, secs: u64) -> Traffic {
+    let (url, faces) = two_at_one_address(x, y).await;
+    let count = || {
+        faces.iter().fold((0, 0), |(pushes, pulls), face| {
+            let face = face.lock().unwrap();
+            (pushes + face.pushes.len(), pulls + face.pulls)
+        })
+    };
     let a = spawn_node_with("a", &[url.as_str()], |cfg| {
         quick(cfg);
         cfg.long_poll_secs = 1;
     })
     .await;
+    post(&a, "beacon", "one").await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let counts = || {
-        let fake = script.lock().unwrap();
-        (fake.pushes.len(), fake.pulls)
-    };
-    let (pushes_then, pulls_then) = counts();
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    let (pushes_now, pulls_now) = counts();
-    let (pushed, pulled) = (pushes_now - pushes_then, pulls_now - pulls_then);
-    // Its pulls answer after 200 ms: about 20 in 4 s, whatever it is called.
-    assert!(pulled <= 24, "{pulled} pulls in 4 s");
-    assert!(pushed <= 4, "{pushed} pushes in 4 s");
+    let (first_second, pulls_then) = count();
+    tokio::time::sleep(Duration::from_secs(secs)).await;
+    let (pushes_now, pulls_now) = count();
     assert_eq!(peers(&a).await.len(), 1);
+    Traffic {
+        first_second,
+        pushes: pushes_now - first_second,
+        pulls: pulls_now - pulls_then,
+    }
+}
+
+/// One of two nodes at one address: `n` events of its own, a head to match,
+/// and taking pushes or not.
+fn face(node: &str, origin: &str, n: u64, takes: bool) -> Fake {
+    let mut fake = Fake::named(node);
+    fake.own = events_of(node, origin, n);
+    fake.head = n as i64;
+    if !takes {
+        fake.take_per_push = Some(0);
+    }
+    fake
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_url_that_keeps_changing_names_stays_quiet() {
+    // Two names at one address, holding nothing and taking nothing: each
+    // change of name makes a start over, which must not become a loop.
+    let traffic =
+        traffic_from_two_at_one_address(face("x", "", 0, false), face("y", "", 0, false), 4).await;
+    // Its pulls answer after 200 ms: about 20 in 4 s, whatever it is called.
+    assert!(traffic.pulls <= 24, "{} pulls in 4 s", traffic.pulls);
+    assert!(traffic.pushes <= 4, "{} pushes in 4 s", traffic.pushes);
+    assert!(
+        traffic.first_second <= 10,
+        "{} pushes in the first second",
+        traffic.first_second
+    );
+}
+
+/// The traffic two nodes at one address with different events get, each
+/// taking pushes or not, must stay small: one's answers must not count as
+/// the other's, nor a push round go on for ever on answers that take turns.
+async fn two_nodes_at_one_address_stay_quiet(take: bool) {
+    let x = face("x", "x~xxxxxxxx", 10, take);
+    let y = face("y", "y~yyyyyyyy", 3, take);
+    let traffic = traffic_from_two_at_one_address(x, y, 6).await;
+    assert!(traffic.pulls <= 36, "{} pulls in 6 s", traffic.pulls);
+    assert!(traffic.pushes <= 6, "{} pushes in 6 s", traffic.pushes);
+    // Starting, a round per write, each cut short by the other's answer.
+    assert!(
+        traffic.first_second <= 20,
+        "{} pushes in the first second",
+        traffic.first_second
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_nodes_at_one_address_that_take_nothing_stay_quiet() {
+    two_nodes_at_one_address_stay_quiet(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_nodes_at_one_address_that_take_everything_stay_quiet() {
+    two_nodes_at_one_address_stay_quiet(true).await;
 }
 
 // ------------------------------------------------------------------- urls

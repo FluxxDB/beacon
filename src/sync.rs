@@ -336,6 +336,10 @@ impl Peer {
 enum Learned {
     /// The peer is who we thought: carry on.
     Same,
+    /// Another node answered at the peer's URL, which changed hands moments
+    /// ago (two nodes answering at one address): the answer says nothing
+    /// about what the peer holds, and is not used for that.
+    Other,
     /// That URL was this node; the peer has other URLs to try.
     Retry,
     /// The peer is gone (it was this node, or it joined the peer that already
@@ -539,10 +543,10 @@ impl Table {
                     .is_some_and(|at| now.duration_since(at) < gap)
                 {
                     // It changed hands moments ago: two nodes answering at
-                    // one address. Until the gap is over its answers count
-                    // as the current one's (they still say what it holds),
-                    // so starting over cannot become a loop.
-                    return Learned::Same;
+                    // one address. Until the gap is over the peer stays the
+                    // current one, and the other's answers say nothing of
+                    // what it holds, so starting over cannot become a loop.
+                    return Learned::Other;
                 }
                 // Another node took over the address: what we knew of the
                 // old one says nothing about this one.
@@ -922,8 +926,9 @@ impl SyncHandle {
     }
 
     /// Sends peer `id` what it lacks until it holds `ev`. `Some(true)` when it
-    /// says it does, `Some(false)` when an answer showed no progress, `None`
-    /// when it is not a peer after all.
+    /// says it does, `Some(false)` when an answer showed no progress or came
+    /// from another node ([`Learned::Other`]), `None` when it is not a peer
+    /// after all.
     ///
     /// The first batch is chosen from what we know of the peer (R13); every
     /// later one from what the peer itself last answered. Our view of a peer
@@ -960,6 +965,7 @@ impl SyncHandle {
                             self.pushed(id, &VersionVector::new(), &answer.have);
                             told = Some(answer.have);
                         }
+                        Learned::Other => return Ok(Some(false)),
                         Learned::Retry => {}
                         Learned::Gone => return Ok(None),
                     }
@@ -985,6 +991,9 @@ impl SyncHandle {
                 .map_err(|e| (url.clone(), e))?;
             match self.learned(id, &url, &node) {
                 Learned::Same => {}
+                // Another node answered: that says nothing of whether the
+                // peer holds `ev`.
+                Learned::Other => return Ok(Some(false)),
                 Learned::Retry => {
                     told = None;
                     continue;
@@ -1298,14 +1307,16 @@ async fn pull_loop(state: AppState, id: PeerId) {
             }
         };
         match sync.learned(id, &url, &node) {
-            Learned::Same => {}
+            Learned::Same => sync.pulled(id, asked_with.as_ref(), page.have, page.head),
+            // Another node's events are as good as any to store, but what it
+            // holds says nothing of the peer.
+            Learned::Other => {}
             Learned::Retry => {
                 follow = false;
                 continue;
             }
             Learned::Gone => return,
         }
-        sync.pulled(id, asked_with.as_ref(), page.have, page.head);
         let mut newly = 0usize;
         let mut broken = None;
         for event in page.events {
@@ -1405,16 +1416,17 @@ async fn push_loop(state: AppState, id: PeerId) {
 /// while it keeps taking them, and again from its answer when that holds
 /// less than the view the batch was chosen from (it lost events we thought
 /// it had). After the first push, another follows only an answer that holds
-/// more than the one before it, or a smaller batch, so a peer that takes
-/// nothing is not sent the same batch again. A selection that holds nothing
-/// that arrived since the last round, for a peer whose version vector has
-/// not changed, was sent already (it lies above a gap the peer shares) and
-/// is skipped.
+/// more, in all, than every earlier answer in the round, so the round ends
+/// however the answers move, and a peer that takes nothing is not sent the
+/// same batch again. A selection that holds nothing that arrived since the
+/// last round, for a peer whose version vector has not changed, was sent
+/// already (it lies above a gap the peer shares) and is skipped. An answer
+/// from another node ([`Learned::Other`]) ends the round unmarked: the next
+/// one tries again.
 async fn push_round(state: &AppState, id: PeerId) -> Result<Round, (String, anyhow::Error)> {
     let sync = &state.sync;
-    // This round's last push: how many events it carried, and how many the
-    // peer said it held in all after it.
-    let mut last: Option<(usize, u64)> = None;
+    // The most the peer said it held, in all, in this round's answers.
+    let mut most: Option<u64> = None;
     loop {
         let Some((url, have, mark)) = sync.with_peer(id, |p| {
             (
@@ -1432,6 +1444,7 @@ async fn push_round(state: &AppState, id: PeerId) -> Result<Round, (String, anyh
                 .map_err(|e| (url.clone(), e))?;
             match sync.learned(id, &url, &node) {
                 Learned::Same => sync.pushed(id, &VersionVector::new(), &answer.have),
+                Learned::Other => return Ok(Round::Done),
                 Learned::Retry => return Ok(Round::Retry),
                 Learned::Gone => return Ok(Round::Gone),
             }
@@ -1459,12 +1472,13 @@ async fn push_round(state: &AppState, id: PeerId) -> Result<Round, (String, anyh
         }
         let full = page.len() >= BATCH;
         let events: Vec<Event> = page.into_iter().map(|a| a.event).collect();
-        let sent = events.len();
         let (node, answer) = push(&sync.inner.client, &url, &events, PUSH_TIMEOUT)
             .await
             .map_err(|e| (url.clone(), e))?;
         match sync.learned(id, &url, &node) {
             Learned::Same => {}
+            // Unmarked: what the peer took is not known.
+            Learned::Other => return Ok(Round::Done),
             Learned::Retry => return Ok(Round::Retry),
             Learned::Gone => return Ok(Round::Gone),
         }
@@ -1477,9 +1491,8 @@ async fn push_round(state: &AppState, id: PeerId) -> Result<Round, (String, anyh
         // next is chosen from what it said.
         let more = (full || behind(&answer.have, &have)) && now != have;
         let held = total(&answer.have);
-        let progress =
-            last.is_none_or(|(before_sent, before_held)| held > before_held || sent < before_sent);
-        last = Some((sent, held));
+        let progress = most.is_none_or(|most| held > most);
+        most = Some(most.map_or(held, |most| most.max(held)));
         if more && progress {
             continue;
         }
@@ -1950,9 +1963,11 @@ mod tests {
         t.get_mut(id).unwrap().their_have = Some(vv(&[("pc~00000000", 9)]));
         let mut woken = t.get(id).unwrap().retry.subscribe();
         woken.borrow_and_update();
-        // Back to the first name at once: two nodes at one address. It keeps
-        // the name and what it knows, and its tasks are not woken.
-        assert_eq!(t.learned(id, "http://mac:7700", "mac"), Learned::Same);
+        // Back to the first name at once: two nodes at one address. That
+        // answer is the other node's, not the peer's; the peer keeps its
+        // name and what it knows, and its tasks are not woken.
+        assert_eq!(t.learned(id, "http://mac:7700", "mac"), Learned::Other);
+        assert_eq!(t.learned(id, "http://mac:7700", "mini"), Learned::Same);
         let peer = t.get(id).unwrap();
         assert_eq!(peer.node.as_deref(), Some("mini"));
         assert_eq!(peer.their_have, Some(vv(&[("pc~00000000", 9)])));
