@@ -6,9 +6,11 @@
 //! 0 ok, 1 usage, 2 not found, 3 server unreachable, 4 auth, 5 conflict,
 //! 6 `wait` timed out.
 //!
-//! Every command except `serve` and `health` first tells the node the
+//! Every command except `serve`, `health` and `skill` first tells the node the
 //! caller's handle is here (a presence heartbeat), when a handle is known.
-//! A request is never repeated: a post has no idempotency key.
+//! A request is never repeated: a post has no idempotency key. (`wait` and
+//! `watch` do ask again, but only for what they can ask for twice: a look at
+//! what is unread, and a new stream.)
 
 pub mod human;
 
@@ -822,7 +824,7 @@ async fn open_attachment(
                 Error::Usage(format!("{path} has no file name; give one with --name"))
             })?,
     };
-    let len = meta.is_file().then(|| meta.len());
+    let len = meta.is_file().then_some(meta.len());
     Ok((Box::pin(file), name, len))
 }
 
@@ -1033,7 +1035,8 @@ async fn join(ctx: &Ctx, channel: &str, change: Membership) -> Result<(), Error>
         .channels
         .iter()
         .any(|c| c.name == channel);
-    if !exists && !(change == Membership::Leave && was_joined) {
+    let may_clean_up = change == Membership::Leave && was_joined;
+    if !exists && !may_clean_up {
         return Err(Error::NotFound(match change {
             Membership::Join => {
                 format!("no channel #{channel}; create it with ./beacon channel new {channel}")
@@ -1248,5 +1251,31 @@ fn skill(action: SkillAction) -> Result<(), Error> {
         SkillAction::Install { .. } => Err(Error::Usage(
             "run ./beacon skill install on the host".to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secs(d: Duration) -> u64 {
+        d.as_secs()
+    }
+
+    #[test]
+    fn watch_pauses_double_from_1_s_up_to_30_s_and_start_over() {
+        let mut pause = Backoff::new(WATCH_RECONNECT_MAX);
+        let steps: Vec<u64> = (0..8).map(|_| secs(pause.step())).collect();
+        assert_eq!(steps, [1, 2, 4, 8, 16, 30, 30, 30]);
+        pause.reset();
+        assert_eq!(secs(pause.step()), 1);
+        assert_eq!(secs(pause.step()), 2);
+    }
+
+    #[test]
+    fn wait_pauses_are_shorter() {
+        let mut pause = Backoff::new(WAIT_RECONNECT_MAX);
+        let steps: Vec<u64> = (0..5).map(|_| secs(pause.step())).collect();
+        assert_eq!(steps, [1, 2, 4, 5, 5]);
     }
 }

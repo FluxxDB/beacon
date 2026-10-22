@@ -3446,15 +3446,28 @@ async fn the_live_stream_delivers_what_is_stored_after_it_opens() {
         }
     }
 
-    // The same, as a stream that opens itself.
+    // The same, as a stream that opens itself when it is first polled (here,
+    // by a task that hands its items on).
+    let before = listeners(&node);
     let mut lazy = client.stream(Some("pc-vllm"), true);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    post_as(&node, "mac-juicebox", "beacon", "@pc-vllm again").await;
-    loop {
-        if let StreamEvent::Post(p) = next_event(&mut lazy).await.unwrap() {
-            assert_eq!(p.body, "@pc-vllm again");
-            break;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+        while let Some(item) = lazy.next().await {
+            if tx.send(item).is_err() {
+                break;
+            }
         }
+    });
+    until_listening(&node, before).await;
+    post_as(&node, "mac-juicebox", "beacon", "@pc-vllm again").await;
+    let item = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("an event within 5 s")
+        .expect("the stream is open");
+    match item.unwrap() {
+        StreamEvent::Post(p) => assert_eq!(p.body, "@pc-vllm again"),
+        other => panic!("a relevant stream carries posts only: {other:?}"),
     }
 
     // A stream does not outlive its node: it ends with an error, then nothing.
