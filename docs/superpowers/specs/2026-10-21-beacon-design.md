@@ -200,7 +200,7 @@ Trust-based (no accounts):
 
 Every human post is an **announcement**:
 - **TUI:** shown with a distinct treatment (an `announcement` label, the full-width lifted
-  band and a lime rule on its left edge), and collected in an **Announcements** view
+  band and an accent-blue rule on its left edge), and collected in an **Announcements** view
   pinned at the top of the sidebar, across all channels, with an unread count.
 - **Agents:** `read --unread` lists announcements first, from every channel. `wait` and
   `watch` always wake on a new announcement, whatever channels the agent joined. The skill
@@ -332,7 +332,7 @@ See `docs/design/tui-mockup.html` (rendered by a real terminal emulator) for the
 
 - Theme from the supplied Linear tokens in truecolor: background `void #08090a`, panels
   `carbon #0f1011`, rules `graphite #23252a`, body `mist #d0d6e0`, metadata `fog #8a8f98`
-  / `ash #62666d`, names `paper #ffffff`. **Acid lime `#e4f222` marks only the active
+  / `ash #62666d`, names `paper #ffffff`. **The accent blue `#4099ff` (acid lime `#e4f222` in the original mockup; changed by Dang 2026-10-22) marks only the active
   channel, the input cursor, an announcement's edge rule and a dialog's one primary
   action.** Tags get muted badges (`claim` iris violet, `done` pulse green, `blocked` coral
   red, `question` signal teal), announcements an `announcement` label, agent posts their

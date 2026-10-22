@@ -1,7 +1,7 @@
 //! TUI rendering: the approved mockup screens (`docs/design/tui-mockup.html`,
 //! extracted to `tests/fixtures/mockup/`) must come out of `view::render`
 //! glyph for glyph and color for color, and the rules the mockup can't show
-//! (lime only where allowed, every cell painted, 256-color fallback, narrow
+//! (the accent only where allowed, every cell painted, 256-color fallback, narrow
 //! layout, wrapping, empty states) hold too.
 
 use std::collections::BTreeSet;
@@ -11,7 +11,7 @@ use beacon::tui::state::{
     AgentItem, App, AttachmentItem, ChannelItem, Conn, Dialog, Focus, FormField, NewChannelForm,
     PeerItem, PostItem, Selection,
 };
-use beacon::tui::theme::{nearest_xterm256, palette, ColorMode, Rgb, Theme};
+use beacon::tui::theme::{nearest_xterm256, palette, role, ColorMode, Rgb, Theme};
 use beacon::tui::{view, wrap};
 use jiff::tz::TimeZone;
 use ratatui::backend::TestBackend;
@@ -292,7 +292,7 @@ fn color_name(c: Color) -> String {
         (palette::FOG, "FOG"),
         (palette::MIST, "MIST"),
         (palette::PAPER, "PAPER"),
-        (palette::LIME, "LIME"),
+        (palette::AZURE, "AZURE"),
         (palette::GREEN, "GREEN"),
         (palette::CORAL, "CORAL"),
         (palette::TEAL, "TEAL"),
@@ -417,10 +417,10 @@ fn colors_match_mockup() {
 
 type Cells = BTreeSet<(u16, u16)>;
 
-/// The cells allowed to carry lime on a screen, each found by the role of
+/// The cells allowed to carry the accent on a screen, each found by the role of
 /// the element it belongs to.
 #[derive(Debug, Default)]
-struct LimeSites {
+struct AccentSites {
     /// `▍` edge rules: the active channel's sidebar row, each announcement row.
     edges: Cells,
     /// The composer's `›`.
@@ -438,7 +438,7 @@ fn column_of(buf: &Buffer, y: u16, needle: &str) -> Option<u16> {
         .map(|byte| row[..byte].chars().count() as u16)
 }
 
-fn lime_sites(buf: &Buffer, app: &App) -> LimeSites {
+fn accent_sites(buf: &Buffer, app: &App) -> AccentSites {
     let (width, height) = (buf.area.width, buf.area.height);
     let has_sidebar = width >= 80;
     let (x0, pane_w) = if has_sidebar {
@@ -446,7 +446,7 @@ fn lime_sites(buf: &Buffer, app: &App) -> LimeSites {
     } else {
         (1, width - 2)
     };
-    let mut sites = LimeSites::default();
+    let mut sites = AccentSites::default();
 
     // The active channel: the sidebar's first column on its row.
     if let (true, Selection::Channel(name)) = (has_sidebar, &app.selected) {
@@ -499,24 +499,24 @@ fn lime_sites(buf: &Buffer, app: &App) -> LimeSites {
     sites
 }
 
-fn lime_cells(buf: &Buffer) -> Cells {
-    let lime = rgb(palette::LIME);
+fn accent_cells(buf: &Buffer) -> Cells {
+    let accent = rgb(role::ACCENT);
     buf.content()
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.fg == lime || c.bg == lime)
+        .filter(|(_, c)| c.fg == accent || c.bg == accent)
         .map(|(i, _)| buf.pos_of(i))
         .collect()
 }
 
 #[test]
-fn lime_only_where_allowed() {
-    let lime = rgb(palette::LIME);
-    // Nothing dimmed: exactly the edges, the prompt and the caret are lime.
+fn accent_only_where_allowed() {
+    let accent = rgb(role::ACCENT);
+    // Nothing dimmed: exactly the edges, the prompt and the caret are the accent.
     for (label, width, height) in [("board", 104, 33), ("mac", 94, 30), ("narrow", 79, 24)] {
         let app = mockup_app();
         let buf = render(&app, TRUECOLOR, width, height);
-        let sites = lime_sites(&buf, &app);
+        let sites = accent_sites(&buf, &app);
         let allowed: Cells = sites
             .edges
             .iter()
@@ -524,24 +524,24 @@ fn lime_only_where_allowed() {
             .chain(&sites.carets)
             .copied()
             .collect();
-        assert_eq!(lime_cells(&buf), allowed, "{label}: {sites:?}");
+        assert_eq!(accent_cells(&buf), allowed, "{label}: {sites:?}");
         for &(x, y) in &sites.edges {
             let cell = &buf[(x, y)];
             assert_eq!(
                 (cell.symbol(), cell.fg, cell.bg),
-                ("▍", lime, rgb(palette::OBSIDIAN)),
+                ("▍", accent, rgb(palette::OBSIDIAN)),
                 "{label}: edge ({x},{y})"
             );
         }
         for &(x, y) in &sites.prompt {
             assert_eq!(
                 (buf[(x, y)].symbol(), buf[(x, y)].fg),
-                ("›", lime),
+                ("›", accent),
                 "{label}: prompt"
             );
         }
         for &(x, y) in &sites.carets {
-            assert_eq!(buf[(x, y)].bg, lime, "{label}: caret ({x},{y})");
+            assert_eq!(buf[(x, y)].bg, accent, "{label}: caret ({x},{y})");
         }
         if label == "board" {
             // The active channel, three announcement rows, prompt and caret.
@@ -549,19 +549,19 @@ fn lime_only_where_allowed() {
         }
     }
 
-    // Behind a dialog the marks dim: lime stays on the two carets (composer
+    // Behind a dialog the marks dim: the accent stays on the two carets (composer
     // and the focused field) and the dialog's primary action.
     let app = modal_app();
     let buf = render(&app, TRUECOLOR, 104, 33);
-    let sites = lime_sites(&buf, &app);
+    let sites = accent_sites(&buf, &app);
     let allowed: Cells = sites.carets.union(&sites.primary).copied().collect();
     assert_eq!(sites.carets.len(), 2);
     assert_eq!(sites.primary.len(), 10);
-    assert_eq!(lime_cells(&buf), allowed, "modal: {sites:?}");
+    assert_eq!(accent_cells(&buf), allowed, "modal: {sites:?}");
     for &(x, y) in &sites.primary {
         assert_eq!(
             (buf[(x, y)].fg, buf[(x, y)].bg),
-            (rgb(palette::VOID), lime),
+            (rgb(palette::VOID), accent),
             "primary ({x},{y})"
         );
     }
@@ -642,9 +642,9 @@ fn ansi256_picks_nearest_xterm_color() {
     assert_eq!(theme.c(palette::VOID), Color::Indexed(232));
     // #ffffff is the cube's white, 231.
     assert_eq!(theme.c(palette::PAPER), Color::Indexed(231));
-    // #e4f222 -> cube (4, 5, 0) = #d7ff00.
-    assert_eq!(theme.c(palette::LIME), Color::Indexed(190));
-    assert_eq!(TRUECOLOR.c(palette::LIME), Color::Rgb(0xe4, 0xf2, 0x22));
+    // The accent #4099ff -> cube (1, 2, 5) = #5f87ff.
+    assert_eq!(theme.c(role::ACCENT), Color::Indexed(69));
+    assert_eq!(TRUECOLOR.c(role::ACCENT), Color::Rgb(0x40, 0x99, 0xff));
     // Obsidian is exactly between greys 233 and 234; the tie goes to the
     // lighter one, so a lifted row still stands off the carbon panel.
     assert_eq!(theme.c(palette::CARBON), Color::Indexed(233));
@@ -665,6 +665,73 @@ fn ansi256_picks_nearest_xterm_color() {
     .map(|&c| format!("{:?}", theme.c(c)))
     .collect();
     assert_eq!(surfaces.len(), 4, "{surfaces:?}");
+}
+
+/// WCAG 2.x contrast ratio between two colors.
+fn contrast(a: Rgb, b: Rgb) -> f64 {
+    fn luminance(c: Rgb) -> f64 {
+        let lin = |v: u8| {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.0) + 0.7152 * lin(c.1) + 0.0722 * lin(c.2)
+    }
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+#[test]
+fn accent_is_a_readable_blue_with_its_own_256_index() {
+    // The approved accent (Dang, 2026-10-22: the lime highlight becomes a
+    // fitting blue) is #4099ff, a blue as clearly apart from iris, lavender
+    // and teal as the palette allows.
+    assert_eq!(role::ACCENT, Rgb(0x40, 0x99, 0xff));
+    assert_eq!(role::ACCENT, palette::AZURE);
+    let Rgb(r, g, b) = role::ACCENT;
+    assert!(b > g && g > r, "blue dominates: {:?}", role::ACCENT);
+
+    // As a glyph (the edge rules, the prompt, a caret's ink) it reads on
+    // every surface it sits on.
+    for (name, surface) in [
+        ("VOID", palette::VOID),
+        ("CARBON", palette::CARBON),
+        ("OBSIDIAN", palette::OBSIDIAN),
+    ] {
+        let ratio = contrast(role::ACCENT, surface);
+        assert!(ratio >= 4.5, "accent on {name}: {ratio:.2}:1");
+    }
+    // As the dialog's primary action, with void text on it.
+    let ratio = contrast(palette::VOID, role::ACCENT);
+    assert!(ratio >= 4.5, "void on the accent: {ratio:.2}:1");
+
+    // In 256 colors it keeps its own index, apart from every other color.
+    let theme = Theme {
+        mode: ColorMode::Ansi256,
+    };
+    let accent = theme.c(role::ACCENT);
+    assert_eq!(accent, Color::Indexed(nearest_xterm256(role::ACCENT)));
+    for (name, other) in [
+        ("VOID", palette::VOID),
+        ("CARBON", palette::CARBON),
+        ("OBSIDIAN", palette::OBSIDIAN),
+        ("GRAPHITE", palette::GRAPHITE),
+        ("SMOKE", palette::SMOKE),
+        ("ASH", palette::ASH),
+        ("FOG", palette::FOG),
+        ("MIST", palette::MIST),
+        ("PAPER", palette::PAPER),
+        ("GREEN", palette::GREEN),
+        ("CORAL", palette::CORAL),
+        ("TEAL", palette::TEAL),
+        ("IRIS", palette::IRIS),
+        ("LAVENDER", palette::LAVENDER),
+    ] {
+        assert_ne!(accent, theme.c(other), "accent shares an index with {name}");
+    }
 }
 
 #[test]
@@ -1587,7 +1654,7 @@ mod behaviour {
         assert!(text.contains("esc cancel   ↵ delete"));
         let y = row_of(&buf, "↵ delete");
         let x = column_of(&buf, y, "↵ delete").unwrap();
-        assert_eq!(buf[(x, y)].bg, rgb(palette::LIME), "the one primary action");
+        assert_eq!(buf[(x, y)].bg, rgb(role::ACCENT), "the one primary action");
 
         assert!(app.update(key(KeyCode::Esc)).is_empty());
         assert!(app.dialog.is_none() && app.confirm.is_none());
@@ -1656,9 +1723,9 @@ mod behaviour {
         assert!(text.contains("Attach a file"));
         assert!(text.contains("newest.txt") && text.contains("build.log"));
         assert!(text.contains("with “the log”"), "{text}");
-        let lime: Vec<_> = lime_cells(&buf).into_iter().collect();
+        let accent: Vec<_> = accent_cells(&buf).into_iter().collect();
         let y = row_of(&buf, "↵ attach");
-        assert!(lime
+        assert!(accent
             .iter()
             .all(|&(_, ly)| ly == y || ly == row_of(&buf, "›")));
 
@@ -1748,7 +1815,7 @@ mod behaviour {
             text.contains("tab  shift-tab  channels, posts, composer"),
             "{text}"
         );
-        assert!(lime_cells(&screen(&app)).len() <= 1, "no primary action");
+        assert!(accent_cells(&screen(&app)).len() <= 1, "no primary action");
         // At 80×24 it still fits.
         let buf = render(&app, TRUECOLOR, 80, 24);
         let small = rows(&buf).join("\n");

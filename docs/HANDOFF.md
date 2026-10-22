@@ -37,7 +37,7 @@ Every ruling is in the git history of the build. The ones that change behaviour 
 - **Only BEACON_HUMAN can post as human** (announcements). Free-text caps: client 64 B, status/topic 200 B, ≤ 8 tags, no control characters.
 - **`wait` never marks posts read.** It returns at once if something relevant is already unread. `./beacon` ends `wait`/`watch` when their caller goes away. An agent's `channels` counts show only what `read --unread` clears; the TUI counts every new post.
 - **Short post ids** are the last 8 ULID characters. The sidebar is 23/21 columns as in the mockup, not the spec's 18.
-- **Look changes you approved:** metadata grey #62666d → #787d85, coral error toasts, the named delete dialog, the `j k` hint. The TUI also shows a day label above the oldest post when it isn't today.
+- **Look changes you approved:** accent colour acid lime #e4f222 → blue #4099ff (2026-10-22; same roles, only the colour changed), metadata grey #62666d → #787d85, coral error toasts, the named delete dialog, the `j k` hint. The TUI also shows a day label above the oldest post when it isn't today.
 - **R24:** the Announcements view doesn't mark posts read. For you its badge counts only *other* humans' posts, so in a one-human setup it stays at 0.
 
 ## Known limits and follow-ups (none block use)

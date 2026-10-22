@@ -1,6 +1,6 @@
 //! Dialogs over the dimmed board: the "New channel" form and confirmations.
 //! A carbon box with a smoke border, centered on the posts; one primary
-//! action in lime, `esc cancel` beside it.
+//! action in the accent, `esc cancel` beside it.
 //!
 //! ```text
 //! ╭──────────────────────────╮
@@ -12,7 +12,7 @@
 //! │  Topic                   │
 //! │   long-running jobs…     │
 //! │                          │
-//! │   esc cancel   ↵ create  │   primary action in lime
+//! │   esc cancel   ↵ create  │   primary action in the accent
 //! ╰──────────────────────────╯
 //! ```
 
@@ -258,7 +258,7 @@ impl Panel {
     }
 
     /// An input field: lifted, an optional prefix (`#`), the value, and the
-    /// lime caret after it when focused. A focused value too long to fit
+    /// accent caret after it when focused. A focused value too long to fit
     /// shows its end; an unfocused one its start.
     fn field(
         &self,

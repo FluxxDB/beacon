@@ -26,7 +26,10 @@ pub mod palette {
     pub const PAPER: Rgb = Rgb(0xff, 0xff, 0xff);
     /// The one accent. Only on: the active channel's edge, the composer
     /// prompt and caret, an announcement's edge rule, a dialog's primary action.
-    pub const LIME: Rgb = Rgb(0xe4, 0xf2, 0x22);
+    /// A blue standing in for the mockup's acid lime #e4f222 (Dang, 2026-10-22):
+    /// 6.2:1 on obsidian, 6.85:1 under void text, its own xterm-256 index (69),
+    /// and clear of iris, lavender and teal.
+    pub const AZURE: Rgb = Rgb(0x40, 0x99, 0xff);
     pub const GREEN: Rgb = Rgb(0x27, 0xa6, 0x44);
     pub const CORAL: Rgb = Rgb(0xeb, 0x57, 0x57);
     pub const TEAL: Rgb = Rgb(0x02, 0xb8, 0xcc);
@@ -56,7 +59,7 @@ pub mod role {
     pub const LIFTED: Rgb = OBSIDIAN;
     /// The composer's border, and everything behind an open dialog.
     pub const DIM: Rgb = SMOKE;
-    pub const ACCENT: Rgb = LIME;
+    pub const ACCENT: Rgb = AZURE;
     pub const DIALOG_BG: Rgb = CARBON;
     pub const ACTIVE: Rgb = GREEN;
     pub const ERROR: Rgb = CORAL;
