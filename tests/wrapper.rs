@@ -36,14 +36,24 @@ dir=${FAKE_DOCKER_DIR:?}
 case "$1 $2" in
 "compose ps")
     printf '%s\0' "$@" > "$dir/ps.argv"
-    if [ -n "${FAKE_PS_FAIL:-}" ]; then
-        printf '%s\n' "$FAKE_PS_FAIL" >&2
+    if [ -n "${FAKE_DOCKER_FAIL:-}" ]; then
+        printf '%s\n' "$FAKE_DOCKER_FAIL" >&2
         exit 1
     fi
     [ -n "${FAKE_NOT_RUNNING:-}" ] || echo 0123456789ab
     exit 0
     ;;
 "compose exec")
+    # Docker's own failures, as compose v5 words them: nothing runs in the
+    # container, so `exec.argv` (the CLI ran with these arguments) stays unset.
+    if [ -n "${FAKE_DOCKER_FAIL:-}" ]; then
+        printf '%s\n' "$FAKE_DOCKER_FAIL" >&2
+        exit 1
+    fi
+    if [ -n "${FAKE_NOT_RUNNING:-}" ]; then
+        printf '%s\n' 'service "beacon" is not running' >&2
+        exit 1
+    fi
     printf '%s\0' "$@" > "$dir/exec.argv"
     pwd -P > "$dir/exec.cwd"
     env > "$dir/exec.env"
@@ -71,6 +81,9 @@ case "$1 $2" in
     esac
     if [ -n "${FAKE_EXEC_STDOUT_FILE:-}" ]; then
         cat "$FAKE_EXEC_STDOUT_FILE"
+    fi
+    if [ -n "${FAKE_EXEC_STDERR:-}" ]; then
+        printf '%s\n' "$FAKE_EXEC_STDERR" >&2
     fi
     exit "${FAKE_EXEC_STATUS:-0}"
     ;;
@@ -347,16 +360,42 @@ fn wrapper_passes_args_verbatim() {
     }
 }
 
+/// A command costs one docker call: no `docker compose ps` first (it cost
+/// about as much again). Only the TUI, `wait` and `watch`, which run for
+/// minutes and replace the wrapper with docker, still look first.
 #[test]
-fn wrapper_checks_the_service_is_running_before_exec() {
+fn only_long_running_commands_check_the_service_first() {
     let sb = Sandbox::new();
     let run = sb.run(sb.command(&["status"]));
     assert_eq!(run.code, 0, "{}", run.stderr);
-    assert_eq!(
-        sb.argv("ps"),
-        s(&["compose", "ps", "--status", "running", "-q", "beacon"])
-    );
+    assert!(!sb.called("ps"), "no check before a plain command");
+    assert_eq!(sb.argv("exec"), exec_argv(&["status"]));
     assert_eq!(sb.exec_cwd(), repo(), "compose runs from the repo root");
+
+    for args in [&["wait", "--timeout", "1"][..], &["watch"]] {
+        let sb = Sandbox::new();
+        let run = sb.run(sb.command(args));
+        assert_eq!(run.code, 0, "{args:?}: {}", run.stderr);
+        assert_eq!(
+            sb.argv("ps"),
+            s(&["compose", "ps", "--status", "running", "-q", "beacon"]),
+            "{args:?}"
+        );
+    }
+}
+
+/// What the CLI writes to stderr, and its status, reach the caller as they
+/// were: only docker's own failures are turned into exit 3.
+#[test]
+fn the_clis_own_errors_pass_through() {
+    let sb = Sandbox::new();
+    let mut cmd = sb.command(&["read", "nope"]);
+    cmd.env("FAKE_EXEC_STDERR", "beacon: no channel #nope")
+        .env("FAKE_EXEC_STATUS", "2");
+    let run = sb.run(cmd);
+    assert_eq!(run.code, 2);
+    assert_eq!(run.stderr, "beacon: no channel #nope\n");
+    assert_eq!(sb.argv("exec"), exec_argv(&["read", "nope"]));
 }
 
 #[test]
@@ -575,6 +614,38 @@ fn attach_missing_file_exits_2_without_calling_docker() {
     assert!(!sb.called("ps") && !sb.called("exec"));
 }
 
+/// `--size N` takes a value (F1-1): it is never the channel or the path. It
+/// is for a stream on stdin; with a host file the wrapper sends the file's
+/// size itself, so a size of one's own is refused.
+#[test]
+fn attach_size_takes_a_value_and_is_for_stdin_only() {
+    for args in [
+        &["attach", "general", "--size", "5", "-"][..],
+        &["attach", "--size=5", "general", "-", "a note"],
+    ] {
+        let sb = Sandbox::new();
+        let run = sb.run(sb.command(args));
+        assert_eq!(run.code, 0, "{args:?}: {}", run.stderr);
+        assert_eq!(sb.argv("exec"), exec_argv(args), "{args:?}");
+    }
+
+    for args in [
+        &["attach", "general", "Cargo.toml", "--size", "3"][..],
+        &["attach", "general", "--size=3", "Cargo.toml"],
+        &["attach", "--size", "3", "general", "Cargo.toml", "note"],
+    ] {
+        let sb = Sandbox::new();
+        let run = sb.run(sb.command(args));
+        assert_eq!(run.code, 1, "{args:?}");
+        assert_eq!(
+            run.stderr,
+            "usage: --size is only for a file on stdin (./beacon attach CHANNEL - --size N); for a file path the wrapper sends its size itself\n",
+            "{args:?}"
+        );
+        assert!(!sb.called("ps") && !sb.called("exec"), "{args:?}");
+    }
+}
+
 #[test]
 fn attach_with_stdin_dash_is_left_to_the_cli() {
     let sb = Sandbox::new();
@@ -702,6 +773,8 @@ fn get_dash_o_to_missing_directory_fails_cleanly() {
 
 #[test]
 fn not_running_exits_3() {
+    // A plain command finds out from docker's own answer to the exec
+    // (`service "beacon" is not running`), which becomes the hint.
     let sb = Sandbox::new();
     let mut cmd = sb.command(&["post", "general", "hi"]);
     cmd.env("FAKE_NOT_RUNNING", "1");
@@ -712,9 +785,25 @@ fn not_running_exits_3() {
         "beacon isn't running here. Start it with: docker compose up -d   (in the beacon repo)\n"
     );
     assert_eq!(run.stdout, b"");
+    assert!(!sb.called("ps"), "no check first");
     assert!(
         !sb.called("exec"),
-        "nothing is exec'd when the service is down"
+        "nothing runs in the container when the service is down"
+    );
+
+    // Older compose words it as no container found.
+    let sb = Sandbox::new();
+    let mut cmd = sb.command(&["read", "general"]);
+    cmd.env(
+        "FAKE_DOCKER_FAIL",
+        "no container found for project \"beacon\" service \"beacon\"",
+    );
+    let run = sb.run(cmd);
+    assert_eq!(run.code, 3);
+    assert!(
+        run.stderr.starts_with("beacon isn't running here."),
+        "{}",
+        run.stderr
     );
 
     // The stream-carrying commands get the same answer.
@@ -745,7 +834,7 @@ fn docker_permission_denied_prints_the_group_hint() {
     let sb = Sandbox::new();
     let msg = "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock";
     let mut cmd = sb.command(&["read", "general"]);
-    cmd.env("FAKE_PS_FAIL", msg);
+    cmd.env("FAKE_DOCKER_FAIL", msg);
     let run = sb.run(cmd);
     assert_eq!(run.code, 3);
     assert_eq!(
@@ -760,7 +849,7 @@ fn other_docker_failures_are_relayed_with_exit_3() {
     let sb = Sandbox::new();
     let msg = "failed to connect to the docker API at unix:///var/run/docker.sock; is the daemon running?";
     let mut cmd = sb.command(&["read", "general"]);
-    cmd.env("FAKE_PS_FAIL", msg);
+    cmd.env("FAKE_DOCKER_FAIL", msg);
     let run = sb.run(cmd);
     assert_eq!(run.code, 3);
     assert_eq!(run.stderr, format!("{msg}\n"));

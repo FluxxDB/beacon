@@ -50,19 +50,18 @@ die() {
     exit "$code"
 }
 
-# Make sure the container is running, or say what to do and exit 3.
-preflight() {
+NOT_RUNNING="beacon isn't running here. Start it with: docker compose up -d   (in the beacon repo)"
+
+need_docker() {
     command -v docker >/dev/null 2>&1 ||
         die 3 "beacon needs Docker, but docker isn't on PATH."
-    if running=$(docker compose ps --status running -q beacon 2>/dev/null); then
-        [ -n "$running" ] ||
-            die 3 "beacon isn't running here. Start it with: docker compose up -d   (in the beacon repo)"
-        return 0
-    fi
-    # docker itself failed: show why (the call above hid its stderr).
-    err=$(docker compose ps --status running -q beacon 2>&1 >/dev/null)
-    printf '%s\n' "$err" >&2
-    case $err in
+}
+
+# Docker could not run the command: say why, with what to do, and exit 3.
+# $1 is what docker wrote to stderr.
+docker_failed() {
+    printf '%s\n' "$1" >&2
+    case $1 in
     *[Pp]ermission\ denied*)
         printf '%s\n' "add yourself to the docker group or run: sg docker -c './beacon …'" >&2
         ;;
@@ -70,17 +69,59 @@ preflight() {
     exit 3
 }
 
-# Replace this shell with: docker compose exec [-T] … beacon beacon <args>
-# $1 is "tty" (the TUI gets a terminal) or "pipe"; the rest are CLI arguments.
-beacon_exec() {
-    mode=$1
-    shift
-    if [ "$mode" = tty ]; then
-        exec docker compose exec \
-            -e BEACON_AGENT -e BEACON_CLIENT -e TERM -e COLORTERM -e TZ \
-            beacon beacon "$@"
+# For the commands that replace this shell with docker (the TUI, wait and
+# watch), which cannot look at docker's answer afterwards: make sure the
+# container is running first, or say what to do and exit 3. They run for
+# minutes, so the extra docker call costs nothing that matters.
+preflight() {
+    need_docker
+    if running=$(docker compose ps --status running -q beacon 2>/dev/null); then
+        [ -n "$running" ] || die 3 "$NOT_RUNNING"
+        return 0
     fi
-    exec docker compose exec -T \
+    # docker itself failed: show why (the call above hid its stderr).
+    docker_failed "$(docker compose ps --status running -q beacon 2>&1 >/dev/null)"
+}
+
+# Run the CLI in the container: docker compose exec -T … beacon beacon <args>,
+# then exit with its status. There is no check first (a `docker compose ps`
+# cost about as much as the command itself): docker's own answer tells. Its
+# failures (no container running, no daemon, no permission) exit 3 with what
+# to do, like the CLI's when the server is down; the CLI's own messages start
+# with `beacon:` (or clap's `error:`), never like docker's. So stderr is held
+# until the command ends (stdout and stdin stream as usual), then passed on.
+beacon_run() {
+    need_docker
+    exec 4>&1
+    held=$(
+        docker compose exec -T \
+            -e BEACON_AGENT -e BEACON_CLIENT -e TERM -e COLORTERM -e TZ \
+            beacon beacon "$@" 2>&1 >&4 4>&-
+        printf ' %s' "$?"
+    )
+    exec 4>&-
+    code=${held##* }
+    held=${held% *}
+    if [ "$code" -ne 0 ]; then
+        case $held in
+        'service "beacon" is not running'* | 'no container found'* | *'No such container'*)
+            die 3 "$NOT_RUNNING"
+            ;;
+        *'ermission denied while trying to connect'* | [Cc]'annot connect to the Docker'* | \
+            [Ff]'ailed to connect to the docker'* | 'Error response from daemon'*)
+            docker_failed "${held%
+}"
+            ;;
+        esac
+    fi
+    printf '%s' "$held" >&2
+    exit "$code"
+}
+
+# Replace this shell with the TUI: docker compose exec … beacon beacon <args>,
+# with a terminal.
+tui_exec() {
+    exec docker compose exec \
         -e BEACON_AGENT -e BEACON_CLIENT -e TERM -e COLORTERM -e TZ \
         beacon beacon "$@"
 }
@@ -187,12 +228,13 @@ TEXT
 # two arguments that are not options, wherever the options are.
 
 # attach_scan <args after "attach">: sets path_at (1-based position of the path
-# argument, 0 if there is none or help was asked for), path_val and have_name
-# (the user passed --name anywhere).
+# argument, 0 if there is none or help was asked for), path_val, have_name
+# (the user passed --name anywhere) and have_size (--size).
 attach_scan() {
     path_at=0
     path_val=
     have_name=0
+    have_size=0
     pos=0
     npos=0
     skip=0
@@ -209,6 +251,8 @@ attach_scan() {
             --help | -h) path_at=0; return 0 ;;
             --name) have_name=1; skip=1 ;;
             --name=*) have_name=1 ;;
+            --size) have_size=1; skip=1 ;;
+            --size=*) have_size=1 ;;
             --tag | --as | --client) skip=1 ;;
             --tag=* | --as=* | --client=*) ;;
             -) npos=$((npos + 1)) ;;
@@ -232,6 +276,8 @@ host_attach() {
     attach_scan "$@"
     [ "$path_at" -gt 0 ] || return 0
     [ "$path_val" != - ] || return 0
+    [ "$have_size" -eq 0 ] ||
+        die 1 "usage: --size is only for a file on stdin (./beacon attach CHANNEL - --size N); for a file path the wrapper sends its size itself"
     given=$path_val
     case $given in
     /*) path=$given ;;
@@ -261,8 +307,7 @@ host_attach() {
             set -- "$@" "$arg"
         fi
     done
-    preflight
-    beacon_exec pipe attach "$@" <"$path"
+    beacon_run attach "$@" <"$path"
 }
 
 # --- ./beacon get <id> [-o <path>] -------------------------------------------
@@ -304,8 +349,7 @@ host_get() {
         die 1 "usage: ./beacon get <post-id> [-o path]"
     fi
     if [ "$have_out" -eq 0 ] || [ "$out" = - ]; then
-        preflight
-        beacon_exec pipe get "$@"
+        beacon_run get "$@"
     fi
     given=$out
     case $given in
@@ -315,17 +359,15 @@ host_get() {
     [ ! -d "$out" ] || die 1 "is a directory: $given"
     if [ -e "$out" ] && [ ! -f "$out" ]; then
         # /dev/null, a FIFO, …: nothing to rename over, so write straight to it.
-        preflight
-        (beacon_exec pipe get "$@") >"$out"
+        (beacon_run get "$@") >"$out"
         exit $?
     fi
     dir=${out%/*}
     [ -d "${dir:-/}" ] || die 1 "no such directory: ${dir:-/}"
     [ -w "${dir:-/}" ] || die 1 "can't write to ${dir:-/}"
     tmp=${dir%/}/.beacon-get.$$
-    preflight
     trap 'rm -f "$tmp"; exit 1' HUP INT TERM
-    (beacon_exec pipe get "$@") >"$tmp"
+    (beacon_run get "$@") >"$tmp"
     code=$?
     if [ "$code" -eq 0 ]; then
         mv -f "$tmp" "$out" || code=1
@@ -339,7 +381,7 @@ start_tui() {
     [ -t 0 ] ||
         die 1 "the TUI needs a terminal; agents use ./beacon <command> (see ./beacon skill show)"
     preflight
-    beacon_exec tty "$@"
+    tui_exec "$@"
 }
 
 # --- dispatch ----------------------------------------------------------------
@@ -401,8 +443,10 @@ attach) host_attach "$@" ;;
 get) host_get "$@" ;;
 esac
 
-preflight
 case $(subcommand "$@") in
-watch | wait) linked_exec "$@" ;;
+watch | wait)
+    preflight
+    linked_exec "$@"
+    ;;
 esac
-beacon_exec pipe "$@"
+beacon_run "$@"
