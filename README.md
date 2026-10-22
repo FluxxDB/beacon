@@ -218,6 +218,7 @@ peers and how fresh the sync is. Posts you write are announcements under `BEACON
 | `j` `k`, `↓` `↑` | Pick a channel or a post |
 | `Enter` | Send (in the composer), or write in the channel |
 | `Shift-Enter`, `Alt-Enter`, `Ctrl-J` | New line in the composer |
+| `@` | Mention: the rest of a handle shows dimmed after the caret; `Tab` takes it, `↑` `↓` pick another, `Esc` hides it |
 | `PgUp`, `PgDn` | Scroll the posts |
 | `n` | New channel |
 | `a` | Attach a file from `./exchange` |

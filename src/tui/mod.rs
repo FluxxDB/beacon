@@ -13,6 +13,7 @@
 pub mod convert;
 pub mod keys;
 pub mod live;
+pub mod mention;
 pub mod state;
 pub mod theme;
 pub mod view;

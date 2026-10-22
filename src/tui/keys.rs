@@ -12,6 +12,9 @@
 //!   other printable key jumps to the composer and types itself.
 //! * Anywhere: `Tab`/`Shift-Tab` cycle the focus, `PgUp`/`PgDn` scroll the
 //!   posts, `Esc` clears the filter.
+//! * **`@` ghost** ([`crate::tui::mention`]): while the composer shows one,
+//!   `Tab` takes it, `↑`/`↓` pick another match and `Esc` puts it away;
+//!   without one those keys do what they always do.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
@@ -63,6 +66,9 @@ impl App {
         }
         if self.filter_editing {
             self.filter_key(&key);
+            return Vec::new();
+        }
+        if self.ghost_key(&key) {
             return Vec::new();
         }
         match key.code {
@@ -141,6 +147,25 @@ impl App {
                 Vec::new()
             }
         }
+    }
+
+    /// `Tab`, `↑` `↓` and `Esc` while the composer shows a ghost: take it
+    /// (and a space), pick another match, put it away. Whether the key was
+    /// the ghost's.
+    fn ghost_key(&mut self, key: &KeyEvent) -> bool {
+        let Some(ghost) = self.ghost() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.insert_text(&format!("{} ", ghost.rest));
+            }
+            KeyCode::Down => self.pick_mention(&ghost, true),
+            KeyCode::Up => self.pick_mention(&ghost, false),
+            KeyCode::Esc => self.dismiss_mention(),
+            _ => return false,
+        }
+        true
     }
 
     /// Sends the composer's text to the channel on screen.
