@@ -25,6 +25,7 @@ use crate::error::Error;
 use crate::model::AuthorKind;
 use crate::tui::convert;
 use crate::tui::mention::Mention;
+use crate::tui::reply::Target;
 use crate::tui::view::Layout;
 use crate::tui::widgets::posts;
 
@@ -139,6 +140,9 @@ pub struct App {
     /// older posts was on its way: the node may have read that page before
     /// they arrived, so they go in when it lands, where they fit.
     pub held: Vec<(PostItem, PostExtra)>,
+    /// What the node said about the posts replies name, by the id a reply
+    /// names (uppercase), kept across views; see [`crate::tui::reply`].
+    pub replies: HashMap<String, Target>,
     pub last_heartbeat_ms: Option<i64>,
     pub last_status_ms: Option<i64>,
 }
@@ -185,6 +189,7 @@ impl App {
             extras: HashMap::new(),
             arrivals: None,
             held: Vec::new(),
+            replies: HashMap::new(),
             last_heartbeat_ms: None,
             last_status_ms: None,
         }
@@ -314,6 +319,12 @@ pub enum Loaded {
     Status(StatusJson),
     /// The exchange folder, newest first.
     Files(Result<Vec<ExchangeFile>, String>),
+    /// The post a reply names by `id`: `None` when the node has no such
+    /// post, `Err` when it could not be asked.
+    Post {
+        id: String,
+        post: Result<Option<Box<PostJson>>, String>,
+    },
 }
 
 /// Something for the event loop to do. Each runs on its own task; its
@@ -367,6 +378,8 @@ pub enum Cmd {
     },
     /// Tell the node `me` is here (kind human, client `tui`).
     Heartbeat,
+    /// The post a reply names, by its id or short id.
+    LoadPost(String),
     Quit,
 }
 
@@ -514,6 +527,8 @@ impl App {
         if self.scroll == 0 && (scrolled || (filtered && posts::shows_all(self))) {
             cmds.extend(self.caught_up());
         }
+        // What the view's replies answer, asked for once per id.
+        cmds.extend(self.ask_for_reply_targets());
         cmds
     }
 
@@ -536,6 +551,7 @@ impl App {
                 match result {
                     Ok(id) => {
                         self.remove_post(&id);
+                        self.reply_target_deleted(&id);
                     }
                     Err(e) => self.error(format!("Not deleted: {e}")),
                 }
@@ -544,6 +560,7 @@ impl App {
             Msg::ChannelDeleted(result) => match result {
                 Ok(name) => {
                     self.channels.retain(|c| c.name != name);
+                    self.reply_targets_lost_channel(&name);
                     let mut cmds = Vec::new();
                     if self.selected == Selection::Channel(name.clone()) {
                         cmds = self.channel_gone(&name);
@@ -655,6 +672,7 @@ impl App {
                 self.connection = Conn::Up;
                 self.live = true;
                 self.secret_rejected = false;
+                self.retry_reply_targets();
                 self.last_heartbeat_ms = Some(self.now_ms);
                 self.last_status_ms = Some(self.now_ms);
                 // Whatever happened while the feed was closed is read afresh.
@@ -797,6 +815,10 @@ impl App {
                     picker.files = Some(files);
                     picker.selected = 0;
                 }
+                Vec::new()
+            }
+            Loaded::Post { id, post } => {
+                self.on_reply_target(id, post);
                 Vec::new()
             }
         }
@@ -952,12 +974,14 @@ impl App {
                 }
                 self.held.retain(|(p, _)| p.id != id);
                 self.remove_post(&id);
+                self.reply_target_deleted(&id);
                 // The unread counts may have included it.
                 vec![Cmd::LoadChannels]
             }
             StreamEvent::Channel { channel, deleted } => {
                 if deleted {
                     self.channels.retain(|c| c.name != channel.name);
+                    self.reply_targets_lost_channel(&channel.name);
                     let mut cmds = Vec::new();
                     if self.selected == Selection::Channel(channel.name.clone()) {
                         cmds = self.channel_gone(&channel.name);
@@ -1004,6 +1028,7 @@ impl App {
 
     fn on_live_post(&mut self, post: &PostJson) -> Vec<Cmd> {
         let item = convert::post_item(post);
+        self.reply_target_arrived(&item);
         let mut cmds = Vec::new();
         if !self.channels.iter().any(|c| c.name == item.channel) {
             // A post can arrive before its channel does, or bring a deleted
