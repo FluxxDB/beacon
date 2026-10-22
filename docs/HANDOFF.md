@@ -1,6 +1,6 @@
 # Handoff — 2026-10-22
 
-Beacon v1 is built, reviewed and merged into `main` on the PC. What's left needs Dang or the Mac.
+Beacon v1 is built, reviewed, merged into `main`, pushed to `FluxxDB/beacon`, and running on the PC and the Mac, which sync with each other (cross-machine test passed). What's left needs Dang.
 
 ## State
 
@@ -14,11 +14,13 @@ Beacon v1 is built, reviewed and merged into `main` on the PC. What's left needs
 ## Next (needs Dang or the Mac)
 
 1. ~~**GitHub repo.**~~ Done 2026-10-22: Dang created private `FluxxDB/beacon`; the PC pushed `main` (`origin`).
-2. **Mac side** (Mac agent): clone, `mkdir -p exchange`, `.env` from `.env.example` with `BEACON_NODE=mac`, `BEACON_URL=http://dangs-macbook-pro:7700`, `BEACON_PEERS=http://soybean-wsl:7700`, `BEACON_BIND=<mac tailnet IP>`, the same `BEACON_SECRET` as the PC (copy it from the PC's `.env`), `TZ=America/New_York`; base compose file only. `docker compose up -d --build`, `./beacon skill install all`. Then add `BEACON_PEERS=http://dangs-macbook-pro:7700` on the PC and `docker compose up -d`.
-3. **Cross-machine test** (plan Task 15 step 4): post both ways (`post` must say `delivered to …`), attachment both ways, `./beacon peers` on both, stop the Mac, post 3× on the PC (`mac unreachable, queued`), start it, catch-up + `queued 0`; `wait` on the Mac woken by a PC mention; the TUI side by side in iTerm2 and Windows Terminal. Also check, from the final review:
-   - do single-label MagicDNS names (`soybean-wsl`) resolve inside a Docker Desktop container? If not, use the full `*.ts.net` name or the tailnet IP in `BEACON_PEERS`/`BEACON_URL`;
-   - on macOS, does killing `./beacon watch` (Ctrl-C) remove the in-container `beacon watch` (`docker top`)? (FIFO lifeline; verified on Linux only);
-   - is the first post after the Mac wakes delivered, or reported queued for a moment?
+2. ~~**Mac side.**~~ Done 2026-10-22 by the Mac agent: node `mac` on `100.69.143.46:7700` (base compose, arm64 image 12.8 MB), skill installed for Claude Code and Codex. The PC has `BEACON_PEERS=http://dangs-macbook-pro:7700` (it had already discovered the Mac from its announcement).
+3. ~~**Cross-machine test.**~~ Passed 2026-10-22 (channel `#e2e`, handles `pc-test` / `mac-test`; details in Slack #bots):
+   - posts both ways reported `delivered to …` (PC→Mac 374 ms end to end); 293 KB attachments both ways, sha256 matched on both sides;
+   - the Mac's `wait` was woken by a PC mention in 0.7 s;
+   - Mac stopped → three PC posts said `mac unreachable, queued` → Mac back, queue drained within seconds, all three arrived; `peers` on both `● synced`, nothing queued;
+   - MagicDNS short names resolve inside Docker Desktop; Ctrl-C on `./beacon watch` leaves no process in the Mac's container.
+   - **Still open:** Dang's visual check of the TUI side by side in iTerm2 and Windows Terminal.
 4. **Log in the `claude` CLI on the PC** if you want the real `claude -p` skill check (the subagent stand-in passed).
 5. Switch agent coordination from Slack #bots to beacon and update `CLAUDE.md` accordingly.
 
