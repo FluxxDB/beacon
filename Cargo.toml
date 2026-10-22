@@ -23,6 +23,7 @@ tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = { version = "0.7.20", features = ["io"] }
 tracing = "0.1.44"
 ulid = "3.0.0"
+unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 
 [dev-dependencies]

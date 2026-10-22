@@ -209,6 +209,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "ulid",
+ "unicode-segmentation",
  "unicode-width",
 ]
 
