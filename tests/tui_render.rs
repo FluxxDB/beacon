@@ -979,3 +979,1088 @@ fn render_never_panics_at_any_size() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Behaviour: App::update, keys, dialogs and the live feed (Task 11)
+// ---------------------------------------------------------------------------
+
+mod behaviour {
+    use super::*;
+
+    use beacon::api::{
+        AttachmentJson, ChannelAck, ChannelJson, ChannelsJson, Delivery, PeerJson, PostCreated,
+        PostJson, PostsResponse, PresenceJson, StreamEvent, WhoJson,
+    };
+    use beacon::model::{parse_mentions, AuthorKind};
+    use beacon::tui::convert;
+    use beacon::tui::keys::HELP;
+    use beacon::tui::state::{Cmd, ExchangeFile, Loaded, Msg, FILTER_MAX, NAME_RULE, PAGE};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    const W: u16 = 104;
+    const H: u16 = 33;
+
+    fn key(code: KeyCode) -> Msg {
+        Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn chord(code: KeyCode, modifiers: KeyModifiers) -> Msg {
+        Msg::Key(KeyEvent::new(code, modifiers))
+    }
+
+    fn ch(c: char) -> Msg {
+        key(KeyCode::Char(c))
+    }
+
+    /// Feeds every message, returning all the commands they asked for.
+    fn feed(app: &mut App, msgs: impl IntoIterator<Item = Msg>) -> Vec<Cmd> {
+        msgs.into_iter().flat_map(|m| app.update(m)).collect()
+    }
+
+    fn type_text(app: &mut App, text: &str) -> Vec<Cmd> {
+        feed(app, text.chars().map(ch))
+    }
+
+    fn ulid(n: u32) -> String {
+        format!("01JAN{n:021}")
+    }
+
+    /// A post as the server sends it: `n` gives its id, arrival and minute.
+    fn api_post(n: u32, channel: &str, author: &str, body: &str) -> PostJson {
+        let id = ulid(n);
+        PostJson {
+            v: 1,
+            short_id: id[id.len() - 8..].to_string(),
+            id,
+            channel: channel.to_string(),
+            ts: String::new(),
+            ts_ms: at(17, 0) + i64::from(n) * 60_000,
+            author: author.to_string(),
+            author_kind: AuthorKind::Agent,
+            client: Some("codex".to_string()),
+            node: "mac".to_string(),
+            body: body.to_string(),
+            tags: Vec::new(),
+            mentions: parse_mentions(body),
+            announcement: false,
+            attachment: None,
+            arrival: i64::from(n),
+        }
+    }
+
+    fn announcement(n: u32, channel: &str, author: &str, body: &str) -> PostJson {
+        let mut p = api_post(n, channel, author, body);
+        p.author_kind = AuthorKind::Human;
+        p.announcement = true;
+        p.client = Some("tui".to_string());
+        p
+    }
+
+    fn channels_json(list: &[(&str, u32)], announcements_unread: u32) -> ChannelsJson {
+        ChannelsJson {
+            v: 1,
+            channels: list
+                .iter()
+                .map(|(name, unread)| ChannelJson {
+                    name: name.to_string(),
+                    topic: Some(format!("about {name}")),
+                    unread: Some(*unread),
+                })
+                .collect(),
+            announcements_unread: Some(announcements_unread),
+        }
+    }
+
+    fn page(posts: Vec<PostJson>) -> Loaded {
+        let view = Selection::Channel(posts[0].channel.clone());
+        Loaded::Posts {
+            view,
+            before: None,
+            page: Ok(PostsResponse {
+                v: 1,
+                posts,
+                remaining: None,
+            }),
+        }
+    }
+
+    /// Dang's board after it connected: three channels, `general` open with
+    /// two posts, the composer focused.
+    fn live_app() -> App {
+        let mut app = App::new("pc", "Dang", new_york());
+        feed(
+            &mut app,
+            [
+                Msg::Tick(at(18, 40)),
+                Msg::Resize(W, H),
+                Msg::Connection(Conn::Up),
+            ],
+        );
+        let cmds = app.update(Msg::Loaded(Loaded::Channels(channels_json(
+            &[("general", 0), ("beacon", 2), ("vllm", 3)],
+            1,
+        ))));
+        assert_eq!(
+            cmds,
+            [Cmd::LoadPosts {
+                channel: "general".to_string(),
+                before: None
+            }],
+            "the board opens on its first channel"
+        );
+        app.update(Msg::Loaded(page(vec![
+            api_post(1, "general", "pc-configs", "scaffolding the crate"),
+            api_post(2, "general", "mac-juicebox", "arm64 builds"),
+        ])));
+        app
+    }
+
+    fn screen(app: &App) -> Buffer {
+        render(app, TRUECOLOR, W, H)
+    }
+
+    fn screen_text(app: &App) -> String {
+        rows(&screen(app)).join("\n")
+    }
+
+    fn created(post: PostJson) -> PostCreated {
+        PostCreated {
+            v: 1,
+            post,
+            delivery: vec![Delivery {
+                node: "mac".to_string(),
+                delivered: true,
+            }],
+        }
+    }
+
+    fn row_of(buf: &Buffer, needle: &str) -> u16 {
+        (0..buf.area.height)
+            .find(|&y| row_text(buf, y).contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} is not on screen:\n{}", rows(buf).join("\n")))
+    }
+
+    // ----------------------------------------------------------- composer
+
+    #[test]
+    fn enter_sends_and_clears_input() {
+        let mut app = live_app();
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(app.update(key(KeyCode::Enter)).is_empty(), "empty: nothing");
+        type_text(&mut app, "   ");
+        assert!(app.update(key(KeyCode::Enter)).is_empty(), "blank: nothing");
+        app.input.clear();
+
+        type_text(&mut app, "on my way");
+        let cmds = app.update(key(KeyCode::Enter));
+        assert_eq!(
+            cmds,
+            [Cmd::SendPost {
+                channel: "general".to_string(),
+                body: "on my way".to_string()
+            }]
+        );
+        // Enter again while it is on its way does not post it twice.
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        let mut mine = api_post(3, "general", "Dang", "on my way");
+        mine.author_kind = AuthorKind::Human;
+        mine.announcement = true;
+        app.update(Msg::Sent(Ok(created(mine))));
+        assert_eq!(app.input, "");
+        assert!(app.posts.iter().any(|p| p.body == "on my way"));
+        assert!(
+            screen_text(&app).contains("message #general"),
+            "placeholder back"
+        );
+
+        // A failure keeps the text and says why.
+        type_text(&mut app, "again");
+        assert_eq!(app.update(key(KeyCode::Enter)).len(), 1);
+        app.update(Msg::Sent(Err(
+            "cannot reach http://127.0.0.1:7700 (connection refused)".to_string(),
+        )));
+        assert_eq!(app.input, "again");
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("Not sent: cannot reach http://127.0.0.1:7700 (connection refused)")
+        );
+        assert!(screen_text(&app).contains("Not sent: cannot reach"));
+    }
+
+    #[test]
+    fn text_typed_while_sending_stays() {
+        let mut app = live_app();
+        type_text(&mut app, "first");
+        app.update(key(KeyCode::Enter));
+        type_text(&mut app, " and more");
+        app.update(Msg::Sent(Ok(created(api_post(
+            3, "general", "Dang", "first",
+        )))));
+        assert_eq!(app.input, " and more");
+    }
+
+    #[test]
+    fn shift_enter_alt_enter_and_ctrl_j_add_a_line() {
+        let mut app = live_app();
+        type_text(&mut app, "one");
+        for newline in [
+            chord(KeyCode::Enter, KeyModifiers::SHIFT),
+            chord(KeyCode::Enter, KeyModifiers::ALT),
+            chord(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ] {
+            assert!(app.update(newline).is_empty());
+        }
+        type_text(&mut app, "two");
+        assert_eq!(app.input, "one\n\n\ntwo");
+        app.update(key(KeyCode::Backspace));
+        assert_eq!(app.input, "one\n\n\ntw");
+    }
+
+    #[test]
+    fn paste_with_newlines_never_sends() {
+        let mut app = live_app();
+        let cmds = app.update(Msg::Paste("line one\r\nline two\n\x1b[31mred".to_string()));
+        assert!(cmds.is_empty());
+        assert_eq!(app.input, "line one\nline two\n[31mred");
+    }
+
+    #[test]
+    fn q_in_composer_types_q() {
+        let mut app = live_app();
+        assert!(app.update(ch('q')).is_empty());
+        assert_eq!(app.input, "q");
+        // Outside the composer it quits.
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(app.update(ch('q')), [Cmd::Quit]);
+        // Ctrl-C quits from anywhere, dialogs included.
+        let ctrl_c = || chord(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.focus = Focus::Composer;
+        assert_eq!(app.update(ctrl_c()), [Cmd::Quit]);
+        app.focus = Focus::Sidebar;
+        app.update(ch('n'));
+        assert!(app.dialog.is_some());
+        assert!(app.update(ch('q')).is_empty(), "q is typed into the name");
+        assert_eq!(app.update(ctrl_c()), [Cmd::Quit]);
+    }
+
+    #[test]
+    fn printable_keys_outside_the_composer_jump_to_it() {
+        let mut app = live_app();
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.update(ch('H'));
+        assert_eq!(app.focus, Focus::Composer);
+        type_text(&mut app, "i there");
+        assert_eq!(app.input, "Hi there");
+    }
+
+    #[test]
+    fn tab_cycles_focus_and_shows_it() {
+        let mut app = live_app();
+        let order: Vec<Focus> = (0..3)
+            .map(|_| {
+                app.update(key(KeyCode::Tab));
+                app.focus
+            })
+            .collect();
+        assert_eq!(order, [Focus::Sidebar, Focus::Posts, Focus::Composer]);
+        app.update(key(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Posts);
+        // Posts focused: the newest post is selected and drawn with its edge.
+        assert_eq!(app.selected_post.as_deref(), Some(ulid(2).as_str()));
+        let buf = screen(&app);
+        let y = row_of(&buf, "mac-juicebox");
+        let (x0, _) = main_pane(W);
+        assert_eq!(buf[(x0, y)].symbol(), "▍");
+        // Sidebar focused: its section label brightens.
+        app.update(key(KeyCode::BackTab));
+        let buf = screen(&app);
+        let y = row_of(&buf, "CHANNELS");
+        let x = column_of(&buf, y, "CHANNELS").unwrap();
+        assert_eq!(buf[(x, y)].fg, rgb(palette::MIST));
+        // Esc leaves the composer for the posts.
+        app.focus = Focus::Composer;
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::Posts);
+    }
+
+    // ------------------------------------------------------------ sidebar
+
+    #[test]
+    fn selecting_channel_loads_and_marks_read() {
+        let mut app = live_app();
+        app.update(key(KeyCode::Tab));
+        let cmds = app.update(ch('j'));
+        assert_eq!(
+            cmds,
+            [Cmd::LoadPosts {
+                channel: "beacon".to_string(),
+                before: None
+            }]
+        );
+        assert_eq!(app.selected, Selection::Channel("beacon".to_string()));
+        assert!(app.posts.is_empty() && app.loading);
+        // While it loads the pane says nothing, rather than "Nothing in #beacon".
+        assert!(!screen_text(&app).contains("Nothing in"));
+
+        // A page for a view no longer on screen is dropped.
+        let stale = app.update(Msg::Loaded(page(vec![api_post(7, "general", "x", "old")])));
+        assert!(stale.is_empty() && app.posts.is_empty());
+
+        let cmds = app.update(Msg::Loaded(page(vec![
+            api_post(9, "beacon", "pc-configs", "nine"),
+            api_post(5, "beacon", "pc-vllm", "five"),
+        ])));
+        assert_eq!(
+            cmds,
+            [Cmd::MarkRead {
+                channel: "beacon".to_string(),
+                arrival: 9
+            }]
+        );
+        let beacon = app.channels.iter().find(|c| c.name == "beacon").unwrap();
+        assert_eq!(beacon.unread, 0);
+        assert_eq!(app.posts[0].body, "five", "oldest first");
+        let buf = screen(&app);
+        assert!(rows(&buf).iter().any(|r| r.contains("▍ # beacon")));
+
+        // ↓ and ↑ work too, and the top of the list is Announcements.
+        assert_eq!(
+            app.update(key(KeyCode::Down)),
+            [Cmd::LoadPosts {
+                channel: "vllm".to_string(),
+                before: None
+            }]
+        );
+        assert!(app.update(ch('j')).is_empty(), "the last channel stays");
+        feed(&mut app, [ch('k'), ch('k')]);
+        assert_eq!(app.update(key(KeyCode::Up)), [Cmd::LoadAnnouncements]);
+        assert_eq!(app.selected, Selection::Announcements);
+        // Enter from the sidebar goes to the composer.
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.focus, Focus::Composer);
+    }
+
+    // ------------------------------------------------------------ dialogs
+
+    #[test]
+    fn new_channel_dialog_validates() {
+        let mut app = live_app();
+        app.update(key(KeyCode::Tab));
+        app.update(ch('n'));
+        assert!(matches!(app.dialog, Some(Dialog::NewChannel(_))));
+        let form = |app: &App| match &app.dialog {
+            Some(Dialog::NewChannel(form)) => form.clone(),
+            other => panic!("not the form: {other:?}"),
+        };
+
+        // `#` is already drawn; capitals are lowercased as typed.
+        type_text(&mut app, "#GPU-Jobs");
+        assert_eq!(form(&app).name, "gpu-jobs");
+        assert_eq!(form(&app).error, None);
+
+        // A character a channel name can't have: the rule turns coral.
+        app.update(ch('_'));
+        assert_eq!(form(&app).error.as_deref(), Some(NAME_RULE));
+        let buf = screen(&app);
+        let y = row_of(&buf, NAME_RULE);
+        let x = column_of(&buf, y, NAME_RULE).unwrap();
+        assert_eq!(buf[(x, y)].fg, rgb(palette::CORAL));
+        assert!(app.update(key(KeyCode::Enter)).is_empty(), "not sent");
+
+        app.update(key(KeyCode::Backspace));
+        assert_eq!(form(&app).error, None);
+        let buf = screen(&app);
+        let y = row_of(&buf, NAME_RULE);
+        let x = column_of(&buf, y, NAME_RULE).unwrap();
+        assert_eq!(buf[(x, y)].fg, rgb(palette::ASH), "the hint again");
+
+        // No longer than 32 characters.
+        type_text(&mut app, &"x".repeat(40));
+        assert_eq!(form(&app).name.len(), 32);
+        for _ in 0..24 {
+            app.update(key(KeyCode::Backspace));
+        }
+        assert_eq!(form(&app).name, "gpu-jobs");
+
+        app.update(key(KeyCode::Tab));
+        type_text(&mut app, "long jobs on the 7900 GRE");
+        assert_eq!(form(&app).field, FormField::Topic);
+        let cmds = app.update(key(KeyCode::Enter));
+        assert_eq!(
+            cmds,
+            [Cmd::CreateChannel {
+                name: "gpu-jobs".to_string(),
+                topic: Some("long jobs on the 7900 GRE".to_string())
+            }]
+        );
+        assert!(app.dialog.is_none());
+
+        // An empty name is not sent either; Esc closes.
+        app.update(ch('n'));
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert_eq!(form(&app).error.as_deref(), Some(NAME_RULE));
+        app.update(key(KeyCode::Esc));
+        assert!(app.dialog.is_none());
+
+        // Once created, the new channel is opened.
+        let cmds = app.update(Msg::Created(Ok(ChannelAck {
+            v: 1,
+            ok: true,
+            created: true,
+            channel: ChannelJson {
+                name: "gpu-jobs".to_string(),
+                topic: Some("long jobs".to_string()),
+                unread: None,
+            },
+        })));
+        assert_eq!(app.selected, Selection::Channel("gpu-jobs".to_string()));
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(cmds.contains(&Cmd::LoadPosts {
+            channel: "gpu-jobs".to_string(),
+            before: None
+        }));
+        assert_eq!(app.toast.as_deref(), Some("created #gpu-jobs"));
+    }
+
+    #[test]
+    fn delete_requires_confirm() {
+        let mut app = live_app();
+        feed(&mut app, [key(KeyCode::Tab), key(KeyCode::Tab)]);
+        assert_eq!(app.focus, Focus::Posts);
+        let id = app.selected_post.clone().unwrap();
+
+        assert!(app.update(ch('d')).is_empty());
+        let buf = screen(&app);
+        let text = rows(&buf).join("\n");
+        assert!(text.contains("Delete this post?"), "{text}");
+        assert!(text.contains("It disappears on every device."));
+        assert!(text.contains("esc cancel   ↵ delete"));
+        let y = row_of(&buf, "↵ delete");
+        let x = column_of(&buf, y, "↵ delete").unwrap();
+        assert_eq!(buf[(x, y)].bg, rgb(palette::LIME), "the one primary action");
+
+        assert!(app.update(key(KeyCode::Esc)).is_empty());
+        assert!(app.dialog.is_none() && app.confirm.is_none());
+        assert_eq!(app.focus, Focus::Posts);
+        assert!(app.posts.iter().any(|p| p.id == id), "nothing deleted");
+
+        app.update(ch('d'));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Cmd::DeletePost(id.clone())]
+        );
+        assert!(app.dialog.is_none());
+        app.update(Msg::PostDeleted(Ok(id.clone())));
+        assert!(app.posts.iter().all(|p| p.id != id));
+        assert_eq!(
+            app.selected_post.as_deref(),
+            Some(ulid(1).as_str()),
+            "the selection moves to a neighbour"
+        );
+
+        // In the sidebar, `d` deletes the channel on screen.
+        app.update(key(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.update(ch('d'));
+        let text = screen_text(&app);
+        assert!(text.contains("Delete #general?"), "{text}");
+        // The message wraps inside the dialog.
+        for part in [
+            "Its posts are hidden on every device until",
+            "someone posts there again.",
+        ] {
+            assert!(text.contains(part), "{part:?} missing:\n{text}");
+        }
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Cmd::DeleteChannel("general".to_string())]
+        );
+        let cmds = app.update(Msg::ChannelDeleted(Ok("general".to_string())));
+        assert_eq!(app.selected, Selection::Channel("beacon".to_string()));
+        assert!(cmds.contains(&Cmd::LoadPosts {
+            channel: "beacon".to_string(),
+            before: None
+        }));
+        assert_eq!(app.toast.as_deref(), Some("deleted #general"));
+    }
+
+    #[test]
+    fn attach_picker_uploads_with_the_composer_text() {
+        let mut app = live_app();
+        type_text(&mut app, "the log");
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.update(ch('a')), [Cmd::ListFiles]);
+        assert!(screen_text(&app).contains("Reading ./exchange…"));
+        let file = |name: &str, minutes_ago: i64| ExchangeFile {
+            name: name.to_string(),
+            path: format!("/exchange/{name}").into(),
+            size: 12 * 1024,
+            modified_ms: at(18, 40) - minutes_ago * 60_000,
+        };
+        app.update(Msg::Loaded(Loaded::Files(Ok(vec![
+            file("newest.txt", 1),
+            file("build.log", 30),
+        ]))));
+        let buf = screen(&app);
+        let text = rows(&buf).join("\n");
+        assert!(text.contains("Attach a file"));
+        assert!(text.contains("newest.txt") && text.contains("build.log"));
+        assert!(text.contains("with “the log”"), "{text}");
+        let lime: Vec<_> = lime_cells(&buf).into_iter().collect();
+        let y = row_of(&buf, "↵ attach");
+        assert!(lime
+            .iter()
+            .all(|&(_, ly)| ly == y || ly == row_of(&buf, "›")));
+
+        app.update(ch('j'));
+        let cmds = app.update(key(KeyCode::Enter));
+        assert_eq!(
+            cmds,
+            [Cmd::Upload {
+                channel: "general".to_string(),
+                path: "/exchange/build.log".into(),
+                body: "the log".to_string()
+            }]
+        );
+        assert!(app.dialog.is_none());
+
+        // An empty folder says what to do; Announcements can't take a file.
+        app.update(Msg::Sent(Err("boom".to_string())));
+        app.update(ch('a'));
+        app.update(Msg::Loaded(Loaded::Files(Ok(Vec::new()))));
+        assert!(pane_text(&screen(&app)).contains("No files in ./exchange yet."));
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        app.update(key(KeyCode::Esc));
+        app.focus = Focus::Sidebar;
+        app.update(ch('k'));
+        assert_eq!(app.selected, Selection::Announcements);
+        assert!(app.update(ch('a')).is_empty());
+        assert!(app.dialog.is_none());
+    }
+
+    #[test]
+    fn save_writes_the_selected_attachment() {
+        let mut app = live_app();
+        let mut with_file = api_post(3, "general", "mac-juicebox", "report attached");
+        with_file.attachment = Some(AttachmentJson {
+            name: "test-report.txt".to_string(),
+            size: 12 * 1024,
+            sha256: "ab".repeat(32),
+            available: true,
+        });
+        app.update(Msg::Stream(StreamEvent::Post(with_file)));
+        // `s` saves the post selected in the posts pane.
+        app.focus = Focus::Sidebar;
+        assert!(app.update(ch('s')).is_empty());
+        assert!(app
+            .toast
+            .as_deref()
+            .unwrap()
+            .starts_with("Select a post first"));
+
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.selected_post.as_deref(), Some(ulid(3).as_str()));
+        assert_eq!(
+            app.update(ch('s')),
+            [Cmd::Save {
+                post_id: ulid(3),
+                sha: "ab".repeat(32),
+                name: "test-report.txt".to_string()
+            }]
+        );
+        app.update(Msg::Saved(Ok("test-report (1).txt".to_string())));
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("saved to ./exchange/test-report (1).txt")
+        );
+        assert!(screen_text(&app).contains("saved to ./exchange/test-report (1).txt"));
+
+        // A post without a file has nothing to save.
+        app.update(ch('k'));
+        assert!(app.update(ch('s')).is_empty());
+        assert_eq!(app.toast.as_deref(), Some("This post has no file to save"));
+    }
+
+    #[test]
+    fn help_overlay_lists_every_key() {
+        let mut app = live_app();
+        app.update(key(KeyCode::Tab));
+        app.update(ch('?'));
+        assert_eq!(app.dialog, Some(Dialog::Help));
+        let text = screen_text(&app);
+        for (keys, what) in HELP {
+            assert!(text.contains(keys), "{keys} missing:\n{text}");
+            assert!(text.contains(what), "{what} missing:\n{text}");
+        }
+        assert!(lime_cells(&screen(&app)).len() <= 1, "no primary action");
+        // At 80×24 it still fits.
+        let buf = render(&app, TRUECOLOR, 80, 24);
+        let small = rows(&buf).join("\n");
+        assert!(
+            small.contains("ctrl-c") && small.contains("esc close"),
+            "{small}"
+        );
+        app.update(ch('x'));
+        assert_eq!(app.dialog, None, "any key closes it");
+        assert_eq!(app.input, "", "and does nothing else");
+    }
+
+    // ------------------------------------------------------------- filter
+
+    #[test]
+    fn filter_by_tag_or_handle() {
+        let mut app = live_app();
+        app.update(key(KeyCode::Tab));
+        app.update(ch('/'));
+        assert!(app.filter_editing);
+        type_text(&mut app, "@pc-configs");
+        let text = screen_text(&app);
+        assert!(text.contains("filter /@pc-configs"), "{text}");
+        assert!(
+            text.contains("enter keep"),
+            "the keys for it in the help row"
+        );
+        let pane = pane_text(&screen(&app));
+        assert!(pane.contains("scaffolding") && !pane.contains("arm64"));
+        app.update(key(KeyCode::Enter));
+        assert!(!app.filter_editing);
+        assert_eq!(app.filter.as_deref(), Some("@pc-configs"));
+        // j/k keys are commands again, not filter text.
+        app.update(ch('j'));
+        assert_eq!(app.filter.as_deref(), Some("@pc-configs"));
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.filter, None);
+
+        // A huge paste is cut to the cap and still draws.
+        app.update(ch('/'));
+        app.update(Msg::Paste("x".repeat(70_000)));
+        assert_eq!(app.filter.as_ref().unwrap().chars().count(), FILTER_MAX);
+        for (w, h) in [(W, H), (80, 24), (60, 20)] {
+            render(&app, TRUECOLOR, w, h);
+        }
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.filter, None);
+        assert!(!app.filter_editing);
+    }
+
+    // -------------------------------------------------------------- live
+
+    #[test]
+    fn stream_post_appends_and_counts_unread() {
+        let mut app = live_app();
+        // In the channel on screen: shown, and read at once.
+        let cmds = app.update(Msg::Stream(StreamEvent::Post(api_post(
+            10,
+            "general",
+            "mac-juicebox",
+            "@Dang e2e passed across both machines",
+        ))));
+        assert_eq!(
+            cmds,
+            [Cmd::MarkRead {
+                channel: "general".to_string(),
+                arrival: 10
+            }]
+        );
+        assert_eq!(app.posts.last().unwrap().id, ulid(10));
+        // A mention of Dang is drawn on the lifted band.
+        let buf = screen(&app);
+        let y = row_of(&buf, "e2e passed");
+        let (x0, w) = main_pane(W);
+        assert_eq!(buf[(x0 + 2, y)].bg, rgb(palette::OBSIDIAN));
+        assert_eq!(buf[(x0 + w - 2, y)].bg, rgb(palette::OBSIDIAN));
+
+        // Elsewhere: counted.
+        let cmds = app.update(Msg::Stream(StreamEvent::Post(api_post(
+            11, "vllm", "pc-vllm", "waiting",
+        ))));
+        assert!(cmds.is_empty());
+        let unread =
+            |app: &App, name: &str| app.channels.iter().find(|c| c.name == name).unwrap().unread;
+        assert_eq!(unread(&app, "vllm"), 4);
+        assert!(app.posts.iter().all(|p| p.id != ulid(11)));
+
+        // An announcement from another human counts in its channel and in
+        // Announcements.
+        app.update(Msg::Stream(StreamEvent::Post(announcement(
+            12,
+            "beacon",
+            "Kim",
+            "freeze at 6",
+        ))));
+        assert_eq!(app.announcements_unread, 2);
+        assert_eq!(unread(&app, "beacon"), 3);
+        assert!(rows(&screen(&app))
+            .iter()
+            .any(|r| r.contains("◆ Announcements   2")));
+
+        // Dang's own posts are never unread.
+        app.update(Msg::Stream(StreamEvent::Post(announcement(
+            13,
+            "vllm",
+            "dang",
+            "from the mac",
+        ))));
+        assert_eq!(unread(&app, "vllm"), 4);
+        assert_eq!(app.announcements_unread, 2);
+
+        // The same post twice is shown once.
+        app.update(Msg::Stream(StreamEvent::Post(api_post(
+            10,
+            "general",
+            "mac-juicebox",
+            "@Dang e2e passed across both machines",
+        ))));
+        assert_eq!(app.posts.iter().filter(|p| p.id == ulid(10)).count(), 1);
+
+        // A post in a channel the TUI doesn't know (revived) reloads the list.
+        let cmds = app.update(Msg::Stream(StreamEvent::Post(api_post(
+            14,
+            "revived",
+            "pc-configs",
+            "back",
+        ))));
+        assert!(cmds.contains(&Cmd::LoadChannels));
+        assert_eq!(unread(&app, "revived"), 1);
+
+        // Deleted elsewhere: gone from the screen.
+        app.update(Msg::Stream(StreamEvent::PostDeleted { id: ulid(10) }));
+        assert!(app.posts.iter().all(|p| p.id != ulid(10)));
+        assert!(!screen_text(&app).contains("e2e passed"));
+    }
+
+    #[test]
+    fn a_page_keeps_what_arrived_while_it_loaded() {
+        let mut app = live_app();
+        app.focus = Focus::Sidebar;
+        app.update(ch('j'));
+        // While #beacon's page is on its way, a post arrives and one goes.
+        app.update(Msg::Stream(StreamEvent::Post(api_post(
+            20, "beacon", "pc-vllm", "live one",
+        ))));
+        app.update(Msg::Stream(StreamEvent::PostDeleted { id: ulid(5) }));
+        app.update(Msg::Loaded(page(vec![
+            api_post(5, "beacon", "pc-configs", "deleted meanwhile"),
+            api_post(6, "beacon", "pc-configs", "kept"),
+        ])));
+        let bodies: Vec<&str> = app.posts.iter().map(|p| p.body.as_str()).collect();
+        assert_eq!(bodies, ["kept", "live one"]);
+    }
+
+    #[test]
+    fn channel_events_update_the_sidebar() {
+        let mut app = live_app();
+        let cmds = app.update(Msg::Stream(StreamEvent::Channel {
+            channel: ChannelJson {
+                name: "gpu-jobs".to_string(),
+                topic: Some("long jobs".to_string()),
+                unread: None,
+            },
+            deleted: false,
+        }));
+        assert_eq!(cmds, [Cmd::LoadChannels]);
+        assert!(app.channels.iter().any(|c| c.name == "gpu-jobs"));
+        // The channel on screen deleted elsewhere: says so and moves on.
+        let cmds = app.update(Msg::Stream(StreamEvent::Channel {
+            channel: ChannelJson {
+                name: "general".to_string(),
+                topic: None,
+                unread: None,
+            },
+            deleted: true,
+        }));
+        assert_eq!(app.selected, Selection::Channel("beacon".to_string()));
+        assert!(cmds.contains(&Cmd::LoadChannels));
+        assert_eq!(app.toast.as_deref(), Some("#general was deleted"));
+    }
+
+    #[test]
+    fn presence_and_peers_reach_the_sidebar_and_header() {
+        let mut app = live_app();
+        let seen = |handle: &str, kind: AuthorKind, ms: i64| PresenceJson {
+            handle: handle.to_string(),
+            kind,
+            client: "claude-code".to_string(),
+            node: "pc".to_string(),
+            status: None,
+            last_seen: String::new(),
+            last_seen_ms: ms,
+            active: true,
+        };
+        app.update(Msg::Loaded(Loaded::Agents(WhoJson {
+            v: 1,
+            agents: vec![
+                seen("pc-configs", AuthorKind::Agent, at(18, 39)),
+                seen("Dang", AuthorKind::Human, at(18, 40)),
+            ],
+        })));
+        assert_eq!(app.agents.len(), 1, "Dang is not an agent");
+        app.update(Msg::Stream(StreamEvent::Presence(seen(
+            "mac-juicebox",
+            AuthorKind::Agent,
+            at(18, 40),
+        ))));
+        let handles: Vec<&str> = app.agents.iter().map(|a| a.handle.as_str()).collect();
+        assert_eq!(handles, ["mac-juicebox", "pc-configs"]);
+        // Ten minutes later both are idle, and three hours later gone.
+        app.update(Msg::Tick(at(18, 50)));
+        assert!(app.agents.iter().all(|a| !a.active));
+        app.update(Msg::Tick(at(21, 50)));
+        assert!(app.agents.is_empty());
+
+        app.update(Msg::Stream(StreamEvent::Peers(vec![PeerJson {
+            node: Some("mac".to_string()),
+            url: "http://mac:7700".to_string(),
+            reachable: false,
+            last_sync: Some("2026-10-21T22:39:00.000Z".to_string()),
+            queued: 3,
+        }])));
+        assert!(screen_text(&app).contains("1 offline · 3 queued"));
+    }
+
+    #[test]
+    fn server_down_then_back_reloads() {
+        let mut app = live_app();
+        let cmds = app.update(Msg::Connection(Conn::Down {
+            since_ms: at(18, 41),
+        }));
+        assert!(cmds.is_empty());
+        assert!(pane_text(&screen(&app)).contains("Can't reach the beacon server"));
+        // Retries failing keep the first time.
+        app.update(Msg::Connection(Conn::Down {
+            since_ms: at(18, 45),
+        }));
+        assert_eq!(
+            app.connection,
+            Conn::Down {
+                since_ms: at(18, 41)
+            }
+        );
+        // No heartbeats while it is down.
+        assert!(app.update(Msg::Tick(at(18, 50))).is_empty());
+
+        let cmds = app.update(Msg::Connection(Conn::Up));
+        for want in [
+            Cmd::Heartbeat,
+            Cmd::LoadChannels,
+            Cmd::LoadAgents,
+            Cmd::LoadStatus,
+            Cmd::LoadPosts {
+                channel: "general".to_string(),
+                before: None,
+            },
+        ] {
+            assert!(cmds.contains(&want), "{want:?} not in {cmds:?}");
+        }
+        assert!(!pane_text(&screen(&app)).contains("Can't reach"));
+        assert!(!app.loading, "the old posts stay up while they reload");
+    }
+
+    #[test]
+    fn heartbeat_every_minute_while_connected() {
+        let mut app = live_app();
+        let beats = |app: &mut App, at_ms: i64| {
+            app.update(Msg::Tick(at_ms))
+                .into_iter()
+                .filter(|c| *c == Cmd::Heartbeat)
+                .count()
+        };
+        let start = at(18, 40);
+        assert_eq!(beats(&mut app, start + 30_000), 0);
+        assert_eq!(beats(&mut app, start + 60_000), 1);
+        assert_eq!(beats(&mut app, start + 61_000), 0);
+        assert_eq!(beats(&mut app, start + 120_000), 1);
+        // The toast goes away after a while.
+        app.toast = Some("x".to_string());
+        app.toast_until_ms = Some(start + 125_000);
+        app.update(Msg::Tick(start + 126_000));
+        assert_eq!(app.toast, None);
+    }
+
+    // ------------------------------------------------------------ scrolling
+
+    fn full_page_app() -> App {
+        let mut app = live_app();
+        app.focus = Focus::Sidebar;
+        app.update(ch('j'));
+        let posts: Vec<PostJson> = (100..100 + PAGE)
+            .map(|n| api_post(n, "beacon", "pc-configs", &format!("post {n}")))
+            .collect();
+        app.update(Msg::Loaded(page(posts)));
+        app.focus = Focus::Posts;
+        app
+    }
+
+    #[test]
+    fn pgup_scrolls_and_loads_older_pages() {
+        let mut app = full_page_app();
+        assert!(app.has_older);
+        assert!(app.update(key(KeyCode::PageUp)).is_empty());
+        let one_page = app.scroll;
+        assert!(one_page > 0);
+        assert!(screen_text(&app).contains("↓ newer posts below"));
+        app.update(key(KeyCode::PageDown));
+        assert_eq!(app.scroll, 0);
+
+        // Reaching the top asks for the page before the oldest post, once.
+        let mut asked = Vec::new();
+        for _ in 0..200 {
+            asked.extend(app.update(key(KeyCode::PageUp)));
+        }
+        let oldest = app.posts[0].clone();
+        assert_eq!(
+            asked,
+            [Cmd::LoadPosts {
+                channel: "beacon".to_string(),
+                before: Some((oldest.ts_ms, oldest.id.clone()))
+            }]
+        );
+        let scroll = app.scroll;
+        let older: Vec<PostJson> = (50..60)
+            .map(|n| api_post(n, "beacon", "pc-configs", &format!("older {n}")))
+            .collect();
+        app.update(Msg::Loaded(Loaded::Posts {
+            view: Selection::Channel("beacon".to_string()),
+            before: Some((oldest.ts_ms, oldest.id)),
+            page: Ok(PostsResponse {
+                v: 1,
+                posts: older,
+                remaining: None,
+            }),
+        }));
+        assert_eq!(app.posts.len(), PAGE as usize + 10);
+        assert_eq!(app.posts[0].body, "older 50");
+        assert!(!app.has_older, "a short page is the last");
+        assert_eq!(app.scroll, scroll, "the view stays where it was");
+        assert!(app.update(key(KeyCode::PageUp)).is_empty());
+    }
+
+    #[test]
+    fn selection_scrolls_into_view_and_k_past_the_top_loads_more() {
+        let mut app = full_page_app();
+        app.update(key(KeyCode::Tab));
+        app.update(key(KeyCode::BackTab));
+        assert_eq!(app.selected_post.as_deref(), Some(ulid(199).as_str()));
+        let mut asked = Vec::new();
+        for _ in 0..PAGE {
+            asked.extend(app.update(ch('k')));
+        }
+        assert_eq!(app.selected_post.as_deref(), Some(ulid(100).as_str()));
+        let buf = screen(&app);
+        assert!(rows(&buf).iter().any(|r| r.contains("post 100")));
+        assert_eq!(asked.len(), 1, "one older page asked for: {asked:?}");
+        // Back down to the newest returns to the bottom.
+        for _ in 0..PAGE {
+            app.update(ch('j'));
+        }
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn a_live_post_does_not_move_a_scrolled_view() {
+        let mut app = full_page_app();
+        app.update(key(KeyCode::PageUp));
+        let before = pane_text(&screen(&app));
+        app.update(Msg::Stream(StreamEvent::Post(api_post(
+            500,
+            "beacon",
+            "pc-vllm",
+            "new at the bottom",
+        ))));
+        assert_eq!(pane_text(&screen(&app)), before);
+        app.update(key(KeyCode::PageDown));
+        app.update(key(KeyCode::PageDown));
+        assert!(pane_text(&screen(&app)).contains("new at the bottom"));
+    }
+
+    // ---------------------------------------------------------- conversion
+
+    #[test]
+    fn api_types_become_view_items() {
+        let mut p = api_post(1, "beacon", "pc-\x1b[31mconfigs", "body\n\tkept");
+        p.client = Some("claude\ncode".to_string());
+        p.mentions = vec!["Dang".to_string()];
+        p.attachment = Some(AttachmentJson {
+            name: "re\x07port.txt".to_string(),
+            size: 9,
+            sha256: "cd".repeat(32),
+            available: false,
+        });
+        let item = convert::post_item(&p);
+        assert_eq!(item.author, "pc-[31mconfigs", "no control characters");
+        assert_eq!(item.client.as_deref(), Some("claudecode"));
+        assert_eq!(item.body, "body\n\tkept", "bodies keep lines for wrapping");
+        assert_eq!(item.mentions, ["dang"]);
+        assert_eq!(item.attachment.as_ref().unwrap().name, "report.txt");
+        let extra = convert::post_extra(&p);
+        assert_eq!(extra.arrival, 1);
+        assert_eq!(extra.sha256.as_deref(), Some("cd".repeat(32).as_str()));
+        assert!(!extra.available);
+
+        let ch = convert::channel_item(&ChannelJson {
+            name: "beacon".to_string(),
+            topic: Some("  ".to_string()),
+            unread: None,
+        });
+        assert_eq!((ch.topic, ch.unread), (None, 0));
+
+        let peers = [
+            PeerJson {
+                node: None,
+                url: "http://soybean-wsl:7700/".to_string(),
+                reachable: true,
+                last_sync: Some("2026-10-21T22:39:59.600Z".to_string()),
+                queued: 0,
+            },
+            PeerJson {
+                node: Some("mac".to_string()),
+                url: "http://mac:7700".to_string(),
+                reachable: true,
+                last_sync: Some("2026-10-21T22:30:00.000Z".to_string()),
+                queued: 0,
+            },
+        ];
+        assert_eq!(convert::peer_item(&peers[0]).node, "soybean-wsl");
+        assert_eq!(convert::last_sync_ms(&peers), Some(at(18, 40) - 400));
+    }
+
+    #[test]
+    fn behaviour_states_render_at_every_size() {
+        let mut apps = Vec::new();
+        let mut app = live_app();
+        app.update(ch('?'));
+        apps.push(app.clone());
+        app.dialog = None;
+        app.focus = Focus::Posts;
+        app.update(ch('a'));
+        apps.push(app.clone());
+        app.update(Msg::Loaded(Loaded::Files(Ok((0..40)
+            .map(|n| ExchangeFile {
+                name: format!("{}-{n}.log", "very-long-file-name".repeat(4)),
+                path: "/exchange/x".into(),
+                size: n * 1_000_000,
+                modified_ms: 0,
+            })
+            .collect()))));
+        apps.push(app.clone());
+        app.update(Msg::Loaded(Loaded::Files(Err(
+            "permission denied".to_string()
+        ))));
+        apps.push(app.clone());
+        app.dialog = None;
+        app.update(ch('/'));
+        apps.push(app);
+        for app in &apps {
+            for width in [0u16, 10, 40, 60, 79, 80, 104, 160] {
+                for height in [0u16, 5, 12, 14, 24, 33] {
+                    let buf = render(app, TRUECOLOR, width, height);
+                    for cell in buf.content() {
+                        assert_ne!(cell.bg, Color::Reset, "{width}x{height}");
+                    }
+                }
+            }
+        }
+    }
+}

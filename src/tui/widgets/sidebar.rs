@@ -6,7 +6,7 @@ use std::slice;
 use ratatui::layout::Rect;
 
 use crate::timefmt::age_short;
-use crate::tui::state::{App, Selection};
+use crate::tui::state::{App, Focus, Selection};
 use crate::tui::theme::{palette, role, Ink, Rgb};
 use crate::tui::widgets::{Canvas, Seg};
 use crate::tui::wrap::truncate;
@@ -33,7 +33,12 @@ pub fn render(canvas: &mut Canvas, app: &App, rect: Rect) {
     let mut rows: Vec<Option<Row>> = vec![None];
     rows.push(Some(announcements(app)));
     rows.push(None);
-    rows.push(Some(label("CHANNELS", None)));
+    // The section label brightens while the sidebar has the keys.
+    let mut channels = label("CHANNELS", None);
+    if app.focus == Focus::Sidebar {
+        channels.name_ink = panel(role::TEXT);
+    }
+    rows.push(Some(channels));
     rows.push(None);
     rows.extend(app.channels.iter().map(|ch| {
         let selected = app.selected == Selection::Channel(ch.name.clone());

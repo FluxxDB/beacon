@@ -50,35 +50,34 @@ impl Line {
 }
 
 pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
-    let mut area = layout.posts;
-    if area.width <= INDENT + BODY_MARGIN || area.height == 0 {
+    let full = layout.posts;
+    if full.width <= INDENT + BODY_MARGIN || full.height == 0 {
         return;
     }
 
+    let area = viewport(app, layout);
     if let Conn::Down { .. } = app.connection {
-        let band = server_down(area.width);
-        let used = (band.len() as u16 + 1).min(area.height);
+        let band = server_down(full.width);
         draw_lines(
             canvas,
             Rect {
-                height: used,
-                ..area
+                height: full.height - area.height,
+                ..full
             },
             &band,
         );
-        area.y += used;
-        area.height -= used;
-        if area.height == 0 {
-            return;
-        }
+    }
+    if area.height == 0 {
+        return;
     }
 
-    let filter = app.filter.as_deref().filter(|f| !f.is_empty());
-    let posts: Vec<&PostItem> = app
-        .posts
-        .iter()
-        .filter(|p| filter.is_none_or(|f| matches_filter(p, f)))
-        .collect();
+    let filter = active_filter(app);
+    let posts = shown(app);
+    // While the view's posts are on their way, say nothing rather than
+    // claim the channel is empty.
+    if app.loading && posts.is_empty() {
+        return;
+    }
 
     if let Some(message) = empty_message(app, posts.is_empty(), filter) {
         let lines: Vec<Line> = wrap(&message, area.width - BODY_MARGIN)
@@ -160,6 +159,75 @@ fn draw_lines(canvas: &mut Canvas, area: Rect, lines: &[Line]) {
     }
 }
 
+/// The rows of the posts pane left for posts: all of them, less the
+/// server-down band while the server is unreachable.
+pub fn viewport(app: &App, layout: &Layout) -> Rect {
+    let area = layout.posts;
+    match app.connection {
+        Conn::Down { .. } if area.width > INDENT + BODY_MARGIN => {
+            let used = (server_down(area.width).len() as u16 + 1).min(area.height);
+            Rect {
+                y: area.y + used,
+                height: area.height - used,
+                ..area
+            }
+        }
+        _ => area,
+    }
+}
+
+/// The filter, if one is set and not empty.
+fn active_filter(app: &App) -> Option<&str> {
+    app.filter.as_deref().filter(|f| !f.is_empty())
+}
+
+/// The posts the pane shows: the view's posts that pass the filter, oldest first.
+pub fn shown(app: &App) -> Vec<&PostItem> {
+    let filter = active_filter(app);
+    app.posts
+        .iter()
+        .filter(|p| filter.is_none_or(|f| matches_filter(p, f)))
+        .collect()
+}
+
+/// Where one shown post sits in the laid-out pane, in rows counted up from
+/// the bottom (row 0 is the newest post's last row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    pub id: String,
+    /// Rows below the post's last row.
+    pub bottom: usize,
+    /// The post's own rows: header, body and attachment.
+    pub height: usize,
+}
+
+/// The rows each shown post takes in a pane `width` cells wide, newest
+/// first, laid out as [`render`] lays them out (a blank row, and a day
+/// separator when the day changes, between posts). The last span's top is
+/// the height of everything.
+pub fn spans(app: &App, width: u16) -> Vec<Span> {
+    let posts = shown(app);
+    let mut out = Vec::with_capacity(posts.len());
+    let mut row = 0usize;
+    for (i, post) in posts.iter().enumerate().rev() {
+        if let Some(next) = posts.get(i + 1) {
+            row += if same_day(post.ts_ms, next.ts_ms, app) {
+                1
+            } else {
+                3
+            };
+        }
+        let height = post_lines(post, app, width).len();
+        out.push(Span {
+            id: post.id.clone(),
+            bottom: row,
+            height,
+        });
+        row += height;
+    }
+    out
+}
+
 /// The copy for a pane with nothing to show, if that is the case.
 fn empty_message(app: &App, no_posts: bool, filter: Option<&str>) -> Option<String> {
     if app.channels.is_empty() {
@@ -181,7 +249,7 @@ fn empty_message(app: &App, no_posts: bool, filter: Option<&str>) -> Option<Stri
 }
 
 /// `claim` keeps posts tagged claim; `@pc-vllm` keeps posts by pc-vllm.
-fn matches_filter(post: &PostItem, filter: &str) -> bool {
+pub fn matches_filter(post: &PostItem, filter: &str) -> bool {
     match filter.strip_prefix('@') {
         Some(handle) => post.author.eq_ignore_ascii_case(handle),
         None => post.tags.iter().any(|t| t.eq_ignore_ascii_case(filter)),
@@ -394,7 +462,7 @@ fn clean(body: &str) -> String {
 }
 
 /// `512 B`, `12 KB`, `3.4 MB`, `1.2 GB` (powers of 1024).
-fn human_size(bytes: u64) -> String {
+pub fn human_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     let b = bytes as f64;
     if b < KB {

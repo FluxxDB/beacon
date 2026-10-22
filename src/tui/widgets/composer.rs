@@ -111,6 +111,8 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
 /// What the empty composer says it is for.
 fn placeholder(app: &App) -> String {
     match &app.selected {
+        // Nothing is known yet (the server has not answered).
+        _ if app.channels.is_empty() && app.loading => "waiting for the server…".to_string(),
         _ if app.channels.is_empty() => "press n to create a channel".to_string(),
         Selection::Channel(name) => format!("message #{name}"),
         Selection::Announcements => "pick a channel to post in".to_string(),
