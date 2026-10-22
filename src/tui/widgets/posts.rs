@@ -12,7 +12,7 @@
 //!            body, wrapped to end by width - 4
 //! ```
 //!
-//! The first row is a reply's only ([`crate::tui::reply`]): what it answers,
+//! Only a reply has the first row ([`crate::tui::reply`]): what it answers,
 //! in dim ink, cut where body text ends.
 
 use jiff::Timestamp;
@@ -384,10 +384,16 @@ fn post_lines(post: &PostItem, app: &App, width: u16) -> Vec<Line> {
         Line { band, segs }
     };
 
-    let reply = reply::parse(&post.body);
-    let target = reply.as_ref().map(|r| app.reply_target(&r.id));
+    // An id without a digit may be just a word (`re branches:`): its line
+    // waits until the post is found.
+    let reply = reply::parse(&post.body)
+        .map(|r| {
+            let target = app.reply_target(&r.id);
+            (r, target)
+        })
+        .filter(|(r, target)| r.has_digit() || matches!(target, Resolved::Found(_)));
     let mut lines = Vec::new();
-    if let Some(target) = target {
+    if let Some((_, target)) = &reply {
         lines.push(row(reply_line(target, post, width, bg)));
     }
     lines.push(row(header(post, app, width, bg, selected)));
@@ -399,8 +405,8 @@ fn post_lines(post: &PostItem, app: &App, width: u16) -> Vec<Line> {
     });
     let body_w = width.saturating_sub(INDENT + BODY_MARGIN);
     // Once the line above says what it answers, `re <id>:` is left out.
-    let written = match (&reply, target) {
-        (Some(reply), Some(Resolved::Found(_))) => reply.rest,
+    let written = match &reply {
+        Some((reply, Resolved::Found(_))) => reply.rest,
         _ => &post.body,
     };
     // Trailing whitespace is never shown: a final newline, or a space that
@@ -432,7 +438,7 @@ fn post_lines(post: &PostItem, app: &App, width: u16) -> Vec<Line> {
 /// column, over the reply's own name: the author in fog, the rest in ash,
 /// cut where body text ends. ` in #channel` only when the post it answers
 /// is in another channel; `…` while that post is on its way.
-fn reply_line(target: Resolved, post: &PostItem, width: u16, bg: Rgb) -> Vec<(u16, Seg)> {
+fn reply_line(target: &Resolved, post: &PostItem, width: u16, bg: Rgb) -> Vec<(u16, Seg)> {
     let quiet = Ink::new(role::QUIET, bg);
     let end = width.saturating_sub(BODY_MARGIN);
     let mut segs: Vec<(u16, Seg)> = Vec::new();
@@ -450,31 +456,16 @@ fn reply_line(target: Resolved, post: &PostItem, width: u16, bg: Rgb) -> Vec<(u1
     match target {
         Resolved::Pending => put(&mut x, "…", quiet),
         Resolved::Missing => put(&mut x, NOT_HERE, quiet),
-        Resolved::Found(answered) => {
-            put(&mut x, &answered.author, Ink::new(role::META, bg));
-            if answered.channel != post.channel {
-                put(&mut x, &format!(" in #{}", answered.channel), quiet);
+        Resolved::Found(quote) => {
+            put(&mut x, &quote.author, Ink::new(role::META, bg));
+            if quote.channel != post.channel {
+                put(&mut x, &format!(" in #{}", quote.channel), quiet);
             }
             x += 2;
-            put(&mut x, &preview(answered), quiet);
+            put(&mut x, &quote.text, quiet);
         }
     }
     segs
-}
-
-/// The start of what `post` says: its first line with any text (without
-/// its own `re <id>:`), or else its file's name.
-fn preview(post: &PostItem) -> String {
-    let body = reply::parse(&post.body).map_or(post.body.as_str(), |r| r.rest);
-    let body = clean(body);
-    match body.lines().map(str::trim).find(|line| !line.is_empty()) {
-        Some(line) => line.to_string(),
-        None => post
-            .attachment
-            .as_ref()
-            .map(|a| format!("≡ {}", a.name))
-            .unwrap_or_default(),
-    }
 }
 
 /// `{time}  {author}  {client} · {node}`, with the badges right-aligned.
@@ -580,7 +571,7 @@ fn mention_len(word: &str) -> usize {
 /// The body as it may reach the terminal: tabs as spaces, no other control
 /// characters (an escape sequence in a post must never be drawn) and no bidi
 /// overrides (see [`is_unsafe`]).
-fn clean(body: &str) -> String {
+pub(crate) fn clean(body: &str) -> String {
     body.chars()
         .filter_map(|c| match c {
             '\t' => Some(' '),

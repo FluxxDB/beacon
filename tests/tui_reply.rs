@@ -5,7 +5,9 @@
 //! id is looked up among the loaded posts first, then fetched from the node
 //! once; misses are remembered too.
 
-use beacon::api::{ChannelJson, ChannelsJson, PostJson, PostsResponse, StreamEvent};
+use beacon::api::{
+    AttachmentJson, ChannelJson, ChannelsJson, PostJson, PostsResponse, StreamEvent,
+};
 use beacon::model::{parse_mentions, AuthorKind};
 use beacon::tui::reply;
 use beacon::tui::state::{App, Cmd, Conn, Focus, Loaded, Msg, Selection};
@@ -791,7 +793,260 @@ fn narrow_terminals_cut_the_line_and_wrap_the_body_without_its_prefix() {
     );
 }
 
+// ------------------------------------------------------- ids without digits
+
+/// An 8-letter word can be a short id (about 1 in 20 has no digit), or just
+/// a word: without a digit, the line shows only once the node finds the post.
+#[test]
+fn a_word_that_could_be_an_id_draws_nothing_unless_it_resolves() {
+    let body = "re branches: merged both into main";
+    let (mut app, cmds) = board(vec![api_post("E5F6G7H8", 20, "general", "pc-beacon", body)]);
+    assert_eq!(fetches(&cmds), ["BRANCHES"], "asked for all the same");
+    let unchanged = |app: &App, when: &str| {
+        let buf = screen(app);
+        assert_eq!(line_above(app, &buf, "pc-beacon"), "", "{when}");
+        assert_eq!(body_of(app, &buf, "pc-beacon"), body, "{when}");
+        assert_eq!(rows_of(app, "E5F6G7H8"), 2, "{when}");
+    };
+    unchanged(&app, "while it is asked for");
+
+    let mut cmds = app.update(answer("BRANCHES", Ok(None)));
+    unchanged(&app, "once the node has no such post");
+    for t in 1..4 {
+        cmds.extend(app.update(Msg::Tick(NOW + t * 1_000)));
+    }
+    assert_eq!(fetches(&cmds), Vec::<String>::new());
+}
+
+#[test]
+fn an_id_without_a_digit_that_resolves_draws_its_line() {
+    let (mut app, cmds) = board(vec![
+        api_post("ABKQZXTWMN", 30, "general", "pc-configs", "on it"),
+        api_post(
+            "E5F6G7H8",
+            20,
+            "general",
+            "mac-juicebox",
+            "re kqzxtwmn: thanks",
+        ),
+        api_post("E5F6G7H9", 10, "general", "pc-vllm", "re HJKMNPQR: nice"),
+    ]);
+    assert_eq!(
+        fetches(&cmds),
+        ["HJKMNPQR"],
+        "the loaded one is not asked for"
+    );
+    let buf = screen(&app);
+    assert_eq!(
+        line_above(&app, &buf, "mac-juicebox"),
+        "╭─ pc-configs  on it"
+    );
+    assert_eq!(body_of(&app, &buf, "mac-juicebox"), "thanks");
+    assert_eq!(line_above(&app, &buf, "pc-vllm"), "", "not known yet");
+
+    app.update(answer(
+        "HJKMNPQR",
+        Ok(Some(api_post(
+            "ABHJKMNPQR",
+            90,
+            "beacon",
+            "nas-backup",
+            "nightly done",
+        ))),
+    ));
+    let buf = screen(&app);
+    assert_eq!(
+        line_above(&app, &buf, "pc-vllm"),
+        "╭─ nas-backup in #beacon  nightly done"
+    );
+    assert_eq!(body_of(&app, &buf, "pc-vllm"), "nice");
+}
+
+#[test]
+fn the_quote_leaves_out_the_answered_posts_own_reply_prefix() {
+    let mut file_only = api_post("A1B2C3D6", 45, "general", "pc-files", "");
+    file_only.attachment = Some(AttachmentJson {
+        name: "notes.txt".to_string(),
+        size: 12,
+        sha256: "0".repeat(64),
+        available: true,
+    });
+    let (app, _) = board(vec![
+        file_only,
+        api_post(
+            "A1B2C3D4",
+            40,
+            "general",
+            "pc-configs",
+            "re SFRR8WM4: done, tagged v0.1",
+        ),
+        api_post("A1B2C3D5", 35, "general", "pc-vllm", "re branches: merged"),
+        api_post(
+            "E5F6G7H7",
+            30,
+            "general",
+            "nas-files",
+            "re A1B2C3D6: got it",
+        ),
+        api_post(
+            "E5F6G7H8",
+            20,
+            "general",
+            "mac-juicebox",
+            "re A1B2C3D4: thanks",
+        ),
+        api_post("E5F6G7H9", 10, "general", "nas-backup", "re A1B2C3D5: nice"),
+    ]);
+    let buf = screen(&app);
+    // A prefix with a digit is a reply's: left out. A word without one may
+    // be just a word: kept. A post with only a file quotes the file.
+    assert_eq!(
+        line_above(&app, &buf, "mac-juicebox"),
+        "╭─ pc-configs  done, tagged v0.1"
+    );
+    assert_eq!(
+        line_above(&app, &buf, "nas-backup"),
+        "╭─ pc-vllm  re branches: merged"
+    );
+    assert_eq!(
+        line_above(&app, &buf, "nas-files"),
+        "╭─ pc-files  ≡ notes.txt"
+    );
+}
+
+#[test]
+fn a_failed_fetch_is_asked_again_after_switching_away_and_back() {
+    let reply = || api_post("E5F6G7H9", 10, "general", "pc-vllm", "re 7K4TR2MF: nice");
+    let (mut app, cmds) = board(vec![reply()]);
+    assert_eq!(fetches(&cmds), ["7K4TR2MF"]);
+    app.update(answer("7K4TR2MF", Err("connection refused".to_string())));
+
+    app.focus = Focus::Sidebar;
+    let mut cmds = app.update(key(KeyCode::Char('j')));
+    cmds.extend(app.update(page(Selection::Channel("beacon".to_string()), vec![])));
+    cmds.extend(app.update(key(KeyCode::Char('k'))));
+    cmds.extend(app.update(page(general(), vec![reply()])));
+    assert_eq!(app.selected, general());
+    assert_eq!(fetches(&cmds), ["7K4TR2MF"], "once");
+}
+
+#[test]
+fn the_selected_posts_edge_covers_its_reply_line() {
+    let (mut app, _) = board(vec![
+        api_post("A1B2C3D4", 30, "general", "pc-configs", "on it"),
+        api_post(
+            "E5F6G7H8",
+            20,
+            "general",
+            "mac-juicebox",
+            "re A1B2C3D4: thanks",
+        ),
+    ]);
+    app.focus = Focus::Posts;
+    app.update(key(KeyCode::Char('k')));
+    assert_eq!(app.selected_post, Some(ulid("E5F6G7H8")));
+    let buf = screen(&app);
+    let pane = posts_pane(&app);
+    let (header, _) = header_of(&buf, "mac-juicebox");
+    for y in [header - 1, header, header + 1] {
+        let cell = &buf[(pane.x, y)];
+        assert_eq!((cell.symbol(), cell.fg), ("▍", rgb(role::META)), "row {y}");
+    }
+    assert_eq!(
+        buf[(pane.x, header - 2)].symbol(),
+        " ",
+        "the gap is not the post's"
+    );
+}
+
+#[test]
+fn reply_lines_render_at_every_size() {
+    let (mut app, _) = board(vec![
+        api_post(
+            "A1B2C3D4",
+            50,
+            "general",
+            "pc-configs",
+            "on it, a first line\nand a second",
+        ),
+        api_post(
+            "E5F6G7H5",
+            40,
+            "general",
+            "mac-juicebox",
+            "re A1B2C3D4: found, loaded",
+        ),
+        api_post(
+            "E5F6G7H6",
+            30,
+            "general",
+            "pc-vllm",
+            "re 7K4TR2MF: found, fetched from another channel",
+        ),
+        api_post(
+            "E5F6G7H7",
+            20,
+            "general",
+            "nas-backup",
+            "re 00NHQEG3: missing",
+        ),
+        api_post(
+            "E5F6G7H8",
+            10,
+            "general",
+            "pc-beacon",
+            "re SFRR8WM4: still on its way",
+        ),
+        api_post(
+            "E5F6G7H9",
+            5,
+            "general",
+            "mac-vllm",
+            "re branches: a word, not an id",
+        ),
+        // A name long enough to fill the line at the narrowest widths.
+        api_post(
+            "E5F6G7HA",
+            3,
+            "general",
+            "mac-juicebox-nightly-builder",
+            "a long name",
+        ),
+        api_post(
+            "E5F6G7HB",
+            1,
+            "general",
+            "pc-vllm",
+            "re E5F6G7HA: and the quote?",
+        ),
+    ]);
+    app.update(answer("7K4TR2MF", Ok(Some(kickoff()))));
+    app.update(answer("00NHQEG3", Ok(None)));
+    app.focus = Focus::Posts;
+    app.update(key(KeyCode::Char('k')));
+    for width in 0..=80u16 {
+        for height in [0u16, 1, 5, 13, 14, 15, 20, 24, 33] {
+            app.update(Msg::Resize(width, height));
+            let buf = screen(&app);
+            for (i, cell) in buf.content().iter().enumerate() {
+                let (x, y) = buf.pos_of(i);
+                assert_ne!(cell.bg, Color::Reset, "{width}x{height}: bg at ({x},{y})");
+                assert_ne!(cell.fg, Color::Reset, "{width}x{height}: fg at ({x},{y})");
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------- height and scrolling
+
+/// The rows the post ending in `tail` takes in the pane.
+fn rows_of(app: &App, tail: &str) -> usize {
+    posts::spans(app, posts_pane(app).width)
+        .into_iter()
+        .find(|s| s.id == ulid(tail))
+        .unwrap_or_else(|| panic!("{tail} is not shown"))
+        .height
+}
 
 #[test]
 fn the_reply_line_counts_in_a_posts_height() {
@@ -806,19 +1061,12 @@ fn the_reply_line_counts_in_a_posts_height() {
         ),
         api_post("E5F6G7H9", 10, "general", "pc-vllm", "re 7K4TR2MF: nice"),
     ]);
-    let height = |app: &App, tail: &str| {
-        posts::spans(app, posts_pane(app).width)
-            .into_iter()
-            .find(|s| s.id == ulid(tail))
-            .unwrap()
-            .height
-    };
     // Header and one body row; a reply has its line on top.
-    assert_eq!(height(&app, "A1B2C3D4"), 2);
-    assert_eq!(height(&app, "E5F6G7H8"), 3);
-    assert_eq!(height(&app, "E5F6G7H9"), 3, "on its way");
+    assert_eq!(rows_of(&app, "A1B2C3D4"), 2);
+    assert_eq!(rows_of(&app, "E5F6G7H8"), 3);
+    assert_eq!(rows_of(&app, "E5F6G7H9"), 3, "on its way");
     app.update(answer("7K4TR2MF", Ok(None)));
-    assert_eq!(height(&app, "E5F6G7H9"), 3, "not here");
+    assert_eq!(rows_of(&app, "E5F6G7H9"), 3, "not here");
 }
 
 /// `n` posts in #general, a minute apart, the oldest a reply to a post the
@@ -871,54 +1119,121 @@ fn scrolled_to_the_top_the_oldest_replys_line_shows() {
     assert!(row_text(&buf, pane.y + 1).contains("pc-oldest  claude-code · pc"));
 }
 
+/// Fifteen posts in #general and, newest, pc-vllm's reply (`E5F6G7H9`)
+/// saying `body`, with the view at the bottom.
+fn reply_at_the_bottom(body: &str) -> App {
+    let mut posts: Vec<PostJson> = (0..15)
+        .map(|i| {
+            api_post(
+                &format!("{i:08}"),
+                30 - i,
+                "general",
+                "pc-configs",
+                &format!("post number {i}"),
+            )
+        })
+        .collect();
+    posts.push(api_post("E5F6G7H9", 1, "general", "pc-vllm", body));
+    board(posts).0
+}
+
+/// The posts pane's rows as drawn.
+fn pane_rows(app: &App) -> Vec<String> {
+    let buf = screen(app);
+    let pane = posts_pane(app);
+    (pane.y..pane.bottom())
+        .map(|y| region(&buf, y, pane.x, pane.right()))
+        .collect()
+}
+
+/// `PgUp` once, which leaves the reply below the view. Returns the rows on
+/// screen then.
+fn page_up_past_the_reply(app: &mut App) -> Vec<String> {
+    app.update(key(KeyCode::PageUp));
+    let rows = pane_rows(app);
+    assert!(app.scroll > 0);
+    assert!(
+        !rows.iter().any(|r| r.contains("pc-vllm")),
+        "the reply is below the view:\n{}",
+        rows.join("\n")
+    );
+    rows
+}
+
+/// Two body rows while its `re 7K4TR2MF: ` shows, one without it.
+const LONG_REPLY: &str =
+    "re 7K4TR2MF: the arm64 image builds in 2m14s and every test passes on both";
+
+/// The post `7K4TR2MF` names, in #beacon.
+fn kickoff() -> PostJson {
+    api_post("AB7K4TR2MF", 600, "beacon", "Dang", "kickoff")
+}
+
 #[test]
 fn a_reply_resolving_below_a_scrolled_view_does_not_move_it() {
-    let mut posts = Vec::new();
-    for i in 0..15 {
-        posts.push(api_post(
-            &format!("{i:08}"),
-            30 - i,
-            "general",
-            "pc-configs",
-            &format!("post number {i}"),
-        ));
-    }
-    // The newest: two body rows while its prefix shows, one without it.
-    posts.push(api_post(
-        "E5F6G7H9",
-        1,
-        "general",
-        "pc-vllm",
-        "re 7K4TR2MF: the arm64 image builds in 2m14s and every test passes on both",
-    ));
-    let (mut app, _) = board(posts);
-    let pane = posts_pane(&app);
-    let width = pane.width;
-    let height_of_newest = |app: &App| posts::spans(app, width).first().map(|s| s.height).unwrap();
-    assert_eq!(height_of_newest(&app), 4);
+    let mut app = reply_at_the_bottom(LONG_REPLY);
+    assert_eq!(rows_of(&app, "E5F6G7H9"), 4);
+    let before = page_up_past_the_reply(&mut app);
+    app.update(answer("7K4TR2MF", Ok(Some(kickoff()))));
+    assert_eq!(rows_of(&app, "E5F6G7H9"), 3, "one body row now");
+    assert_eq!(pane_rows(&app), before, "the view stays where it was");
+}
 
-    app.update(key(KeyCode::PageUp));
-    let pane_rows = |app: &App| {
-        let buf = screen(app);
-        (pane.y..pane.bottom())
-            .map(|y| region(&buf, y, pane.x, pane.right()))
-            .collect::<Vec<_>>()
-    };
-    let before = pane_rows(&app);
-    assert!(
-        !before.iter().any(|r| r.contains("pc-vllm")),
-        "the reply is below the view"
-    );
+#[test]
+fn a_digit_free_reply_resolving_below_a_scrolled_view_does_not_move_it() {
+    let mut app = reply_at_the_bottom("re HJKMNPQR: kickoff done");
+    assert_eq!(rows_of(&app, "E5F6G7H9"), 2, "no line while unknown");
+    let before = page_up_past_the_reply(&mut app);
     app.update(answer(
-        "7K4TR2MF",
+        "HJKMNPQR",
         Ok(Some(api_post(
-            "AB7K4TR2MF",
+            "ABHJKMNPQR",
             600,
             "beacon",
             "Dang",
             "kickoff",
         ))),
     ));
-    assert_eq!(height_of_newest(&app), 3, "one body row now");
+    assert_eq!(rows_of(&app, "E5F6G7H9"), 3, "its line now");
+    assert_eq!(pane_rows(&app), before, "the view stays where it was");
+}
+
+#[test]
+fn a_target_arriving_live_below_a_scrolled_view_does_not_move_it() {
+    let mut app = reply_at_the_bottom(LONG_REPLY);
+    let before = page_up_past_the_reply(&mut app);
+    app.update(Msg::Stream(StreamEvent::Post(kickoff())));
+    assert_eq!(rows_of(&app, "E5F6G7H9"), 3, "one body row now");
+    assert_eq!(pane_rows(&app), before, "the view stays where it was");
+}
+
+#[test]
+fn a_target_deleted_below_a_scrolled_view_does_not_move_it() {
+    let mut app = reply_at_the_bottom(LONG_REPLY);
+    app.update(answer("7K4TR2MF", Ok(Some(kickoff()))));
+    assert_eq!(rows_of(&app, "E5F6G7H9"), 3);
+    let before = page_up_past_the_reply(&mut app);
+    app.update(Msg::Stream(StreamEvent::PostDeleted {
+        id: ulid("AB7K4TR2MF"),
+    }));
+    assert_eq!(rows_of(&app, "E5F6G7H9"), 4, "its prefix is back");
+    assert_eq!(pane_rows(&app), before, "the view stays where it was");
+}
+
+#[test]
+fn a_target_whose_channel_is_deleted_below_a_scrolled_view_does_not_move_it() {
+    let mut app = reply_at_the_bottom(LONG_REPLY);
+    app.update(answer("7K4TR2MF", Ok(Some(kickoff()))));
+    let before = page_up_past_the_reply(&mut app);
+    let cmds = app.update(Msg::Stream(StreamEvent::Channel {
+        channel: ChannelJson {
+            name: "beacon".to_string(),
+            topic: None,
+            unread: None,
+        },
+        deleted: true,
+    }));
+    assert_eq!(fetches(&cmds), ["7K4TR2MF"]);
+    assert_eq!(rows_of(&app, "E5F6G7H9"), 4, "on its way again");
     assert_eq!(pane_rows(&app), before, "the view stays where it was");
 }

@@ -8,15 +8,21 @@
 //! spaces and a post id: a short id (the last 8 characters of a ULID) or a
 //! whole 26-character ULID, in Crockford base32 of any case; then maybe `:`
 //! or `,`, then whitespace or the end of the body. Only that first id
-//! counts.
+//! counts. An 8-character id with no digit may just be a word
+//! (`re branches:`; about 1 in 20 real short ids has none), so its line
+//! shows only once the post it names is found.
 //!
 //! The id is looked up among the posts loaded in the view first. Otherwise
 //! [`App::update`] asks the node for it once ([`Cmd::LoadPost`]) and keeps
 //! the answer in [`App::replies`], a miss included, across views. Newer news
 //! wins over an answer still on its way: a post that arrives live resolves
 //! the replies waiting on it, and one that is deleted (or whose channel is)
-//! takes them back. When the live feed reconnects, the ids the node could
-//! not be asked about, or did not have, are asked again.
+//! takes them back. Ids the node could not be asked about are asked again
+//! when the view changes or the live feed reconnects; ids it did not have,
+//! when the feed reconnects (they may have synced meanwhile). None of this
+//! moves a view scrolled up.
+
+use std::borrow::Cow;
 
 use crate::api::PostJson;
 use crate::tui::convert;
@@ -30,6 +36,14 @@ pub struct Reply<'a> {
     pub id: String,
     /// The body after `re <id>:` and the whitespace that follows it.
     pub rest: &'a str,
+}
+
+impl Reply<'_> {
+    /// Whether the id has a digit, as every whole ULID and most short ids
+    /// do. Without one it may be a word that only looks like an id.
+    pub fn has_digit(&self) -> bool {
+        self.id.bytes().any(|b| b.is_ascii_digit())
+    }
 }
 
 /// Length of a short id, and of a whole ULID.
@@ -82,52 +96,93 @@ fn is_post_id(id: &str) -> bool {
 
 /// Whether `reference`, an id a reply names (uppercase), names the post
 /// whose id is `id`: the same ULID, or its last 8 characters.
-pub fn names(reference: &str, id: &str) -> bool {
+fn names(reference: &str, id: &str) -> bool {
     id.len()
         .checked_sub(reference.len())
         .and_then(|start| id.get(start..))
         .is_some_and(|tail| tail.eq_ignore_ascii_case(reference))
 }
 
-/// What is known of a post a reply names that was not loaded in the view.
+/// What a reply's line says of the post it answers, ready to draw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Quote {
+    pub author: String,
+    pub channel: String,
+    /// Its first line with any text, cleaned for the terminal and without
+    /// its own `re <id>:` (when that id has a digit), or else `≡ file`.
+    pub text: String,
+}
+
+impl Quote {
+    /// What a reply's line says of `post`, worked out once, when it is
+    /// remembered, rather than at every layout.
+    pub fn of(post: &PostItem) -> Quote {
+        let body = parse(&post.body)
+            .filter(Reply::has_digit)
+            .map_or(post.body.as_str(), |reply| reply.rest);
+        let first = body
+            .lines()
+            .map(|line| posts::clean(line).trim().to_string())
+            .find(|line| !line.is_empty());
+        let text = first.unwrap_or_else(|| {
+            post.attachment
+                .as_ref()
+                .map(|a| format!("≡ {}", a.name))
+                .unwrap_or_default()
+        });
+        Quote {
+            author: post.author.clone(),
+            channel: post.channel.clone(),
+            text,
+        }
+    }
+}
+
+/// What is known of a post a reply names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     /// The node was asked; no answer yet.
     Asked,
-    Found(Box<PostItem>),
+    Found(Quote),
     /// The node has no such post: deleted (or its channel is), not synced
     /// here, or never written.
     Missing,
-    /// The node could not be asked. Asked again once the live feed is back.
+    /// The node could not be asked. Asked again when the view changes or
+    /// the live feed is back.
     Failed,
 }
 
 /// The post a reply names, as far as the board knows now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolved<'a> {
-    Found(&'a PostItem),
+    Found(Cow<'a, Quote>),
     /// Not known yet: asked for, or about to be.
     Pending,
     Missing,
 }
 
 impl App {
-    /// The post `reference` (an id a reply names, uppercase) names: one
-    /// loaded in the view first, then what the node said about it.
-    pub fn reply_target(&self, reference: &str) -> Resolved<'_> {
-        if let Some(post) = self.posts.iter().find(|p| names(reference, &p.id)) {
-            return Resolved::Found(post);
+    /// The post `reference` (an id a reply names, uppercase) names: found in
+    /// [`App::replies`], else loaded in the view (a reply that came in during
+    /// this update, or a target a page brought while it was being asked
+    /// for), else what the node said about it.
+    pub(crate) fn reply_target(&self, reference: &str) -> Resolved<'_> {
+        let known = self.replies.get(reference);
+        if let Some(Target::Found(quote)) = known {
+            return Resolved::Found(Cow::Borrowed(quote));
         }
-        match self.replies.get(reference) {
-            Some(Target::Found(post)) => Resolved::Found(post),
+        if let Some(post) = self.posts.iter().find(|p| names(reference, &p.id)) {
+            return Resolved::Found(Cow::Owned(Quote::of(post)));
+        }
+        match known {
             Some(Target::Missing) => Resolved::Missing,
-            Some(Target::Asked | Target::Failed) | None => Resolved::Pending,
+            _ => Resolved::Pending,
         }
     }
 
     /// Asks the node for each post the view's replies name that is neither
-    /// loaded nor asked about yet: once per id. A loaded one is remembered
-    /// as it is, so it is not looked for again.
+    /// loaded nor asked about yet: once per id. A loaded one is remembered,
+    /// so it is not looked for again.
     pub(crate) fn ask_for_reply_targets(&mut self) -> Vec<Cmd> {
         let mut cmds = Vec::new();
         for post in &self.posts {
@@ -138,7 +193,7 @@ impl App {
                 continue;
             }
             let target = match self.posts.iter().find(|p| names(&reply.id, &p.id)) {
-                Some(loaded) => Target::Found(Box::new(loaded.clone())),
+                Some(loaded) => Target::Found(Quote::of(loaded)),
                 None => {
                     cmds.push(Cmd::LoadPost(reply.id.clone()));
                     Target::Asked
@@ -161,7 +216,7 @@ impl App {
             return;
         }
         let target = match post {
-            Ok(Some(post)) => Target::Found(Box::new(convert::post_item(&post))),
+            Ok(Some(post)) => Target::Found(Quote::of(&convert::post_item(&post))),
             Ok(None) => Target::Missing,
             Err(_) => Target::Failed,
         };
@@ -179,10 +234,11 @@ impl App {
         if !self.replies.iter().any(waiting) {
             return;
         }
+        let quote = Quote::of(post);
         self.keeping_view(|app| {
             for (reference, target) in app.replies.iter_mut() {
                 if waiting((reference, &*target)) {
-                    *target = Target::Found(Box::new(post.clone()));
+                    *target = Target::Found(quote.clone());
                 }
             }
         });
@@ -192,18 +248,28 @@ impl App {
     /// without asking the node. (Every id the view's replies name is in
     /// [`App::replies`] by now, loaded targets too.)
     pub(crate) fn reply_target_deleted(&mut self, id: &str) {
-        for (reference, target) in self.replies.iter_mut() {
-            if names(reference, id) {
-                *target = Target::Missing;
-            }
+        let named = |reference: &String| names(reference, id);
+        if !self.replies.keys().any(named) {
+            return;
         }
+        self.keeping_view(|app| {
+            for (reference, target) in app.replies.iter_mut() {
+                if named(reference) {
+                    *target = Target::Missing;
+                }
+            }
+        });
     }
 
     /// Channel `name` was deleted, and its posts are no longer shown: what
     /// replies knew of them is asked for again.
     pub(crate) fn reply_targets_lost_channel(&mut self, name: &str) {
-        self.replies
-            .retain(|_, target| !matches!(target, Target::Found(post) if post.channel == name));
+        let lost =
+            |target: &Target| matches!(target, Target::Found(quote) if quote.channel == name);
+        if !self.replies.values().any(lost) {
+            return;
+        }
+        self.keeping_view(|app| app.replies.retain(|_, target| !lost(target)));
     }
 
     /// The live feed is back: ids the node could not be asked about, or
@@ -213,13 +279,19 @@ impl App {
             .retain(|_, target| matches!(target, Target::Found(_) | Target::Asked));
     }
 
+    /// A view was picked: ids the node could not be asked about are asked
+    /// again, as the view's posts are.
+    pub(crate) fn retry_failed_reply_targets(&mut self) {
+        self.replies.retain(|_, target| *target != Target::Failed);
+    }
+
     /// Makes `change` (to what replies resolve to) without moving a view
     /// scrolled up: the posts below it that grow or shrink (a reply line
-    /// resolving, its body losing `re <id>:`) move the scroll with them, as
-    /// a post arriving there does.
+    /// showing or resolving, its body losing or getting back `re <id>:`)
+    /// move the scroll with them, as a post arriving there does.
     fn keeping_view(&mut self, change: impl FnOnce(&mut App)) {
-        let width = match self.viewport() {
-            Some(view) if self.scroll > 0 => view.width,
+        let width = match self.posts_width() {
+            Some(width) if self.scroll > 0 => width,
             _ => return change(self),
         };
         let before = posts::spans(self, width);

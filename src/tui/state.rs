@@ -707,6 +707,7 @@ impl App {
         self.has_older = false;
         self.oldest_page = None;
         self.held.clear();
+        self.retry_failed_reply_targets();
         self.load_view()
     }
 
@@ -1273,7 +1274,7 @@ impl App {
         self.layout().map(|layout| posts::viewport(self, &layout))
     }
 
-    fn posts_width(&self) -> Option<u16> {
+    pub(crate) fn posts_width(&self) -> Option<u16> {
         self.layout().map(|layout| layout.posts.width)
     }
 
