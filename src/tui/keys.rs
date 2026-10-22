@@ -17,6 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::model::{normalize_channel, BODY_MAX, TOPIC_MAX};
+use crate::timefmt::{clock_12h, day_label};
 use crate::tui::state::{
     App, AttachPicker, Cmd, ConfirmDialog, Dialog, Focus, FormField, NewChannelForm, Selection,
     CHANNEL_NAME_MAX, FILTER_MAX, NAME_RULE,
@@ -394,7 +395,7 @@ impl App {
 
     fn open_attach(&mut self) -> Vec<Cmd> {
         if !matches!(self.selected, Selection::Channel(_)) {
-            self.toast("Pick a channel to attach a file to");
+            self.toast("Pick a channel to attach a file to: tab to the channels, then j/k");
             return Vec::new();
         }
         if self.sending.is_some() {
@@ -431,7 +432,7 @@ impl App {
         // Whether the bytes are here yet is the node's to say: they arrive
         // after the post, and nothing here would hear of it. A node without
         // them answers 404, which comes back as "not synced yet".
-        self.error(format!("saving {}…", attachment.name));
+        self.waiting(format!("saving {}…", attachment.name));
         vec![Cmd::Save {
             post_id: id,
             sha,
@@ -465,10 +466,22 @@ impl App {
                     self.toast(PICK_POST);
                     return;
                 };
+                // Named, since the dialog may cover the post it is about.
+                let whose = match self.posts.iter().find(|p| p.id == id) {
+                    Some(post) => {
+                        let owner = if post.author.eq_ignore_ascii_case(&self.me) {
+                            "Your".to_string()
+                        } else {
+                            format!("{}'s", post.author)
+                        };
+                        format!("{owner} post from {}", self.when(post.ts_ms))
+                    }
+                    None => "It".to_string(),
+                };
                 (
                     ConfirmDialog {
                         title: "Delete this post?".to_string(),
-                        message: "It disappears on every device.".to_string(),
+                        message: format!("{whose} disappears on every device."),
                         action: "delete".to_string(),
                     },
                     Cmd::DeletePost(id),
@@ -477,6 +490,16 @@ impl App {
         };
         self.dialog = Some(Dialog::Confirm(dialog));
         self.confirm = Some(cmd);
+    }
+
+    /// `6:07 pm` today, `yesterday, 6:07 pm`, or `Tue Oct 20, 6:07 pm`.
+    fn when(&self, ts_ms: i64) -> String {
+        let clock = clock_12h(ts_ms, &self.tz);
+        match day_label(ts_ms, self.now_ms, &self.tz).as_str() {
+            "Today" => clock,
+            "Yesterday" => format!("yesterday, {clock}"),
+            day => format!("{day}, {clock}"),
+        }
     }
 
     // ------------------------------------------------------------ filter

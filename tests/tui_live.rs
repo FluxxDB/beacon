@@ -365,7 +365,7 @@ async fn attach_save_and_delete_through_the_keys() {
         // Delete: nothing until confirmed.
         tui.press(KeyCode::Char('d'));
         tui.until(Duration::from_secs(2), "the confirmation", |s| {
-            s.contains("Delete this post?") && s.contains("It disappears on every device.")
+            s.contains("Delete this post?") && s.contains("Your post from")
         })
         .await;
         tui.press(KeyCode::Esc);

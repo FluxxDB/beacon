@@ -37,8 +37,8 @@ const BUTTONS_INSET: u16 = 4;
 const NAME_HINT: &str = NAME_RULE;
 /// Files the attach picker lists at once; more scroll.
 const PICKER_ROWS: usize = 8;
-/// Cells of the help's key column.
-const HELP_KEYS: u16 = 15;
+/// Cells of the help's key column: the longest keys and two spaces.
+const HELP_KEYS: u16 = 16;
 
 pub fn render(canvas: &mut Canvas, dialog: &Dialog, app: &App, layout: &Layout) {
     match dialog {

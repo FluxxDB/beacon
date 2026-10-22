@@ -944,7 +944,119 @@ fn day_separator_between_days() {
     let first_post = lines.iter().position(|l| l.contains("6:09 pm")).unwrap();
     let second_post = lines.iter().position(|l| l.contains("6:12 pm")).unwrap();
     assert!(first_post < y && y < second_post);
-    assert!(!lines.iter().any(|l| l.contains("Yesterday")));
+    // Yesterday's post says its day too: its label sits above it.
+    let label = lines
+        .iter()
+        .position(|l| l.contains("── Yesterday ──"))
+        .expect("a label above the first post");
+    assert_eq!(label + 2, first_post, "{}", lines.join("\n"));
+}
+
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+#[test]
+fn a_first_post_from_another_day_is_labelled() {
+    // A channel whose posts are all from yesterday: the times alone would
+    // read as today's.
+    let mut app = mockup_app();
+    app.posts.truncate(3);
+    for post in &mut app.posts {
+        post.ts_ms -= DAY_MS;
+    }
+    let buf = render(&app, TRUECOLOR, 104, 33);
+    let lines = rows(&buf);
+    let labels: Vec<usize> = (0..lines.len())
+        .filter(|&y| lines[y].contains("──") && lines[y].contains("day ──"))
+        .collect();
+    let first = lines.iter().position(|l| l.contains("6:07 pm")).unwrap();
+    assert_eq!(labels.len(), 1, "{}", lines.join("\n"));
+    assert!(lines[labels[0]].contains("── Yesterday ──"));
+    assert_eq!(labels[0] + 2, first, "the label, a blank row, the post");
+
+    // Older than yesterday: the date.
+    for post in &mut app.posts {
+        post.ts_ms -= 2 * DAY_MS;
+    }
+    let lines = rows(&render(&app, TRUECOLOR, 104, 33));
+    assert!(
+        lines.iter().any(|l| l.contains("── Sun Oct 18 ──")),
+        "{}",
+        lines.join("\n")
+    );
+
+    // Scrolling to the top of a full channel reaches the label: it counts
+    // as a row of the history.
+    let mut app = mockup_app();
+    for post in &mut app.posts {
+        post.ts_ms -= DAY_MS;
+    }
+    app.update(beacon::tui::state::Msg::Resize(104, 33));
+    for _ in 0..10 {
+        app.update(beacon::tui::state::Msg::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::PageUp,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ));
+    }
+    let buf = render(&app, TRUECOLOR, 104, 33);
+    // Row 5 is the first row of the posts viewport.
+    assert!(
+        row_text(&buf, 5).contains("── Yesterday ──"),
+        "{}",
+        rows(&buf).join("\n")
+    );
+}
+
+#[test]
+fn too_small_says_the_real_minimum() {
+    let app = mockup_app();
+    // The board is drawn down to its minimum …
+    let buf = render(&app, TRUECOLOR, view::MIN_WIDTH, view::MIN_HEIGHT);
+    assert!(
+        row_text(&buf, 0).contains("◆ beacon"),
+        "{}",
+        rows(&buf).join("\n")
+    );
+    // … and below it the message gives that minimum, and the size it got.
+    for (width, height) in [(view::MIN_WIDTH - 1, 30), (100, view::MIN_HEIGHT - 1)] {
+        let buf = render(&app, TRUECOLOR, width, height);
+        let text = rows(&buf)
+            .iter()
+            .map(|r| r.trim())
+            .filter(|r| !r.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains(&format!(
+                "at least {}×{}",
+                view::MIN_WIDTH,
+                view::MIN_HEIGHT
+            )),
+            "{width}x{height}: {text}"
+        );
+        assert!(
+            text.contains(&format!("{width}×{height}")),
+            "{width}x{height}: {text}"
+        );
+    }
+}
+
+#[test]
+fn the_switcher_cuts_a_long_channel_name_with_an_ellipsis() {
+    let mut app = mockup_app();
+    let long = "a-very-long-channel-name-for-gpu";
+    app.channels.push(channel(long, None, 0));
+    app.selected = Selection::Channel(long.to_string());
+    app.posts.clear();
+    for width in [40u16, 44] {
+        let buf = render(&app, TRUECOLOR, width, 24);
+        let row = row_text(&buf, 1);
+        assert!(row.contains("# a-very-long") && row.contains('…'), "{row}");
+        assert!(row.contains("… ›"), "the closing arrow stays: {row}");
+    }
+    let row = row_text(&render(&app, TRUECOLOR, 60, 24), 1);
+    assert!(row.contains(&format!("‹ # {long} ›")), "{row}");
 }
 
 #[test]
@@ -1435,7 +1547,7 @@ mod behaviour {
         let buf = screen(&app);
         let text = rows(&buf).join("\n");
         assert!(text.contains("Delete this post?"), "{text}");
-        assert!(text.contains("It disappears on every device."));
+        assert!(text.contains("mac-juicebox's post from 5:02 pm"), "{text}");
         assert!(text.contains("esc cancel   ↵ delete"));
         let y = row_of(&buf, "↵ delete");
         let x = column_of(&buf, y, "↵ delete").unwrap();
@@ -1594,6 +1706,11 @@ mod behaviour {
             assert!(text.contains(keys), "{keys} missing:\n{text}");
             assert!(text.contains(what), "{what} missing:\n{text}");
         }
+        // The longest keys keep two spaces before what they do.
+        assert!(
+            text.contains("tab  shift-tab  channels, posts, composer"),
+            "{text}"
+        );
         assert!(lime_cells(&screen(&app)).len() <= 1, "no primary action");
         // At 80×24 it still fits.
         let buf = render(&app, TRUECOLOR, 80, 24);
@@ -2391,5 +2508,323 @@ mod behaviour {
                 arrival: 302
             }]
         );
+    }
+
+    // ------------------------------------------------------ polish (Task 14)
+
+    fn beacon_posts(range: std::ops::Range<u32>) -> Vec<PostJson> {
+        range
+            .map(|n| api_post(n, "beacon", "pc-configs", &format!("post {n}")))
+            .collect()
+    }
+
+    fn ask_before(n: u32) -> Cmd {
+        Cmd::LoadPosts {
+            channel: "beacon".to_string(),
+            before: Some((ts_of(n), ulid(n))),
+        }
+    }
+
+    fn reconnect(app: &mut App) {
+        app.update(Msg::Connection(Conn::Down {
+            since_ms: at(18, 41),
+        }));
+        app.update(Msg::Connection(Conn::Up));
+    }
+
+    #[test]
+    fn a_reconnect_reload_never_leaves_paging_stuck() {
+        let mut app = full_page_app();
+        reconnect(&mut app);
+        // Paging up before the fresh page lands asks from the old cursor.
+        assert_eq!(page_to_top(&mut app), [ask_before(100)]);
+        // The fresh page starts later (posts came in while the feed was down),
+        // so the page from the old cursor no longer fits, and is dropped.
+        app.update(Msg::Loaded(page(beacon_posts(150..150 + PAGE))));
+        app.update(older_page((ts_of(100), ulid(100)), 0..PAGE));
+        assert_eq!(app.posts.len(), PAGE as usize);
+        assert_eq!(app.posts[0].body, "post 150");
+        // Paging still works, from the fresh page's oldest post.
+        assert_eq!(page_to_top(&mut app), [ask_before(150)]);
+    }
+
+    #[test]
+    fn an_older_page_asked_for_during_a_reload_lands_if_it_still_fits() {
+        let mut app = full_page_app();
+        reconnect(&mut app);
+        assert_eq!(page_to_top(&mut app), [ask_before(100)]);
+        // Nothing new came in: the fresh page starts where the old one did,
+        // so the older page on its way still fits and is not asked twice.
+        app.update(Msg::Loaded(page(beacon_posts(100..100 + PAGE))));
+        assert!(page_to_top(&mut app).is_empty());
+        app.update(older_page((ts_of(100), ulid(100)), 0..PAGE));
+        assert_eq!(app.posts.len(), 2 * PAGE as usize);
+        assert_eq!(page_to_top(&mut app), [ask_before(0)]);
+    }
+
+    #[test]
+    fn a_late_post_while_an_older_page_loads_shows_when_it_lands() {
+        let mut app = full_page_app();
+        assert_eq!(page_to_top(&mut app), [ask_before(100)]);
+        // Written offline, synced now: it belongs among the posts that page
+        // brings, but the node may have read that page before it arrived.
+        let mut late = api_post(500, "beacon", "pc-vllm", "written offline");
+        late.ts_ms = ts_of(60) + 30_000;
+        app.update(Msg::Stream(StreamEvent::Post(late)));
+        let mut gone = api_post(501, "beacon", "pc-vllm", "deleted meanwhile");
+        gone.ts_ms = ts_of(70) + 30_000;
+        app.update(Msg::Stream(StreamEvent::Post(gone)));
+        app.update(Msg::Stream(StreamEvent::PostDeleted { id: ulid(501) }));
+        assert!(
+            app.posts.iter().all(|p| p.id != ulid(500)),
+            "not before its page"
+        );
+
+        // The page lands without it (the rest of the channel, 50 to 99).
+        app.update(older_page((ts_of(100), ulid(100)), 50..100));
+        let at = app
+            .posts
+            .iter()
+            .position(|p| p.id == ulid(500))
+            .expect("shown once its page is in");
+        assert_eq!(app.posts[at - 1].id, ulid(60));
+        assert_eq!(app.posts[at + 1].id, ulid(61));
+        assert!(
+            app.posts.iter().all(|p| p.id != ulid(501)),
+            "deleted stays gone"
+        );
+        assert_eq!(
+            app.extras.get(&ulid(500)).map(|e| e.arrival),
+            Some(500),
+            "with its arrival, to mark read by"
+        );
+
+        // One older than the page brings waits for the next page, which is
+        // asked for from the page's own oldest post.
+        let mut app = full_page_app();
+        page_to_top(&mut app);
+        let mut early = api_post(502, "beacon", "pc-vllm", "older still");
+        early.ts_ms = ts_of(0) - 60_000;
+        app.update(Msg::Stream(StreamEvent::Post(early)));
+        app.update(older_page((ts_of(100), ulid(100)), 0..PAGE));
+        assert!(app.posts.iter().all(|p| p.id != ulid(502)));
+        assert_eq!(page_to_top(&mut app), [ask_before(0)]);
+    }
+
+    #[test]
+    fn clearing_the_filter_marks_what_it_hid_as_read() {
+        for keep in [true, false] {
+            let mut app = live_app();
+            app.focus = Focus::Posts;
+            app.update(ch('/'));
+            type_text(&mut app, "@pc-configs");
+            if keep {
+                app.update(key(KeyCode::Enter));
+            }
+            // A post the filter hides has not been seen.
+            let cmds = app.update(Msg::Stream(StreamEvent::Post(api_post(
+                3,
+                "general",
+                "mac-juicebox",
+                "hidden by the filter",
+            ))));
+            assert!(mark_reads(&cmds).is_empty(), "{cmds:?}");
+            assert_eq!(unread_of(&app, "general"), 1);
+            // Esc clears the filter: at the bottom, the post is on screen now.
+            let cmds = app.update(key(KeyCode::Esc));
+            assert_eq!(app.filter, None);
+            assert_eq!(
+                mark_reads(&cmds),
+                [Cmd::MarkRead {
+                    channel: "general".to_string(),
+                    arrival: 3
+                }],
+                "keep: {keep}"
+            );
+            assert_eq!(unread_of(&app, "general"), 0);
+        }
+    }
+
+    #[test]
+    fn back_at_the_bottom_by_resize_or_delete_marks_read() {
+        let general = |arrival| Cmd::MarkRead {
+            channel: "general".to_string(),
+            arrival,
+        };
+        let mut app = live_app();
+        // Three rows of posts: the two posts need five.
+        app.update(Msg::Resize(W, 16));
+        app.update(key(KeyCode::PageUp));
+        assert!(app.scroll > 0);
+        let cmds = app.update(Msg::Stream(StreamEvent::Post(api_post(
+            3,
+            "general",
+            "pc-vllm",
+            "while scrolled up",
+        ))));
+        assert!(mark_reads(&cmds).is_empty());
+        assert_eq!(unread_of(&app, "general"), 1);
+        // A taller terminal fits every post: back at the bottom, it is seen.
+        let cmds = app.update(Msg::Resize(W, H));
+        assert_eq!(app.scroll, 0);
+        assert_eq!(mark_reads(&cmds), [general(3)]);
+        assert_eq!(unread_of(&app, "general"), 0);
+
+        // The same when deletions bring the view back down.
+        app.update(Msg::Resize(W, 16));
+        app.update(key(KeyCode::PageUp));
+        app.update(Msg::Stream(StreamEvent::Post(api_post(
+            4, "general", "pc-vllm", "again",
+        ))));
+        assert_eq!(unread_of(&app, "general"), 1);
+        let cmds = feed(
+            &mut app,
+            [1, 2, 3].map(|n| Msg::Stream(StreamEvent::PostDeleted { id: ulid(n) })),
+        );
+        assert_eq!(app.scroll, 0);
+        assert_eq!(mark_reads(&cmds), [general(4)]);
+        assert_eq!(unread_of(&app, "general"), 0);
+    }
+
+    #[test]
+    fn failures_are_coral_and_notices_are_not() {
+        let toast_ink = |app: &App, needle: &str| {
+            let buf = screen(app);
+            let y = row_of(&buf, needle);
+            let x = column_of(&buf, y, needle).unwrap();
+            buf[(x, y)].fg
+        };
+        let mut app = live_app();
+        app.update(Msg::Saved(Ok("report.txt".to_string())));
+        assert_eq!(
+            toast_ink(&app, "saved to ./exchange/report.txt"),
+            rgb(palette::MIST)
+        );
+        app.update(Msg::Saved(Err("not synced to this device yet".to_string())));
+        assert_eq!(
+            toast_ink(&app, "Not saved: not synced"),
+            rgb(palette::CORAL)
+        );
+        app.update(Msg::Sent(Err("cannot reach the node".to_string())));
+        assert_eq!(
+            toast_ink(&app, "Not sent: cannot reach"),
+            rgb(palette::CORAL)
+        );
+        // Waiting on the node is no failure, however long the notice stays.
+        let mut app = live_app();
+        let mut with_file = api_post(3, "general", "pc-vllm", "the report");
+        with_file.attachment = Some(AttachmentJson {
+            name: "report.txt".to_string(),
+            size: 9,
+            sha256: "ab".repeat(32),
+            available: true,
+        });
+        app.update(Msg::Stream(StreamEvent::Post(with_file)));
+        feed(&mut app, [key(KeyCode::Tab), key(KeyCode::Tab)]);
+        assert_eq!(app.selected_post.as_deref(), Some(ulid(3).as_str()));
+        assert_eq!(app.update(ch('s')).len(), 1);
+        assert_eq!(toast_ink(&app, "saving report.txt…"), rgb(palette::MIST));
+    }
+
+    #[test]
+    fn the_delete_confirmation_names_the_post() {
+        let mut app = live_app();
+        feed(&mut app, [key(KeyCode::Tab), key(KeyCode::Tab)]);
+        app.update(ch('d'));
+        let Some(Dialog::Confirm(confirm)) = &app.dialog else {
+            panic!("{:?}", app.dialog)
+        };
+        assert_eq!(confirm.title, "Delete this post?");
+        assert_eq!(
+            confirm.message,
+            "mac-juicebox's post from 5:02 pm disappears on every device."
+        );
+        assert!(screen_text(&app).contains("mac-juicebox's post from 5:02 pm"));
+
+        // Dang's own, from another day.
+        let mut app = live_app();
+        let mut mine = api_post(3, "general", "Dang", "an old note");
+        mine.ts_ms -= 24 * 60 * 60 * 1000;
+        app.update(Msg::Stream(StreamEvent::Post(mine)));
+        app.focus = Focus::Posts;
+        app.selected_post = Some(ulid(1));
+        app.update(ch('k'));
+        assert_eq!(app.selected_post.as_deref(), Some(ulid(3).as_str()));
+        app.update(ch('d'));
+        let Some(Dialog::Confirm(confirm)) = &app.dialog else {
+            panic!("{:?}", app.dialog)
+        };
+        assert_eq!(
+            confirm.message,
+            "Your post from yesterday, 5:03 pm disappears on every device."
+        );
+    }
+
+    #[test]
+    fn the_focused_sidebar_says_which_keys_move_in_it() {
+        let mut app = live_app();
+        let channels_row = |app: &App| {
+            let buf = screen(app);
+            let y = row_of(&buf, "CHANNELS");
+            region_text(&buf, y, 0, 26)
+        };
+        assert!(
+            !channels_row(&app).contains("j k"),
+            "{}",
+            channels_row(&app)
+        );
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Sidebar);
+        let row = channels_row(&app);
+        assert!(row.contains("CHANNELS") && row.contains("j k"), "{row}");
+        let buf = screen(&app);
+        let y = row_of(&buf, "CHANNELS");
+        let x = column_of(&buf, y, "j k").unwrap();
+        assert_eq!(
+            buf[(x, y)].fg,
+            rgb(palette::FOG),
+            "like the n of + new channel"
+        );
+    }
+
+    #[test]
+    fn attaching_from_announcements_says_how_to_pick_a_channel() {
+        let mut app = live_app();
+        app.focus = Focus::Sidebar;
+        app.update(ch('k'));
+        assert_eq!(app.selected, Selection::Announcements);
+        assert!(app.update(ch('a')).is_empty());
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("Pick a channel to attach a file to: tab to the channels, then j/k")
+        );
+    }
+
+    #[test]
+    fn a_page_that_failed_to_load_is_not_an_empty_channel() {
+        let mut app = live_app();
+        app.focus = Focus::Sidebar;
+        app.update(ch('j'));
+        app.update(Msg::Loaded(Loaded::Posts {
+            view: beacon_view(),
+            before: None,
+            page: Err("lost the connection to http://127.0.0.1:7700 (timed out)".to_string()),
+        }));
+        let text = pane_text(&screen(&app));
+        assert!(!text.contains("Nothing in #beacon yet"), "{text}");
+        assert!(
+            text.contains(
+                "Couldn't load #beacon. Switch to another channel and back to try again."
+            ),
+            "{text}"
+        );
+        assert!(app.toast_error);
+        // Back again: it loads.
+        app.update(ch('k'));
+        app.update(ch('j'));
+        app.update(Msg::Loaded(page(beacon_posts(1..3))));
+        let text = pane_text(&screen(&app));
+        assert!(!text.contains("Couldn't load"), "{text}");
+        assert!(text.contains("post 2"), "{text}");
     }
 }

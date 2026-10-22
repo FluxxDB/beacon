@@ -36,6 +36,9 @@ pub const MIN_WIDTH: u16 = 40;
 const ROWS_ABOVE_POSTS: u16 = 5;
 /// Rows below the composer: blank, separator, help, bottom border.
 const ROWS_BELOW_COMPOSER: u16 = 4;
+/// Shortest terminal the board is drawn in at all: one row of posts, the
+/// notice row and a one-line composer between the fixed rows.
+pub const MIN_HEIGHT: u16 = ROWS_ABOVE_POSTS + 1 + 1 + 3 + ROWS_BELOW_COMPOSER;
 
 /// Where everything goes, for one terminal size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +66,7 @@ impl Layout {
     /// The layout for `area`, or `None` when it is too small to draw the board.
     pub fn compute(area: Rect, app: &App) -> Option<Layout> {
         let (w, h) = (area.width, area.height);
-        if w < MIN_WIDTH {
+        if w < MIN_WIDTH || h < MIN_HEIGHT {
             return None;
         }
         let sidebar_w = match w {
@@ -178,12 +181,15 @@ fn frame(canvas: &mut Canvas, layout: &Layout) {
     }
 }
 
-/// Shown instead of the board when the terminal is too small for it.
+/// Shown instead of the board when the terminal is too small for it: how
+/// big it is, and how big it has to be.
 fn too_small(canvas: &mut Canvas, area: Rect) {
-    let lines = wrap(
-        "Too small for beacon: resize the terminal to at least 80×24.",
-        area.width.saturating_sub(2),
+    // Two short lines, each whole in anything narrower than the minimum.
+    let message = format!(
+        "Too small for beacon: {}×{}.\nResize to at least {MIN_WIDTH}×{MIN_HEIGHT}.",
+        area.width, area.height
     );
+    let lines = wrap(&message, area.width.saturating_sub(2));
     let top = area.height.saturating_sub(lines.len() as u16) / 2;
     let ink = Ink::new(role::META, role::MAIN_BG);
     for (line, y) in lines.iter().zip(area.y + top..area.bottom()) {

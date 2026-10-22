@@ -1,5 +1,5 @@
 //! The help row under the board: keys in mist, what they do in ash, and a
-//! toast on the right when there is one.
+//! toast on the right when there is one (in coral when it reports a failure).
 
 use crate::tui::state::App;
 use crate::tui::theme::{role, Ink};
@@ -31,10 +31,13 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
 
     // A toast takes the right end; keys that would run into it are left out.
     // While the filter is being typed, the keys for it take that place.
-    let toast = if app.filter_editing {
-        Some(FILTER_HINT)
+    // A failure is coral.
+    let (toast, ink) = if app.filter_editing {
+        (Some(FILTER_HINT), key)
+    } else if app.toast_error {
+        (app.toast.as_deref(), Ink::new(role::ERROR, role::MAIN_BG))
     } else {
-        app.toast.as_deref()
+        (app.toast.as_deref(), key)
     };
     let mut keys_end = right;
     if let Some(toast) = toast.filter(|t| !t.is_empty()) {
@@ -42,7 +45,7 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
         let room = end.saturating_sub(left + 2);
         let toast = truncate(toast, room);
         let start = end - display_width(&toast);
-        canvas.text(start, y, &toast, key, end);
+        canvas.text(start, y, &toast, ink, end);
         keys_end = start.saturating_sub(2);
     }
 

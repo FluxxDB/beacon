@@ -1,6 +1,7 @@
 //! The posts viewport: posts bottom-anchored above the composer, one blank
-//! row apart, a centered day separator between days, the announcement and
-//! mention bands, tag badges, attachments, and the empty and server-down states.
+//! row apart, a centered day separator between days (and above the oldest
+//! post when it is not from today), the announcement and mention bands, tag
+//! badges, attachments, and the empty and server-down states.
 //!
 //! Columns of a post, from the pane's left edge:
 //!
@@ -15,7 +16,7 @@ use ratatui::layout::Rect;
 
 use crate::model::{mentions_handle, validate_handle};
 use crate::timefmt::{clock_12h, day_label};
-use crate::tui::state::{App, Conn, Focus, PostItem, Selection};
+use crate::tui::state::{view_name, App, Conn, Focus, PostItem, Selection};
 use crate::tui::theme::{palette, role, Ink, Rgb};
 use crate::tui::view::Layout;
 use crate::tui::widgets::{segs_width, Canvas, Seg};
@@ -117,6 +118,11 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
             }
         }
         lines_rev.extend(post_lines(post, app, area.width).into_iter().rev());
+        // The oldest post says its day when that is not today.
+        if i == 0 && lead_rows(app) > 0 {
+            lines_rev.push(Line::blank());
+            lines_rev.push(day_separator(post.ts_ms, app, area.width));
+        }
         if lines_rev.len() >= wanted {
             break;
         }
@@ -192,6 +198,28 @@ pub fn is_shown(app: &App, post: &PostItem) -> bool {
     active_filter(app).is_none_or(|f| matches_filter(post, f))
 }
 
+/// Whether every post of the view is shown: no filter, or an empty one.
+pub fn shows_all(app: &App) -> bool {
+    active_filter(app).is_none()
+}
+
+/// Rows above the oldest shown post: its day's label and a blank row, when
+/// that day is not today (later days are labelled between posts).
+pub fn lead_rows(app: &App) -> usize {
+    match app.posts.iter().find(|p| is_shown(app, p)) {
+        Some(first) if !same_day(first.ts_ms, app.now_ms, app) => 2,
+        _ => 0,
+    }
+}
+
+/// Rows everything in the pane takes: the posts laid out in `spans` (from
+/// [`spans`] for the same app), and the oldest one's day label.
+pub fn total_rows(app: &App, spans: &[Span]) -> usize {
+    spans
+        .last()
+        .map_or(0, |s| s.bottom + s.height + lead_rows(app))
+}
+
 /// Rows `post` takes in a pane `width` cells wide: header, body, attachment.
 pub fn post_rows(post: &PostItem, app: &App, width: u16) -> usize {
     post_lines(post, app, width).len()
@@ -220,8 +248,8 @@ pub struct Span {
 
 /// The rows each shown post takes in a pane `width` cells wide, newest
 /// first, laid out as [`render`] lays them out (a blank row, and a day
-/// separator when the day changes, between posts). The last span's top is
-/// the height of everything.
+/// separator when the day changes, between posts). [`total_rows`] adds the
+/// oldest post's day label to the last span's top.
 pub fn spans(app: &App, width: u16) -> Vec<Span> {
     let posts = shown(app);
     let mut out = Vec::with_capacity(posts.len());
@@ -251,6 +279,16 @@ fn empty_message(app: &App, no_posts: bool, filter: Option<&str>) -> Option<Stri
     }
     if let Some(f) = filter.filter(|_| !app.posts.is_empty()) {
         return Some(format!("No posts match /{f}. Esc clears the filter."));
+    }
+    if app.load_failed {
+        let other = match app.selected {
+            Selection::Channel(_) => "another channel",
+            Selection::Announcements => "a channel",
+        };
+        return Some(format!(
+            "Couldn't load {}. Switch to {other} and back to try again.",
+            view_name(&app.selected)
+        ));
     }
     Some(match &app.selected {
         Selection::Channel(name) => format!("Nothing in #{name} yet. Say hi below."),

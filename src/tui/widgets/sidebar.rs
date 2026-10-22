@@ -33,10 +33,12 @@ pub fn render(canvas: &mut Canvas, app: &App, rect: Rect) {
     let mut rows: Vec<Option<Row>> = vec![None];
     rows.push(Some(announcements(app)));
     rows.push(None);
-    // The section label brightens while the sidebar has the keys.
+    // While the sidebar has the keys, its section label brightens and says
+    // which keys move in it (as `n` sits beside `+ new channel`).
     let mut channels = label("CHANNELS", None);
     if app.focus == Focus::Sidebar {
         channels.name_ink = panel(role::TEXT);
+        channels.right = Some(("j k".to_string(), panel(role::META)));
     }
     rows.push(Some(channels));
     rows.push(None);
