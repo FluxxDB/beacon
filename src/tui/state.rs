@@ -77,9 +77,9 @@ pub struct App {
     /// by handle; the view on screen stays. Only while the sidebar has the
     /// keys: `None` whenever it does not.
     pub selected_agent: Option<String>,
-    /// `shift-e` hid the sidebar: from 80 columns up the main pane takes its
-    /// place. Below 80 there is no sidebar, and `shift-e` leaves this alone.
-    /// For this session only.
+    /// `shift-e` or `space e` hid the sidebar: from 80 columns up the main
+    /// pane takes its place. Below 80 there is no sidebar, and neither key
+    /// touches this. For this session only.
     pub hide_sidebar: bool,
     /// Sync peers, for the header.
     pub peers: Vec<PeerItem>,
@@ -104,6 +104,11 @@ pub struct App {
     /// One `Esc` in a composer with text arms a clear, and the next one
     /// empties it; any other key disarms it.
     pub clear_armed: bool,
+    /// `space` in the posts or the sidebar started a chord (Dang, XNPVKNHP):
+    /// the next key finishes it (`e` shows or hides the sidebar), `Esc`
+    /// drops it, and any other key drops it and does what it always does.
+    /// A paste, a resize or the focus moving drops it too.
+    pub leader: bool,
     /// What the keys did to the `@handle` being typed (its ghost).
     pub mention: Option<Mention>,
     pub focus: Focus,
@@ -119,7 +124,8 @@ pub struct App {
     pub toast_error: bool,
 
     // ------------------------------------------- remembered between frames
-    /// When the toast goes away (epoch ms); `None` keeps it up.
+    /// When the toast goes away (epoch ms); `None` keeps it up. Pushed back
+    /// while the leader's hint covers the toast.
     pub toast_until_ms: Option<i64>,
     /// The terminal's size, for paging and keeping the selected post in view.
     pub size: (u16, u16),
@@ -189,6 +195,7 @@ impl App {
             cursor_goal: None,
             composer_top: 0,
             clear_armed: false,
+            leader: false,
             mention: None,
             focus: Focus::Composer,
             dialog: None,
@@ -543,7 +550,12 @@ impl App {
         let scrolled = self.scroll > 0;
         let filtered = !posts::shows_all(self);
         let agent_at = self.selected_agent_index();
+        let focus = self.focus;
         let mut cmds = self.apply(msg);
+        // A chord `space` started belongs to the pane it started in.
+        if self.focus != focus {
+            self.leader = false;
+        }
         self.sync_mention();
         self.keep_cursor_in_view();
         self.keep_agent_cursor(agent_at);
@@ -563,6 +575,7 @@ impl App {
             Msg::Paste(text) => self.on_paste(&text),
             Msg::Resize(width, height) => {
                 self.size = (width, height);
+                self.leader = false;
                 self.clamp_scroll();
                 self.leave_hidden_sidebar();
                 Vec::new()
@@ -655,8 +668,15 @@ impl App {
     // -------------------------------------------------------------- time
 
     fn on_tick(&mut self, now_ms: i64) -> Vec<Cmd> {
+        let elapsed = now_ms.saturating_sub(self.now_ms);
         self.now_ms = now_ms;
-        if self.toast_until_ms.is_some_and(|until| now_ms >= until) {
+        if self.leader {
+            // The leader's hint covers the toast: its time doesn't run
+            // until it shows again.
+            if let Some(until) = &mut self.toast_until_ms {
+                *until = until.saturating_add(elapsed);
+            }
+        } else if self.toast_until_ms.is_some_and(|until| now_ms >= until) {
             self.toast = None;
             self.toast_error = false;
             self.toast_until_ms = None;

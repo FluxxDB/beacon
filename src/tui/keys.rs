@@ -18,12 +18,22 @@
 //! * **Sidebar and posts:** `j`/`k` and the arrows move (in the sidebar that
 //!   opens the channel; past the last channel the cursor goes on through the
 //!   agent rows, where `d` forgets one), `n` `a` `s` `d` `E` `/` `?` `q` are
-//!   commands, and any other printable key jumps to the composer and types
-//!   itself.
-//! * **`E` (shift-e)** is the only way into the sidebar: from the posts it
-//!   goes there, showing it first if it is hidden; from the sidebar it hides
-//!   it and goes to the composer. Below 80 columns it goes to the switcher
-//!   row (which stands in for the sidebar) and back, hiding nothing.
+//!   commands, `space` starts a chord, and any other printable key jumps to
+//!   the composer and types itself.
+//! * **`space` is a leader** there (Dang, XNPVKNHP): it types nothing and
+//!   the footer says `e sidebar · esc cancel` until the next key. `e` (or
+//!   `E`) shows or hides the sidebar: from the posts, a hidden one is shown
+//!   and takes the keys, a shown one is hidden and the keys stay; from the
+//!   sidebar, it is hidden and the composer takes the keys. `Esc` only
+//!   cancels; any other key cancels and does what it does without the space
+//!   (`space x` types `x` in the composer). A paste, a resize or the focus
+//!   moving cancels it too. In the composer, a dialog or the `/` filter,
+//!   `space` never starts the chord and does what it always did there.
+//! * **`E` (shift-e)** is how you get into a shown sidebar: from the posts
+//!   it goes there, showing it first if it is hidden; from the sidebar it
+//!   hides it and goes to the composer. Below 80 columns `E` and `space e`
+//!   both go to the switcher row (which stands in for the sidebar) and back,
+//!   hiding nothing.
 //! * Anywhere: `Tab`/`Shift-Tab` move between the posts and the composer,
 //!   never into the sidebar (from it, `Tab` goes to the composer and
 //!   `Shift-Tab` to the posts), `PgUp`/`PgDn` scroll the posts, `Esc` clears
@@ -49,10 +59,11 @@ use crate::tui::widgets::posts::{self, Span};
 /// What every key in the help overlay does, in its order.
 /// Each description fits the dialog at 80 columns, and the whole list fits
 /// the board at 80×24 (the dialog is six rows more than the list): `?` is
-/// left out, since the footer always shows it.
+/// left out, since the footer always shows it, and `space e` shares a row
+/// with `shift-e`.
 pub const HELP: [(&str, &str); 14] = [
     ("tab  shift-tab", "posts, composer"),
-    ("shift-e", "go to or hide the sidebar"),
+    ("space e", "sidebar on/off; shift-e: go in"),
     ("j k  ↓ ↑", "pick a channel or a post"),
     ("enter", "send, or write in the channel"),
     ("shift-enter", "new line (or alt-enter, ctrl-j)"),
@@ -80,6 +91,8 @@ impl App {
         }
         // Any key but a second `Esc` in the composer disarms its clear.
         let armed = std::mem::take(&mut self.clear_armed);
+        // Any key ends the chord `space` started.
+        let leader = std::mem::take(&mut self.leader);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && matches!(key.code, KeyCode::Char('c' | 'C')) {
             return vec![Cmd::Quit];
@@ -89,6 +102,20 @@ impl App {
         }
         if self.filter_editing {
             self.filter_key(&key);
+            return Vec::new();
+        }
+        if leader {
+            if key.code == KeyCode::Esc {
+                return Vec::new();
+            }
+            if matches!(printable(&key), Some('e' | 'E')) {
+                self.leader_sidebar();
+                return Vec::new();
+            }
+            // Any other key does what it does without the space.
+        }
+        if self.focus != Focus::Composer && printable(&key) == Some(' ') {
+            self.leader = true;
             return Vec::new();
         }
         if self.ghost_key(&key) {
@@ -121,6 +148,7 @@ impl App {
     /// with newlines never sends.
     pub(crate) fn on_paste(&mut self, text: &str) -> Vec<Cmd> {
         self.clear_armed = false;
+        self.leader = false;
         match &mut self.dialog {
             Some(Dialog::NewChannel(form)) => {
                 for c in text.chars() {
@@ -467,8 +495,9 @@ impl App {
     }
 
     /// `Tab` and `Shift-Tab`: between the posts and the composer, never into
-    /// the sidebar (only `shift-e` goes there). From the sidebar, `Tab` goes
-    /// on to the composer and `Shift-Tab` back to the posts.
+    /// the sidebar (`shift-e` goes there, and so does `space e` when it
+    /// shows it). From the sidebar, `Tab` goes on to the composer and
+    /// `Shift-Tab` back to the posts.
     fn cycle_focus(&mut self, forward: bool) {
         self.focus = match (self.focus, forward) {
             (Focus::Posts, _) | (Focus::Sidebar, true) => Focus::Composer,
@@ -496,6 +525,22 @@ impl App {
         }
         self.hide_sidebar = leave;
         self.refit();
+    }
+
+    /// `space e` in the posts or the sidebar: shows or hides the sidebar.
+    /// From the posts, a hidden one is shown and takes the keys (opening it
+    /// goes there, 4EGGVSTT) and a shown one is hidden, the keys staying in
+    /// the posts; from the sidebar it is hidden and the composer takes the
+    /// keys, as with `shift-e`. Below 80 columns there is nothing to show or
+    /// hide, and it is `shift-e`: to the switcher and back to the composer.
+    fn leader_sidebar(&mut self) {
+        let shown = !self.hide_sidebar && self.size.0 >= SIDEBAR_MIN_WIDTH;
+        if self.focus == Focus::Posts && shown {
+            self.hide_sidebar = true;
+            self.refit();
+        } else {
+            self.toggle_sidebar();
+        }
     }
 
     /// After a resize: the keys can't stay on a sidebar that is hidden at the

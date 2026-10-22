@@ -21,6 +21,8 @@ const PAD: &str = "  ";
 const GAP: &str = "   ";
 /// Shown while `/` is being typed.
 pub const FILTER_HINT: &str = "a tag or @handle · enter keep · esc clear";
+/// Shown while `space` waits for the rest of its chord.
+pub const LEADER_HINT: &str = "e sidebar · esc cancel";
 
 pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
     let area = layout.area;
@@ -30,10 +32,12 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
     let word = Ink::new(role::QUIET, role::MAIN_BG);
 
     // A toast takes the right end; keys that would run into it are left out.
-    // While the filter is being typed, the keys for it take that place.
-    // A failure is coral.
+    // While the filter is being typed, the keys for it take that place, and
+    // so do the keys that finish a chord `space` started. A failure is coral.
     let (toast, ink) = if app.filter_editing {
         (Some(FILTER_HINT), key)
+    } else if app.leader {
+        (Some(LEADER_HINT), key)
     } else if app.toast_error {
         (app.toast.as_deref(), Ink::new(role::ERROR, role::MAIN_BG))
     } else {
