@@ -304,59 +304,63 @@ impl Store {
     /// events above the gap again, which this node already holds. So a
     /// non-empty [`Store::events_after`] does not mean the caller lacks
     /// anything: two nodes missing the same event re-send each other what lies
-    /// above it for as long as the gap lasts. To fetch only what is new, pass
-    /// the responder's last arrival seen to [`Store::events_after_since`].
+    /// above it for as long as the gap lasts. A server deciding whether
+    /// anything is new (say, whether a long-poll should wait) compares the
+    /// arrivals of the selected events with the caller's last-seen head; it
+    /// never filters what it sends by that head.
     pub fn version_vector(&self) -> VersionVector {
         self.vv.clone()
     }
 
-    /// Events of every origin with `seq > have[origin]` (0 when absent): at
-    /// most `limit`, taking each origin's lowest seqs first, ordered by
-    /// arrival. As long as `limit` is at least the number of origins, every
-    /// origin's next missing event is included, so paging always makes
-    /// progress. See [`Store::version_vector`]: a non-empty result does not
-    /// mean the caller lacks anything.
+    /// Events of every origin with `seq > have[origin]` (0 when absent),
+    /// ordered by arrival: each origin's lowest seqs first, up to `limit`
+    /// events, but never fewer than one per origin that has any, so every
+    /// origin's next missing event is in each page and paging always makes
+    /// progress (the result can exceed `limit` when more origins than that
+    /// have events to send). A caller with a gap may be re-sent events it
+    /// already holds; see [`Store::version_vector`].
     pub fn events_after(&self, have: &VersionVector, limit: usize) -> Result<Vec<Event>> {
-        let applied = self.events_after_since(have, 0, limit)?;
+        let applied = self.events_after_applied(have, limit)?;
         Ok(applied.into_iter().map(|a| a.event).collect())
     }
 
-    /// [`Store::events_after`] limited to events that arrived after `since`,
-    /// with their arrivals, so a caller can page through a responder's log
-    /// and skip what it was already sent.
-    pub fn events_after_since(
-        &self,
-        have: &VersionVector,
-        since: i64,
-        limit: usize,
-    ) -> Result<Vec<Applied>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT arrival, json FROM events WHERE origin = ?1 AND seq > ?2 AND arrival > ?3
-             ORDER BY seq LIMIT ?4",
+    /// [`Store::events_after`] with each event's local arrival.
+    pub fn events_after_applied(&self, have: &VersionVector, limit: usize) -> Result<Vec<Applied>> {
+        // Pick by (origin, seq) on the index first; read the JSON only for
+        // the events kept.
+        let per_origin = sql_limit(limit.max(1));
+        let mut select = self.conn.prepare_cached(
+            "SELECT arrival FROM events WHERE origin = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
         )?;
-        // (rank within its origin by seq, arrival, json)
-        let mut found: Vec<(usize, i64, String)> = Vec::new();
+        // (rank within its origin by seq, arrival)
+        let mut picked: Vec<(usize, i64)> = Vec::new();
+        let mut origins = 0;
         for origin in self.vv.keys() {
             let after = have.get(origin).copied().unwrap_or(0);
             let after = i64::try_from(after).unwrap_or(i64::MAX);
-            let rows = stmt.query_map(params![origin, after, since, sql_limit(limit)], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?;
-            for (rank, row) in rows.enumerate() {
-                let (arrival, json) = row?;
-                found.push((rank, arrival, json));
+            let before = picked.len();
+            let rows = select.query_map(params![origin, after, per_origin], |r| r.get(0))?;
+            for (rank, arrival) in rows.enumerate() {
+                picked.push((rank, arrival?));
             }
+            origins += usize::from(picked.len() > before);
         }
-        if found.len() > limit {
+        let keep = limit.max(origins);
+        if picked.len() > keep {
             // Cut by rank, not arrival: an origin's lowest missing seq may
             // have arrived here after many later ones.
-            found.sort_unstable_by_key(|&(rank, arrival, _)| (rank, arrival));
-            found.truncate(limit);
+            picked.sort_unstable_by_key(|&(rank, arrival)| (rank, arrival));
+            picked.truncate(keep);
         }
-        found.sort_unstable_by_key(|&(_, arrival, _)| arrival);
-        found
+        picked.sort_unstable_by_key(|&(_, arrival)| arrival);
+
+        let mut fetch = self
+            .conn
+            .prepare_cached("SELECT json FROM events WHERE arrival = ?1")?;
+        picked
             .into_iter()
-            .map(|(_, arrival, json)| {
+            .map(|(_, arrival)| {
+                let json: String = fetch.query_row([arrival], |r| r.get(0))?;
                 Ok(Applied {
                     event: parse_event(&json)?,
                     arrival,

@@ -440,13 +440,16 @@ fn events_after_relays_all_origins() {
     assert_eq!(events.len(), 4, "both nodes' general and post");
 
     // Nothing is resent to a caller that has everything; a limit below the
-    // number of origins keeps the oldest arrival among their first events.
+    // number of origins still sends each origin's first event, by arrival.
     assert!(a.events_after(&a.version_vector(), 100).unwrap().is_empty());
-    let pc_general = a.events_since_arrival(0, 1).unwrap().remove(0).event;
-    assert_eq!(
-        a.events_after(&VersionVector::new(), 1).unwrap(),
-        vec![pc_general]
-    );
+    let firsts: Vec<(String, u64)> = a
+        .events_after(&VersionVector::new(), 1)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.origin, e.seq))
+        .collect();
+    let expected = vec![(a.origin().to_string(), 1), (b.origin().to_string(), 1)];
+    assert_eq!(firsts, expected);
 }
 
 #[test]
@@ -640,24 +643,79 @@ fn gap_filler_beyond_limit_converges() {
 }
 
 #[test]
-fn events_after_since_skips_what_arrived_before() {
+fn events_after_applied_carries_arrivals() {
     let (mut a, _) = pair();
-    let head = a.arrival_head();
     post(&mut a, "pc", "general", "one", 10);
     post(&mut a, "pc", "general", "two", 20);
-
-    let all = a.events_after_since(&VersionVector::new(), 0, 10).unwrap();
-    let since = a
-        .events_after_since(&VersionVector::new(), head, 10)
-        .unwrap();
-    assert_eq!(all.len(), 3);
-    assert_eq!(since, all[1..].to_vec());
-    assert_eq!(
-        since.iter().map(|x| x.arrival).collect::<Vec<_>>(),
-        vec![head + 1, head + 2]
-    );
-    let events: Vec<Event> = all.into_iter().map(|x| x.event).collect();
+    let applied = a.events_after_applied(&VersionVector::new(), 10).unwrap();
+    assert_eq!(applied.len(), 3);
+    assert_eq!(applied, a.events_since_arrival(0, 10).unwrap());
+    let events: Vec<Event> = applied.into_iter().map(|x| x.event).collect();
     assert_eq!(a.events_after(&VersionVector::new(), 10).unwrap(), events);
+}
+
+#[test]
+fn fresh_receiver_pages_through_origins_received_in_bulk() {
+    // The reviewer's scenario: the relay received pc:1..10, then mac:1..10.
+    let mut pc = Store::open_in_memory("pc").unwrap();
+    let mut mac = Store::open_in_memory("mac").unwrap();
+    for i in 0..9 {
+        post(&mut pc, "pc", "general", &format!("pc {i}"), 10 + i);
+        post(&mut mac, "mac", "general", &format!("mac {i}"), 10 + i);
+    }
+    let mut relay = Store::open_in_memory("relay").unwrap();
+    for source in [&pc, &mac] {
+        for ev in source.events_after(&VersionVector::new(), 100).unwrap() {
+            relay.apply(&ev).unwrap();
+        }
+    }
+    assert_eq!(relay.arrival_head(), 21);
+
+    // 21 events, 4 a page, nothing re-sent: 6 pages.
+    let mut receiver = Store::open_in_memory("receiver").unwrap();
+    for _page in 0..6 {
+        for ev in relay.events_after(&receiver.version_vector(), 4).unwrap() {
+            assert!(receiver.apply(&ev).unwrap().is_some(), "re-sent {ev:?}");
+        }
+    }
+    for origin in [pc.origin(), mac.origin(), relay.origin()] {
+        assert_eq!(
+            receiver.version_vector()[origin],
+            relay.version_vector()[origin]
+        );
+    }
+    assert_eq!(receiver.version_vector()[pc.origin()], 10);
+    assert_eq!(receiver.version_vector()[mac.origin()], 10);
+}
+
+#[test]
+fn limit_below_origin_count_still_reaches_every_origin() {
+    // x:1 is missing on both relay and receiver, so x:2 is re-sent on every
+    // page; with limit 1 it must not crowd out y, which arrived after it.
+    let mut x = Store::open_in_memory("x").unwrap();
+    post(&mut x, "x", "general", "x two", 10);
+    let xs = x.events_after(&VersionVector::new(), 10).unwrap();
+    let mut y = Store::open_in_memory("y").unwrap();
+    post(&mut y, "y", "general", "y two", 20);
+    post(&mut y, "y", "general", "y three", 30);
+
+    let mut relay = Store::open_in_memory("relay").unwrap();
+    let mut receiver = Store::open_in_memory("receiver").unwrap();
+    relay.apply(&xs[1]).unwrap();
+    receiver.apply(&xs[1]).unwrap();
+    for ev in y.events_after(&VersionVector::new(), 10).unwrap() {
+        relay.apply(&ev).unwrap();
+    }
+
+    for _page in 0..10 {
+        let page = relay.events_after(&receiver.version_vector(), 1).unwrap();
+        for ev in page {
+            receiver.apply(&ev).unwrap();
+        }
+    }
+    assert_eq!(receiver.version_vector()[y.origin()], 3);
+    assert_eq!(receiver.version_vector()[relay.origin()], 1);
+    assert_eq!(receiver.version_vector()[x.origin()], 0);
 }
 
 #[test]
