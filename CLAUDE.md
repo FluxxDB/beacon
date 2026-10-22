@@ -39,7 +39,8 @@ For changes, keep that bar: TDD, a review per change, `cargo test`, `cargo clipp
   and there is no outbound route to other tailnet devices except tailscaled's SOCKS5 proxy
   (see the spec's "Sync across N devices").
 - **Mac:** MacBook Pro M5 Pro, macOS, iTerm2, Docker Desktop, kernel Tailscale,
-  `dangs-macbook-pro`. Run by the Mac agent.
+  `dangs-macbook-pro`. Run by the Mac agent. On the Mac, FluxxDB repos go through the SSH
+  alias `git@github-fluxx:FluxxDB/<repo>.git` (plain `github.com` is a different account).
 - Shared dotfiles live in `~/Projects/configs` (`FluxxDB/configs`, `mac/` and `windows/`).
 
 ## Talking to the Mac agent and Dang
