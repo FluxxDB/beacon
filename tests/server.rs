@@ -2750,6 +2750,46 @@ async fn push_rejects_what_it_cannot_store() {
     assert_eq!(channels.channels.len(), 1);
 }
 
+/// A newer peer may push a kind this build does not know: the batch is
+/// taken whole, the unknown event stored and relayed, never derived or
+/// announced, and the posts beside it shown.
+#[tokio::test]
+async fn push_takes_a_batch_with_an_unknown_kind() {
+    let node = spawn_node("pc", &[]).await;
+    let mut rx = node.state().arrivals.subscribe();
+    let future = json!({
+        "origin": "next~abcd1234", "seq": 1, "id": ulid::Ulid::generate().to_string(),
+        "ts": 1_001, "kind": "future_thing", "data": {"anything": [1, "two"]}
+    });
+    let post = remote_post("next~abcd1234", 2, "general", "next-agent", "beside it");
+    let resp = node
+        .post("/api/events")
+        .json(&json!({ "events": [future.clone(), post] }))
+        .send()
+        .await
+        .unwrap();
+    let answer = ok(resp).await;
+    assert_eq!(answer["applied"], 2, "{answer}");
+    assert_eq!(answer["have"]["next~abcd1234"], 2, "{answer}");
+    assert_eq!(channel_bodies(&node, "general").await, ["beside it"]);
+
+    // Only the post is announced.
+    let announced = rx.try_recv().unwrap();
+    assert!(matches!(announced.event.kind, EventKind::PostCreated(_)));
+    assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+    // It relays as it came.
+    let resp = node.get("/api/events?limit=500").send().await.unwrap();
+    let page = ok(resp).await;
+    let relayed = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "future_thing")
+        .cloned();
+    assert_eq!(relayed, Some(future));
+}
+
 #[tokio::test]
 async fn pushed_posts_reach_streams_and_waiters_within_a_second() {
     let node = spawn_node("pc", &[]).await;

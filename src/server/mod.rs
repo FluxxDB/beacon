@@ -2,10 +2,11 @@
 //! API in [`routes`]. Every request needs `Authorization: Bearer $BEACON_SECRET`.
 //!
 //! Handlers stay thin over [`Store`]. Every write goes through
-//! [`AppState::commit`] (a change made on this node) or [`AppState::ingest`]
-//! (an event from a peer), which store it, announce it on
-//! [`AppState::arrivals`] and wake the sync engine ([`crate::sync`]), which
-//! runs beside the server from [`start`] until the node stops.
+//! [`AppState::commit`] (a change made on this node) or
+//! [`AppState::ingest_all`] (a page of events from a peer, in one
+//! transaction), which store it, announce it on [`AppState::arrivals`] once
+//! committed and wake the sync engine ([`crate::sync`]), which runs beside
+//! the server from [`start`] until the node stops.
 
 pub mod routes;
 pub mod stream;
@@ -169,29 +170,67 @@ impl AppState {
     }
 
     /// Stores an event that came from a peer. `None` if we already had it.
-    /// A new event is relayed (sync is woken) whatever it says, but only one
-    /// that passes [`validate_event`] is announced on [`AppState::arrivals`]:
-    /// the store keeps an invalid one without deriving anything from it.
+    /// See [`AppState::ingest_all`]; an event no store can hold is
+    /// [`Error::Usage`].
     pub async fn ingest(&self, ev: Event) -> Result<Option<Applied>, Error> {
+        let mut ingested = self.ingest_all(vec![ev]).await?;
+        if let Some((_, why)) = ingested.refused.pop() {
+            return Err(why);
+        }
+        Ok(ingested.applied.pop())
+    }
+
+    /// Stores a page of events that came from a peer, in one transaction
+    /// ([`Store::apply_all`]), then, still under the store's lock so
+    /// receivers see arrival order, announces on [`AppState::arrivals`] the
+    /// new ones that pass [`validate_event`] (the store keeps an invalid one
+    /// without deriving anything from it) and any it recorded again to settle
+    /// a collision. Sync is woken if anything was stored, so it relays.
+    pub async fn ingest_all(&self, events: Vec<Event>) -> Result<Ingested, Error> {
         let arrivals = self.arrivals.clone();
         let sync = self.sync.clone();
-        let applied = self
+        let ingested = self
             .with_store(move |store| {
-                let applied = store.apply(&ev)?;
-                if let Some(applied) = &applied {
-                    sync.record_version_vector(store.version_vector());
+                let batch = store.apply_all(&events)?;
+                if batch.applied.is_empty() && batch.reissued.is_empty() {
+                    return Ok(Ingested {
+                        applied: batch.applied,
+                        refused: batch.refused,
+                        wrote: false,
+                    });
+                }
+                sync.record_version_vector(store.version_vector());
+                let mut announce: Vec<&Applied> =
+                    batch.applied.iter().chain(&batch.reissued).collect();
+                announce.sort_by_key(|a| a.arrival);
+                for applied in announce {
                     if validate_event(&applied.event).is_ok() {
                         let _ = arrivals.send(applied.clone());
                     }
                 }
-                Ok(applied)
+                Ok(Ingested {
+                    applied: batch.applied,
+                    refused: batch.refused,
+                    wrote: true,
+                })
             })
             .await?;
-        if applied.is_some() {
+        if ingested.wrote {
             self.sync.notify();
         }
-        Ok(applied)
+        Ok(ingested)
     }
+}
+
+/// What [`AppState::ingest_all`] did with a page of events.
+#[derive(Debug)]
+pub struct Ingested {
+    /// The events of the page that were new here, in the order given.
+    pub applied: Vec<Applied>,
+    /// The ones no store can hold, by index in the page, with why.
+    pub refused: Vec<(usize, Error)>,
+    /// Whether anything was written (new events, or ones recorded again).
+    wrote: bool,
 }
 
 /// A signal that the node is shutting down.

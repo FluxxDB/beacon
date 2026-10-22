@@ -1,13 +1,23 @@
 //! The event log every node keeps, and the board state derived from it.
 //!
-//! [`Store::apply`] stores an event once per `(origin, seq)` and updates the
+//! [`Store::apply`] (one event) and [`Store::apply_all`] (a page of them, in
+//! one transaction) store each event once per `(origin, seq)` and update the
 //! derived tables (channels, posts, presence, announced peers) in the same
 //! transaction. An event whose payload breaks [`validate_event`] is stored
 //! and relayed but changes no derived state. The derived state depends only
 //! on the set of events stored, never on the order they arrived in, so nodes
-//! that hold the same events show the same board. See `schema.sql` for the
-//! tables and the visibility rule. What each handle has read and joined lives
-//! beside the log, local to the node; see [`Unread`].
+//! that hold the same events show the same board; a build whose rules derive
+//! differently bumps [`DERIVE_VERSION`], and opening the database then derives
+//! the board again from the log. See `schema.sql` for the tables and the
+//! visibility rule. What each handle has read and joined lives beside the
+//! log, local to the node; see [`Unread`].
+//!
+//! Every commit is synced to disk before it returns (`synchronous=FULL`): a
+//! peer may hold an event a moment later, and a node that lost it in a power
+//! cut would write a different event at the same seq. Should that happen
+//! anyway (a restored backup, a disk that lied), [`Store::apply`] notices
+//! when a peer offers the other event and moves this database to a new
+//! origin; see `Store::on_collision`.
 
 /// SQL for "post `p` mentions the handle bound to `$param` (or `@all`)",
 /// mirroring [`crate::model::mentions_handle`]. One definition for
@@ -25,6 +35,7 @@ macro_rules! mentions_sql {
 
 mod unread;
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,6 +55,16 @@ use crate::model::{
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 const SCHEMA: &str = include_str!("schema.sql");
+
+/// The rules the derived tables were built by. Bump it whenever a change to
+/// [`validate_event`] or to what an event derives would build a different
+/// board from the same events (a rule loosened, a new kind learned): opening
+/// a database built under another version derives the board again from its
+/// events. Stored in `meta` as `derive_version`.
+pub const DERIVE_VERSION: u32 = 1;
+/// The `meta` key prefix of a database id this database wrote under before
+/// it moved to its current one (`Store::move_origin`).
+const FORMER_DB_ID: &str = "former_db_id:";
 
 /// The channel a fresh board starts with; listed first.
 const GENERAL: &str = "general";
@@ -76,11 +97,41 @@ pub struct Store {
     node: String,
     /// `{node}~{db_id}`: the origin of every event this database appends.
     origin: String,
+    /// Every database id this database has written under: the one in
+    /// `origin` and any it moved off. An origin ending in one is ours.
+    own_db_ids: BTreeSet<String>,
     ids: Generator,
     /// Per origin, the highest seq up to which every event is stored.
     vv: VersionVector,
     /// The highest arrival stored (0 when empty).
     head: i64,
+    /// Our origin when the store was opened, and how far its events went
+    /// then; see [`Store::opened_at`].
+    opened_at: (String, u64),
+}
+
+/// The part of a [`Store`] a transaction may change besides the database,
+/// put back if the transaction rolls back.
+struct Saved {
+    origin: String,
+    own_db_ids: BTreeSet<String>,
+    vv: VersionVector,
+    head: i64,
+}
+
+/// What [`Store::apply_all`] did with a page of events.
+#[derive(Debug, Default)]
+pub struct Batch {
+    /// The events of the page that were new here, in the order given (an
+    /// invalid one too: it is stored, though it derives nothing).
+    pub applied: Vec<Applied>,
+    /// Events this node wrote along the way: the two sides of a collision on
+    /// one of our origins, recorded again under our current origin (see
+    /// `Store::on_collision`). Announce them like the rest.
+    pub reissued: Vec<Applied>,
+    /// The events no store can hold (see [`Store::apply`]), by their index
+    /// in the page, with why. Nothing of them was stored.
+    pub refused: Vec<(usize, Error)>,
 }
 
 /// An event this node has just stored, with its local arrival number.
@@ -174,7 +225,9 @@ impl Store {
     pub fn open(path: &Path, node: &str) -> Result<Store> {
         let conn = Connection::open(path)?;
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Each commit reaches the disk before it returns: peers may hold an
+        // event as soon as it is committed (see the module docs).
+        conn.pragma_update(None, "synchronous", "FULL")?;
         // The image has no /tmp and a container may have a read-only root:
         // temporary tables and sorts must not need a file.
         conn.pragma_update(None, "temp_store", "MEMORY")?;
@@ -186,18 +239,17 @@ impl Store {
         Store::init(Connection::open_in_memory()?, node)
     }
 
-    /// Creates the tables and this database's id, loads the version vector
-    /// and, on a board with no channel event yet, creates `general`.
-    fn init(conn: Connection, node: &str) -> Result<Store> {
+    /// Creates the tables and this database's id, derives the board again if
+    /// it was derived under another [`DERIVE_VERSION`], loads the version
+    /// vector and, on a board with no channel event yet, creates `general`.
+    fn init(mut conn: Connection, node: &str) -> Result<Store> {
         conn.execute_batch(SCHEMA)?;
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('db_id', ?1) ON CONFLICT (key) DO NOTHING",
             [new_db_id()],
         )?;
-        let db_id: String =
-            conn.query_row("SELECT value FROM meta WHERE key = 'db_id'", [], |r| {
-                r.get(0)
-            })?;
+        rederive_if_stale(&mut conn)?;
+        let (db_id, own_db_ids) = load_db_ids(&conn)?;
         let vv = load_version_vector(&conn)?;
         let head = conn.query_row("SELECT COALESCE(MAX(arrival), 0) FROM events", [], |r| {
             r.get(0)
@@ -207,13 +259,17 @@ impl Store {
             [],
             |r| r.get(0),
         )?;
+        let origin = format!("{node}~{db_id}");
+        let opened_at = (origin.clone(), vv.get(&origin).copied().unwrap_or(0));
         let mut store = Store {
             conn,
             node: node.to_string(),
-            origin: format!("{node}~{db_id}"),
+            origin,
+            own_db_ids,
             ids: Generator::new(),
             vv,
             head,
+            opened_at,
         };
         if !has_channel_event {
             let general = EventKind::ChannelCreated {
@@ -237,6 +293,16 @@ impl Store {
         &self.origin
     }
 
+    /// Our origin when this store was opened, and the seq its events went up
+    /// to then. Ours above that seq were written since. If the database had
+    /// lost commits a peer already held (a restored backup, a disk that lied
+    /// about a flush), those are the seqs that may have been written twice,
+    /// and only the peer's copies show it, so sync asks each peer for them
+    /// once (see [`Store::apply`] for what a collision does).
+    pub fn opened_at(&self) -> (String, u64) {
+        self.opened_at.clone()
+    }
+
     /// Records a change made on this node: the next seq of our own origin, a
     /// new ULID, ts `now_ms`, then [`Store::apply`]. A `post_created` with an
     /// empty `post_id` gets the event's id as its post id. A payload that
@@ -246,7 +312,19 @@ impl Store {
     }
 
     /// [`Store::append_local`] with ts `ts` and an id made for time `id_ms`.
-    fn append(&mut self, mut kind: EventKind, ts: i64, id_ms: i64) -> Result<Applied> {
+    fn append(&mut self, kind: EventKind, ts: i64, id_ms: i64) -> Result<Applied> {
+        self.in_tx(|s| s.append_in_tx(kind, ts, id_ms, &mut Vec::new()))
+    }
+
+    /// [`Store::append`] inside the caller's transaction; a collision it
+    /// causes (it cannot: the seq is new) would add to `reissued`.
+    fn append_in_tx(
+        &mut self,
+        mut kind: EventKind,
+        ts: i64,
+        id_ms: i64,
+        reissued: &mut Vec<Applied>,
+    ) -> Result<Applied> {
         let seq: u64 = self.conn.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE origin = ?1",
             [&self.origin],
@@ -266,7 +344,7 @@ impl Store {
             kind,
         };
         validate_event(&ev)?;
-        self.apply(&ev)?.ok_or_else(|| {
+        self.store_event(&ev, reissued)?.ok_or_else(|| {
             Error::Internal(anyhow::anyhow!(
                 "local event {}:{} is already stored",
                 ev.origin,
@@ -276,7 +354,10 @@ impl Store {
     }
 
     /// Stores `ev` and updates the derived state, all in one transaction.
-    /// Returns `None`, changing nothing, if `(origin, seq)` is already stored.
+    /// Returns `None`, changing nothing, if `(origin, seq)` is already stored
+    /// (a different event there is a collision: see `Store::on_collision`;
+    /// what it records again is stored and syncs, and [`Store::apply_all`]
+    /// reports it).
     ///
     /// An event whose payload breaks [`validate_event`] is still stored (so
     /// version vectors stay gap-free and it relays) and returned, but changes
@@ -286,27 +367,102 @@ impl Store {
     /// origin that is not `{node}~{db_id}` ([`validate_origin`]), which would
     /// break every version vector it appeared in.
     pub fn apply(&mut self, ev: &Event) -> Result<Option<Applied>> {
-        if i64::try_from(ev.seq).is_err() {
-            return Err(Error::Usage(format!(
-                "event {}:{} has a seq too large to store",
-                ev.origin, ev.seq
-            )));
+        storable(ev)?;
+        self.in_tx(|s| s.store_event(ev, &mut Vec::new()))
+    }
+
+    /// [`Store::apply`] for each of `events`, in order, in one transaction
+    /// (one sync to disk for a whole page from a peer). Each event keeps its
+    /// own rules: an invalid one is stored without deriving anything, and one
+    /// no store can hold is left out and listed in [`Batch::refused`] while
+    /// the rest go in. Any other failure stores nothing of the page.
+    pub fn apply_all(&mut self, events: &[Event]) -> Result<Batch> {
+        if events.is_empty() {
+            return Ok(Batch::default());
         }
-        validate_origin(&ev.origin)?;
+        self.in_tx(|s| {
+            let mut batch = Batch::default();
+            for (i, ev) in events.iter().enumerate() {
+                if let Err(why) = storable(ev) {
+                    batch.refused.push((i, why));
+                    continue;
+                }
+                if let Some(applied) = s.store_event(ev, &mut batch.reissued)? {
+                    batch.applied.push(applied);
+                }
+            }
+            Ok(batch)
+        })
+    }
+
+    /// Runs `f` in one transaction: committed if it returns `Ok`; rolled
+    /// back, with the in-memory state as it was, if it fails.
+    fn in_tx<T>(&mut self, f: impl FnOnce(&mut Store) -> Result<T>) -> Result<T> {
+        if !self.conn.is_autocommit() {
+            // A panic inside an earlier transaction left it open: drop what
+            // it did, and read the state back from what is committed.
+            self.conn.execute_batch("ROLLBACK")?;
+            self.reload()?;
+        }
+        let saved = Saved {
+            origin: self.origin.clone(),
+            own_db_ids: self.own_db_ids.clone(),
+            vv: self.vv.clone(),
+            head: self.head,
+        };
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let done = f(self).and_then(|value| {
+            self.conn.execute_batch("COMMIT")?;
+            Ok(value)
+        });
+        if done.is_err() {
+            if !self.conn.is_autocommit() {
+                if let Err(e) = self.conn.execute_batch("ROLLBACK") {
+                    tracing::error!("cannot roll back a failed write: {e}");
+                }
+            }
+            self.origin = saved.origin;
+            self.own_db_ids = saved.own_db_ids;
+            self.vv = saved.vv;
+            self.head = saved.head;
+        }
+        done
+    }
+
+    /// Reads the in-memory state back from the database.
+    fn reload(&mut self) -> Result<()> {
+        let (db_id, own_db_ids) = load_db_ids(&self.conn)?;
+        self.origin = format!("{}~{db_id}", self.node);
+        self.own_db_ids = own_db_ids;
+        self.vv = load_version_vector(&self.conn)?;
+        self.head =
+            self.conn
+                .query_row("SELECT COALESCE(MAX(arrival), 0) FROM events", [], |r| {
+                    r.get(0)
+                })?;
+        Ok(())
+    }
+
+    /// [`Store::apply`] for an event that is [`storable`], inside the
+    /// caller's transaction. The in-memory state moves with it; the caller
+    /// puts it back if the transaction fails.
+    fn store_event(&mut self, ev: &Event, reissued: &mut Vec<Applied>) -> Result<Option<Applied>> {
         let invalid = validate_event(ev).err();
         let json = serde_json::to_string(ev).map_err(anyhow::Error::from)?;
-        let tx = self.conn.transaction()?;
-        let inserted = tx.execute(
-            "INSERT INTO events (origin, seq, id, ts, json) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (origin, seq) DO NOTHING",
-            params![ev.origin, ev.seq, ev.id, ev.ts, json],
-        )?;
+        let inserted = self
+            .conn
+            .prepare_cached(
+                "INSERT INTO events (origin, seq, id, ts, json) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (origin, seq) DO NOTHING",
+            )?
+            .execute(params![ev.origin, ev.seq, ev.id, ev.ts, json])?;
         if inserted == 0 {
+            self.on_collision(ev, reissued)?;
             return Ok(None);
         }
-        let arrival = tx.last_insert_rowid();
+        let arrival = self.conn.last_insert_rowid();
         match &invalid {
-            None => derive(&tx, ev, arrival)?,
+            None => derive(&self.conn, ev, arrival)?,
             Some(why) => tracing::warn!(
                 origin = %ev.origin,
                 seq = ev.seq,
@@ -314,14 +470,111 @@ impl Store {
             ),
         }
         let have = self.vv.get(&ev.origin).copied().unwrap_or(0);
-        let have = gapless_from(&tx, &ev.origin, have)?;
-        tx.commit()?;
+        let have = gapless_from(&self.conn, &ev.origin, have)?;
         self.vv.insert(ev.origin.clone(), have);
         self.head = arrival;
         Ok(Some(Applied {
             event: ev.clone(),
             arrival,
         }))
+    }
+
+    /// `ev` claims an `(origin, seq)` that is already stored. The same event
+    /// (by id) again is nothing new. A different one means that origin wrote
+    /// two events at one seq: its database lost commits a peer already had
+    /// (a power cut, a restored backup) and reused their seqs. Nodes that
+    /// hold one of the two never take the other at that place, so:
+    ///
+    /// - the stored event is kept, never overwritten, and the collision is
+    ///   logged as an error;
+    /// - if the origin is ours (now or before we moved), this node records
+    ///   both events' changes again, with their own ts, as new events of our
+    ///   current origin, moving to a new origin first if the collision is on
+    ///   the one we write under, so no later write of ours reuses a seq a
+    ///   peer holds. Every node then gets both changes; a post keeps its id,
+    ///   so the copy of a post a node already shows changes nothing there.
+    ///
+    /// Each collision is settled once (`settled_collisions`): another peer
+    /// offering the same event later changes nothing. A collision on another
+    /// node's origin is left to that node, which sees it when a peer offers
+    /// it the other event (sync asks for them; see [`Store::opened_at`]).
+    fn on_collision(&mut self, ev: &Event, reissued: &mut Vec<Applied>) -> Result<()> {
+        let (stored_id, stored_json): (String, String) = self
+            .conn
+            .prepare_cached("SELECT id, json FROM events WHERE origin = ?1 AND seq = ?2")?
+            .query_row(params![ev.origin, ev.seq], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        if stored_id == ev.id {
+            return Ok(());
+        }
+        let ours = ev
+            .origin
+            .split_once('~')
+            .is_some_and(|(_, db_id)| self.own_db_ids.contains(db_id));
+        tracing::error!(
+            origin = %ev.origin,
+            seq = ev.seq,
+            stored = %stored_id,
+            offered = %ev.id,
+            "two different events claim one origin and seq; keeping the stored one{}",
+            if ours { " and recording both again (the origin is ours)" } else { "" }
+        );
+        if !ours {
+            return Ok(());
+        }
+        let first_time = self
+            .conn
+            .prepare_cached(
+                "INSERT INTO settled_collisions (origin, seq, id) VALUES (?1, ?2, ?3)
+                 ON CONFLICT DO NOTHING",
+            )?
+            .execute(params![ev.origin, ev.seq, ev.id])?;
+        if first_time == 0 {
+            return Ok(());
+        }
+        if ev.origin == self.origin {
+            self.move_origin()?;
+        }
+        let stored = parse_event(&stored_json)?;
+        for lost in [ev, &stored] {
+            if let Err(why) = validate_event(lost) {
+                tracing::warn!(
+                    origin = %lost.origin,
+                    seq = lost.seq,
+                    "cannot record an event again: {why}"
+                );
+                continue;
+            }
+            let again = self.append_in_tx(lost.kind.clone(), lost.ts, wall_clock_ms(), reissued)?;
+            reissued.push(again);
+        }
+        Ok(())
+    }
+
+    /// Gives this database a new id, so it writes under a new origin from
+    /// now on; the old id stays one of ours.
+    fn move_origin(&mut self) -> Result<()> {
+        let new = loop {
+            let id = new_db_id();
+            if !self.own_db_ids.contains(&id) {
+                break id;
+            }
+        };
+        let old = self.origin.clone();
+        let old_db_id = old.rsplit_once('~').map_or("", |(_, d)| d);
+        self.conn
+            .execute("UPDATE meta SET value = ?1 WHERE key = 'db_id'", [&new])?;
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO NOTHING",
+            [format!("{FORMER_DB_ID}{old_db_id}"), new.clone()],
+        )?;
+        self.own_db_ids.insert(new.clone());
+        self.origin = format!("{}~{new}", self.node);
+        tracing::error!(
+            from = %old,
+            to = %self.origin,
+            "this node reused a seq a peer already holds (it lost recent commits); writing under a new origin from now on"
+        );
+        Ok(())
     }
 
     /// For every origin stored, the highest seq up to which this node has
@@ -578,6 +831,93 @@ impl Store {
     }
 }
 
+/// Whether any store can hold `ev` (see [`Store::apply`]).
+fn storable(ev: &Event) -> Result<()> {
+    if i64::try_from(ev.seq).is_err() {
+        return Err(Error::Usage(format!(
+            "event {}:{} has a seq too large to store",
+            ev.origin, ev.seq
+        )));
+    }
+    validate_origin(&ev.origin)
+}
+
+/// If the board was derived under another [`DERIVE_VERSION`] (or before
+/// versions were recorded), derives it again from every event, in arrival
+/// order and under today's rules, in one transaction: an event that breaks
+/// [`validate_event`] still derives nothing, one an older build refused may
+/// now derive, and each post keeps its event's arrival. Cursors and joins
+/// are local state, not derived, and stay as they are.
+fn rederive_if_stale(conn: &mut Connection) -> Result<()> {
+    let current = DERIVE_VERSION.to_string();
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'derive_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if stored.as_deref() == Some(current.as_str()) {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "DELETE FROM channel_marks; DELETE FROM posts; DELETE FROM tombstones;
+         DELETE FROM presence; DELETE FROM presence_status; DELETE FROM peers_announced;",
+    )?;
+    let (mut derived, mut skipped) = (0u64, 0u64);
+    {
+        let mut stmt = tx.prepare("SELECT arrival, json FROM events ORDER BY arrival")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let arrival: i64 = row.get(0)?;
+            let json: String = row.get(1)?;
+            match parse_event(&json) {
+                Ok(ev) if validate_event(&ev).is_ok() => {
+                    derive(&tx, &ev, arrival)?;
+                    derived += 1;
+                }
+                Ok(_) => skipped += 1,
+                Err(e) => {
+                    tracing::warn!(arrival, "cannot read a stored event: {e}");
+                    skipped += 1;
+                }
+            }
+        }
+    }
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('derive_version', ?1)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        [&current],
+    )?;
+    tx.commit()?;
+    if derived + skipped > 0 {
+        tracing::info!(
+            from = stored.as_deref().unwrap_or("none"),
+            to = %current,
+            derived,
+            skipped,
+            "derived the board again from the event log"
+        );
+    }
+    Ok(())
+}
+
+/// This database's current id, and every id it has written under.
+fn load_db_ids(conn: &Connection) -> Result<(String, BTreeSet<String>)> {
+    let db_id: String = conn.query_row("SELECT value FROM meta WHERE key = 'db_id'", [], |r| {
+        r.get(0)
+    })?;
+    let mut stmt = conn.prepare("SELECT substr(key, ?1) FROM meta WHERE key LIKE ?2")?;
+    let former = stmt.query_map(
+        params![FORMER_DB_ID.len() + 1, format!("{FORMER_DB_ID}%")],
+        |r| r.get::<_, String>(0),
+    )?;
+    let mut own = former.collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    own.insert(db_id.clone());
+    Ok((db_id, own))
+}
+
 /// Updates the derived tables for a newly stored event.
 fn derive(tx: &Connection, ev: &Event, arrival: i64) -> Result<()> {
     match &ev.kind {
@@ -623,6 +963,8 @@ fn derive(tx: &Connection, ev: &Event, arrival: i64) -> Result<()> {
                 )?;
             }
         }
+        // Never valid, so never derived.
+        EventKind::Unknown(_) => {}
         EventKind::PeerAnnounced { node, url } => {
             tx.execute(
                 "INSERT INTO peers_announced (node, url, ts, origin, seq)
@@ -827,6 +1169,20 @@ impl FromSql for AuthorKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A commit that a peer may already hold must survive a power loss or a
+    /// killed VM: in WAL mode, `NORMAL` can lose the last commits, and a node
+    /// that lost them would reuse their seqs for different events.
+    #[test]
+    fn open_syncs_every_commit_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("beacon.db"), "pc").unwrap();
+        let mode: i64 = store
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, 2, "synchronous should be FULL (2)");
+    }
 
     /// The image is `FROM scratch`: it has no /tmp, and a container may run
     /// with a read-only root. A query that needs a temporary table or a big

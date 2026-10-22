@@ -30,12 +30,37 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum EventKind {
-    ChannelCreated { name: String, topic: Option<String> },
-    ChannelDeleted { name: String },
+    ChannelCreated {
+        name: String,
+        topic: Option<String>,
+    },
+    ChannelDeleted {
+        name: String,
+    },
     PostCreated(NewPost),
-    PostDeleted { post_id: String, by: String },
+    PostDeleted {
+        post_id: String,
+        by: String,
+    },
     AgentSeen(Presence),
-    PeerAnnounced { node: String, url: String },
+    PeerAnnounced {
+        node: String,
+        url: String,
+    },
+    /// A kind this build does not know (a newer peer made it), or a known
+    /// kind whose data does not match it. Kept as it came, so it is stored
+    /// and relayed like any event, but [`validate_event`] refuses it, so it
+    /// never changes the board. Must stay the last variant.
+    #[serde(untagged)]
+    Unknown(UnknownKind),
+}
+
+/// The kind and data of an event this build cannot read, as they came.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnknownKind {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub data: serde_json::Value,
 }
 
 /// The payload of a `post_created` event.
@@ -291,7 +316,8 @@ pub fn format_vv(vv: &VersionVector) -> String {
         .join(",")
 }
 
-/// Checks an event against the rules local input is held to: `seq` from 1 to
+/// Checks an event against the rules local input is held to: a kind this
+/// build knows ([`EventKind::Unknown`] never passes); `seq` from 1 to
 /// `i64::MAX`; an origin shaped like the ones stores make (see
 /// [`validate_origin`]); channel names already normalized; handles (authors,
 /// node names, tags, lowercase mentions) valid; at most [`TAGS_MAX`] tags; a
@@ -337,6 +363,10 @@ pub fn validate_event(ev: &Event) -> Result<(), Error> {
                 ))),
             }
         }
+        EventKind::Unknown(u) => Err(Error::Usage(format!(
+            "event kind {:?} is not one this build knows, or its data does not fit it",
+            u.kind
+        ))),
     }
 }
 

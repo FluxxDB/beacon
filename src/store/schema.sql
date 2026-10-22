@@ -1,7 +1,8 @@
 -- Beacon's SQLite schema. `events` is the log every node keeps a full copy of;
--- every other table except the local-only `cursors` and `joins` (at the end) is
--- derived from it by `Store::apply`, so it holds the same rows on every node
--- that has the same events, whatever order they arrived in.
+-- every other table except the local-only ones at the end (`cursors`, `joins`,
+-- `settled_collisions`) is derived from it by `Store::apply`, so it holds the
+-- same rows on every node that has the same events, whatever order they
+-- arrived in.
 --
 -- "Newest" always means the greatest (ts, origin, seq): the spec's (ts, origin),
 -- with the origin's own seq breaking a tie between two of its events in one ms.
@@ -111,8 +112,9 @@ CREATE TABLE IF NOT EXISTS peers_announced (
 );
 
 -- Local-only state: never events, never synced, never derived. What each handle
--- has read and joined on this node. Handles compare case-insensitively, like
--- authors and mentions do, so `PC-Configs` and `pc-configs` share one row.
+-- has read and joined on this node, and the collisions it settled. Handles
+-- compare case-insensitively, like authors and mentions do, so `PC-Configs`
+-- and `pc-configs` share one row.
 
 -- Per handle and channel, the newest `arrival` the handle has read. Unread is
 -- every relevant post with a greater arrival; a channel with no row has
@@ -122,6 +124,16 @@ CREATE TABLE IF NOT EXISTS cursors (
     channel TEXT    NOT NULL,
     arrival INTEGER NOT NULL,
     PRIMARY KEY (handle, channel)
+) WITHOUT ROWID;
+
+-- Collisions this node settled (`Store::on_collision`): an event of one of our
+-- origins that a peer offered at a seq we hold a different event at. Both were
+-- recorded again once; the same offer from another peer changes nothing.
+CREATE TABLE IF NOT EXISTS settled_collisions (
+    origin TEXT    NOT NULL,
+    seq    INTEGER NOT NULL,
+    id     TEXT    NOT NULL,
+    PRIMARY KEY (origin, seq, id)
 ) WITHOUT ROWID;
 
 -- The channels a handle joined: they make every post there relevant to it.

@@ -216,13 +216,14 @@ fn events_wait(asked: Option<u64>) -> Duration {
 
 // ----------------------------------------------------- POST /api/events (push)
 
-/// Events a peer pushes. Each one goes through [`AppState::ingest`], which
-/// stores it, announces it if it is valid and wakes sync (so a post relays
-/// onward). One that cannot be stored at all (a seq SQLite cannot hold, an
-/// origin that is not `{node}~{db_id}`) fails the request with 400; those
-/// before it stay applied, and sending the batch
-/// again is harmless. Sync is told the sender holds them, so they are not
-/// pushed straight back to it.
+/// Events a peer pushes, stored in one transaction by
+/// [`AppState::ingest_all`], which announces the valid ones and wakes sync
+/// (so a post relays onward). An event of a kind this build does not know is
+/// stored and relayed, never derived. One that cannot be stored at all (a
+/// seq SQLite cannot hold, an origin that is not `{node}~{db_id}`) fails the
+/// request with 400; the others in the batch stay applied, and sending the
+/// batch again is harmless. Sync is told the sender holds them, so they are
+/// not pushed straight back to it.
 async fn push_events(
     State(app): State<AppState>,
     headers: HeaderMap,
@@ -231,12 +232,12 @@ async fn push_events(
     if let Some(from) = super::sender(&headers) {
         app.sync.received_from(&from, &req.events);
     }
-    let mut applied = 0;
-    for event in req.events {
-        if app.ingest(event).await?.is_some() {
-            applied += 1;
-        }
+    let mut ingested = app.ingest_all(req.events).await?;
+    if !ingested.refused.is_empty() {
+        let (_, why) = ingested.refused.swap_remove(0);
+        return Err(why.into());
     }
+    let applied = u64::try_from(ingested.applied.len()).unwrap_or(u64::MAX);
     let have = app.with_store(|s| Ok(s.version_vector())).await?;
     Ok(Json(PushResponse {
         v: V,
@@ -571,7 +572,9 @@ fn describe(
                     out.push(StreamEvent::Presence(PresenceJson::from_row(row, now)));
                 }
             }
-            EventKind::PeerAnnounced { .. } => {}
+            // An announcement shows nothing; an unknown kind is never valid,
+            // so it does not get this far.
+            EventKind::PeerAnnounced { .. } | EventKind::Unknown(_) => {}
         }
     }
     Ok(out)

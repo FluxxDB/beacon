@@ -21,6 +21,14 @@
 //! delivery; a peer we are waiting out (below) is reported undelivered without
 //! being dialled. Everything is idempotent, so all of these may overlap.
 //!
+//! **Pages** are stored in one transaction each (one sync to disk per page,
+//! not per event). The first pulls from each peer after this node starts
+//! also ask again for our own events written since it started
+//! ([`crate::store::Store::opened_at`]): if this database lost commits the
+//! peer already had and wrote different events at those seqs, the peer's
+//! copies show it, and the store settles the collision by moving to a new
+//! origin and recording both sides again.
+//!
 //! **What a peer holds** is what its answers said, which only grows while it
 //! keeps its database. An answer (to a pull or a push) that holds less than
 //! our view of it when we asked means the peer lost events (its database was
@@ -715,6 +723,9 @@ struct Inner {
     /// Our version vector, kept current by the server on every write, so
     /// [`SyncHandle::peers`] never waits on the store.
     our_vv: Mutex<VersionVector>,
+    /// [`Store::opened_at`], read once: where the replay of our own events
+    /// starts on the first pulls from each peer.
+    opened_at: (String, u64),
     /// Bumped on every write stored here; the pushers wait on it.
     written: watch::Sender<u64>,
     tasks: TaskTracker,
@@ -758,7 +769,10 @@ impl SyncHandle {
     /// be used in a request.
     pub fn new(cfg: Arc<Config>, store: Arc<Mutex<Store>>) -> Result<SyncHandle, Error> {
         let client = PeerClient::new(&cfg)?;
-        let our_vv = lock(&store).version_vector();
+        let (our_vv, opened_at) = {
+            let store = lock(&store);
+            (store.version_vector(), store.opened_at())
+        };
         let (launch, launch_rx) = mpsc::unbounded_channel();
         let (blob_jobs, blob_rx) = mpsc::unbounded_channel();
         let table = Table {
@@ -775,6 +789,7 @@ impl SyncHandle {
                 store,
                 table: Mutex::new(table),
                 our_vv: Mutex::new(our_vv),
+                opened_at,
                 written: watch::channel(0).0,
                 tasks: TaskTracker::new(),
                 launch,
@@ -1279,6 +1294,11 @@ async fn pull_loop(state: AppState, id: PeerId) {
     };
     // Follow `more` at once (R22): only while pages bring something new.
     let mut follow = false;
+    // Ours since this node started, as the peer holds them: the first pulls
+    // ask for them again, a page at a time, so a seq this node wrote twice
+    // (it lost commits the peer already had) shows up as a collision in the
+    // store, which settles it. See `Store::opened_at`.
+    let mut replay = Some(sync.inner.opened_at.clone());
     loop {
         if !sync.wait_turn(&mut task, &shutdown).await {
             return;
@@ -1291,7 +1311,12 @@ async fn pull_loop(state: AppState, id: PeerId) {
             return;
         };
         let wait = if follow { 0 } else { state.cfg.long_poll_secs };
-        let after = sync.our_vv();
+        let mut after = sync.our_vv();
+        if let Some((origin, from)) = &replay {
+            if let Some(have) = after.get_mut(origin) {
+                *have = (*have).min(*from);
+            }
+        }
         let started = Instant::now();
         let answer = tokio::select! {
             answer = pull(&sync.inner.client, &url, &after, wait, since) => answer,
@@ -1317,35 +1342,42 @@ async fn pull_loop(state: AppState, id: PeerId) {
             }
             Learned::Gone => return,
         }
-        let mut newly = 0usize;
-        let mut broken = None;
-        for event in page.events {
-            if task.cancel.is_cancelled() || shutdown.is_triggered() {
-                return;
-            }
-            match state.ingest(event).await {
-                Ok(Some(_)) => newly += 1,
-                Ok(None) => {}
-                // An event no store can hold (a seq beyond i64): skip it.
-                Err(Error::Usage(why)) => {
-                    tracing::warn!("sync: skipping an event from {url}: {why}")
+        let replayed = replay.as_ref().and_then(|(origin, _)| {
+            page.events
+                .iter()
+                .filter(|e| e.origin == *origin)
+                .map(|e| e.seq)
+                .max()
+        });
+        // The whole page in one transaction: one sync to disk, not one per
+        // event, however far behind we are.
+        let newly = match state.ingest_all(page.events).await {
+            Ok(ingested) => {
+                // An event no store can hold (a seq beyond i64): skipped.
+                for (_, why) in &ingested.refused {
+                    tracing::warn!("sync: skipping an event from {url}: {why}");
                 }
-                Err(e) => {
-                    broken = Some(e);
-                    break;
+                ingested.applied.len()
+            }
+            Err(e) => {
+                // Our own store failed, not the peer: wait, then pull again.
+                tracing::error!("sync: cannot store events from {url}: {e}");
+                follow = false;
+                if !pause(&task, &shutdown, state.cfg.sync_base_backoff).await {
+                    return;
                 }
+                continue;
             }
+        };
+        if task.cancel.is_cancelled() || shutdown.is_triggered() {
+            return;
         }
-        if let Some(e) = broken {
-            // Our own store failed, not the peer: wait, then pull again.
-            tracing::error!("sync: cannot store events from {url}: {e}");
-            follow = false;
-            if !pause(&task, &shutdown, state.cfg.sync_base_backoff).await {
-                return;
-            }
-            continue;
+        // The replay goes on, at once, while a full page still brings ours.
+        match (&mut replay, replayed) {
+            (Some((_, from)), Some(top)) if page.more => *from = top,
+            _ => replay = None,
         }
-        follow = page.more && newly > 0;
+        follow = (page.more && newly > 0) || replay.is_some();
         if newly == 0 && wait > 0 {
             // A long poll that brought nothing new came back early (an echo
             // of what we already had): never let that turn into a hot loop.

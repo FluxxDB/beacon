@@ -1615,3 +1615,73 @@ fn queued_counts_what_a_peer_lacks_per_origin() {
     let theirs = vv(&[("a~00000000", 12), ("b~00000000", 1), ("c~00000000", 9)]);
     assert_eq!(queued(&ours, Some(&theirs)), 3);
 }
+
+/// The bodies `node` shows in `channel`, sorted.
+async fn bodies_in(node: &TestNode, channel: &str) -> Vec<String> {
+    let mut bodies: Vec<String> = shown(node, channel)
+        .await
+        .into_iter()
+        .map(|p| p.1)
+        .collect();
+    bodies.sort();
+    bodies
+}
+
+fn origin_of(node: &TestNode) -> String {
+    node.state().store.lock().unwrap().origin().to_string()
+}
+
+/// The final review's probe, end to end: a's database loses commits that b
+/// already holds (a restored backup, a disk that lied about a flush), and a
+/// writes a different event at the same seq before it hears from b again.
+/// Its version vector then covers that seq, so b never offers its copy unless
+/// asked: a's first pull from b asks for what b holds of the seqs a wrote
+/// since it started, a sees the collision, moves to a new origin and records
+/// both sides again, and both nodes end up with both posts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_that_lost_commits_a_peer_holds_ends_with_both_posts() {
+    let (ra, rb) = (reserve(), reserve());
+    let a = ra.start("a", &[&rb.url], quick).await;
+    let b = rb.start("b", &[&a.url], quick).await;
+    let x = post(&a, "beacon", "X: delivered then lost").await;
+    eventually(10, "b to have X", || async {
+        bodies_in(&b, "beacon").await == ["X: delivered then lost"]
+    })
+    .await;
+    let old = origin_of(&a);
+    let b = b.stop().await;
+    let a = a.stop().await;
+
+    // Take back X and everything after it, as a power cut that lost the
+    // last commits would; the board is derived again from what is left.
+    {
+        let db = rusqlite::Connection::open(a.dir.path().join("beacon.db")).unwrap();
+        let arrival: i64 = db
+            .query_row(
+                "SELECT arrival FROM posts WHERE id = ?1",
+                [&x.post.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        db.execute("DELETE FROM events WHERE arrival >= ?1", [arrival])
+            .unwrap();
+        db.execute(
+            "UPDATE meta SET value = '0' WHERE key = 'derive_version'",
+            [],
+        )
+        .unwrap();
+    }
+    let a = a.restart().await;
+    assert_eq!(origin_of(&a), old);
+    assert!(bodies_in(&a, "beacon").await.is_empty());
+    post(&a, "beacon", "Y: written after the loss").await;
+
+    let b = b.restart().await;
+    let both = ["X: delivered then lost", "Y: written after the loss"];
+    eventually(10, "both nodes to show both posts", || async {
+        bodies_in(&a, "beacon").await == both && bodies_in(&b, "beacon").await == both
+    })
+    .await;
+    assert_ne!(origin_of(&a), old, "a writes under a new origin");
+    assert_eq!(shown(&a, "beacon").await, shown(&b, "beacon").await);
+}

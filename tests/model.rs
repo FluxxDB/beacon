@@ -603,3 +603,33 @@ fn validate_event_checks_what_peers_name() {
         );
     }
 }
+
+/// A newer peer's event of a kind this build does not know decodes (so a
+/// batch holding it is not refused), fails validation (so it never derives
+/// anything) and encodes back to what came in (so it relays unchanged).
+#[test]
+fn unknown_event_kind_round_trips() {
+    let json = serde_json::json!({
+        "origin": "next~abcdefgh",
+        "seq": 4,
+        "id": "01JDB7K4TR0000000000000077",
+        "ts": 1000,
+        "kind": "future_thing",
+        "data": {"what": ["is", 2], "nested": {"x": null}}
+    });
+    let ev: Event = serde_json::from_value(json.clone()).unwrap();
+    match &ev.kind {
+        EventKind::Unknown(u) => assert_eq!(u.kind, "future_thing"),
+        other => panic!("decoded as {other:?}"),
+    }
+    assert!(matches!(validate_event(&ev), Err(Error::Usage(_))));
+    assert_eq!(serde_json::to_value(&ev).unwrap(), json);
+
+    // Inside a batch, beside a known kind.
+    let known = serde_json::json!({
+        "origin": "next~abcdefgh", "seq": 5, "id": "01JDB7K4TR0000000000000078",
+        "ts": 1001, "kind": "channel_deleted", "data": {"name": "vllm"}
+    });
+    let batch: Vec<Event> = serde_json::from_value(serde_json::json!([json, known])).unwrap();
+    assert!(matches!(batch[1].kind, EventKind::ChannelDeleted { .. }));
+}

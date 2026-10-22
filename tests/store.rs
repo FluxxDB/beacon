@@ -1609,3 +1609,300 @@ fn attachments_lists_each_file_of_a_live_post_once() {
     delete_post(&mut s, &doomed, 6);
     assert_eq!(s.attachments().unwrap(), [(one, 12), (two, 5)]);
 }
+
+// ---- batches, collisions, rebuilds, unknown kinds ----
+
+/// Every event `s` holds, oldest arrival first.
+fn every_event(s: &Store) -> Vec<Event> {
+    s.events_after(&VersionVector::new(), 10_000).unwrap()
+}
+
+/// The event `s` holds at `(origin, seq)`, if any.
+fn event_at(s: &Store, origin: &str, seq: u64) -> Option<Event> {
+    every_event(s)
+        .into_iter()
+        .find(|e| e.origin == origin && e.seq == seq)
+}
+
+#[test]
+fn apply_all_stores_a_page_in_one_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("beacon.db");
+    let mut a = Store::open(&path, "pc").unwrap();
+    let mut b = Store::open_in_memory("mac").unwrap();
+    post(&mut b, "mac", "general", "fine", 10);
+    post(&mut b, "mac", "general", "boom", 20);
+    let page = b.events_after(&a.version_vector(), 100).unwrap();
+    assert_eq!(page.len(), 3);
+
+    // The last post fails: the whole page goes, the first post included.
+    let other = rusqlite::Connection::open(&path).unwrap();
+    other
+        .execute_batch(
+            "CREATE TRIGGER fail_boom BEFORE INSERT ON posts WHEN NEW.body = 'boom'
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+    let before = (a.version_vector(), a.arrival_head(), a.origin().to_string());
+    assert!(a.apply_all(&page).is_err());
+    assert_eq!(
+        (a.version_vector(), a.arrival_head(), a.origin().to_string()),
+        before
+    );
+    assert!(bodies(&a, &PostQuery::default()).is_empty());
+    assert_eq!(every_event(&a).len(), 1, "only a's own general");
+
+    other.execute_batch("DROP TRIGGER fail_boom").unwrap();
+    let batch = a.apply_all(&page).unwrap();
+    assert_eq!(batch.applied.len(), 3);
+    assert!(batch.refused.is_empty());
+    let arrivals: Vec<i64> = batch.applied.iter().map(|x| x.arrival).collect();
+    assert!(arrivals.windows(2).all(|w| w[0] < w[1]), "{arrivals:?}");
+    assert_eq!(bodies(&a, &PostQuery::default()), ["fine", "boom"]);
+    assert!(a.apply_all(&page).unwrap().applied.is_empty());
+}
+
+#[test]
+fn apply_all_keeps_the_rules_of_each_event() {
+    let (mut a, _) = pair();
+    let hello = |seq: u64, body: &str| {
+        let mut ev = remote(
+            seq,
+            EventKind::PostCreated(new_post("evil", "general", body)),
+        );
+        if let EventKind::PostCreated(p) = &mut ev.kind {
+            p.post_id = ev.id.clone();
+        }
+        ev
+    };
+    let bad = EventKind::ChannelCreated {
+        name: "Bad Name".into(),
+        topic: None,
+    };
+    let page = [
+        hello(1, "first"),
+        remote(2, bad),
+        hello(u64::MAX, "never stored"),
+        hello(3, "third"),
+    ];
+    let batch = a.apply_all(&page).unwrap();
+
+    // The invalid event is stored and relayed, but derives nothing; the one
+    // no store can hold is refused, and the rest still go in.
+    let seqs: Vec<u64> = batch.applied.iter().map(|x| x.event.seq).collect();
+    assert_eq!(seqs, [1, 2, 3]);
+    assert_eq!(batch.refused.len(), 1);
+    assert_eq!(batch.refused[0].0, 2);
+    assert!(matches!(batch.refused[0].1, Error::Usage(_)));
+    assert_eq!(a.version_vector()["evil~abcdefgh"], 3);
+    assert_eq!(names(&a), ["general"]);
+    assert_eq!(bodies(&a, &PostQuery::default()), ["first", "third"]);
+}
+
+/// Opens `path` as node "pc" again after taking back every event that
+/// arrived at or after `arrival` and what they derived, as a power loss would
+/// undo commits that had not reached the disk.
+fn roll_back(path: &std::path::Path, arrival: i64) {
+    let c = rusqlite::Connection::open(path).unwrap();
+    c.execute("DELETE FROM events WHERE arrival >= ?1", [arrival])
+        .unwrap();
+    c.execute("DELETE FROM posts WHERE arrival >= ?1", [arrival])
+        .unwrap();
+    c.execute("DELETE FROM channel_marks WHERE origin NOT LIKE 'pc~%'", [])
+        .unwrap();
+}
+
+/// The probe from the final review: a node loses the tail of its log after
+/// a peer already has it, and writes a different event at the same seq.
+#[test]
+fn a_rolled_back_tail_replayed_from_a_peer_ends_with_both_posts_everywhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.db");
+    let mut a = Store::open(&path, "pc").unwrap();
+    let mut b = Store::open_in_memory("mac").unwrap();
+    let x = post(&mut a, "pc", "general", "X: delivered then lost", 1_000);
+    sync(&mut a, &mut b);
+    let x_arrival = a.post(&x.id).unwrap().arrival;
+    let old = a.origin().to_string();
+    drop(a);
+
+    roll_back(&path, x_arrival);
+    let mut a = Store::open(&path, "pc").unwrap();
+    assert_eq!(a.origin(), old);
+    let y = post(&mut a, "pc", "general", "Y: written after restart", 2_000);
+    assert_eq!((y.origin.as_str(), y.seq), (old.as_str(), x.seq));
+
+    // A peer replays what it holds of a's origin: a sees its seq taken twice,
+    // keeps what it stored, and moves to a new origin.
+    for ev in every_event(&b) {
+        assert!(a.apply(&ev).unwrap().is_none() || ev.origin != old);
+    }
+    assert_ne!(a.origin(), old, "a writes under a new origin");
+    assert_eq!(a.origin().split_once('~').unwrap().0, "pc");
+    assert_eq!(
+        event_at(&a, &old, x.seq).unwrap().id,
+        y.id,
+        "never overwritten"
+    );
+
+    // Offered again (another peer replays it too): settled once is enough.
+    let (moved, head) = (a.origin().to_string(), a.arrival_head());
+    let again = a.apply_all(&every_event(&b)).unwrap();
+    assert!(again.applied.is_empty() && again.reissued.is_empty());
+    assert_eq!((a.origin(), a.arrival_head()), (moved.as_str(), head));
+
+    sync(&mut a, &mut b);
+    let both = ["X: delivered then lost", "Y: written after restart"];
+    assert_eq!(bodies(&a, &PostQuery::default()), both);
+    assert_eq!(bodies(&b, &PostQuery::default()), both);
+    assert_eq!(
+        portable(&a, &PostQuery::default()),
+        portable(&b, &PostQuery::default())
+    );
+    assert_eq!(
+        event_at(&b, &old, x.seq).unwrap().id,
+        x.id,
+        "never overwritten"
+    );
+
+    // New writes take the new origin, so they cannot collide again.
+    let z = post(&mut a, "pc", "general", "Z: after the move", 3_000);
+    assert_eq!(z.origin, a.origin());
+    sync(&mut a, &mut b);
+    assert_eq!(
+        portable(&a, &PostQuery::default()),
+        portable(&b, &PostQuery::default())
+    );
+
+    // The move survives a restart.
+    let moved = a.origin().to_string();
+    drop(a);
+    assert_eq!(Store::open(&path, "pc").unwrap().origin(), moved);
+}
+
+#[test]
+fn a_collision_on_another_nodes_origin_keeps_what_is_stored() {
+    let (mut a, mut b) = pair();
+    let x = post(&mut a, "pc", "general", "the real one", 1_000);
+    sync(&mut a, &mut b);
+    let mac = b.origin().to_string();
+
+    let mut twin = x.clone();
+    twin.id = "01JDB7K4TR0000000000000099".into();
+    if let EventKind::PostCreated(p) = &mut twin.kind {
+        p.post_id = twin.id.clone();
+        p.body = "an impostor".into();
+    }
+    assert!(b.apply(&twin).unwrap().is_none());
+    assert_eq!(
+        b.origin(),
+        mac,
+        "only a collision on our own origin moves it"
+    );
+    assert_eq!(event_at(&b, &x.origin, x.seq).unwrap(), x);
+    assert_eq!(bodies(&b, &PostQuery::default()), ["the real one"]);
+}
+
+#[test]
+fn a_new_derive_version_rebuilds_the_board_from_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("beacon.db");
+    {
+        let mut a = Store::open(&path, "pc").unwrap();
+        post(&mut a, "pc", "general", "kept", 10);
+        a.set_joins("pc-configs", &strings(&["general"])).unwrap();
+    }
+    // What an older build with a tighter rule left: an event it stored and
+    // relayed but did not derive, and one no build derives.
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let insert = |ev: &Event| {
+        c.execute(
+            "INSERT INTO events (origin, seq, id, ts, json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                ev.origin,
+                ev.seq,
+                ev.id,
+                ev.ts,
+                serde_json::to_string(ev).unwrap()
+            ],
+        )
+        .unwrap();
+    };
+    insert(&remote(
+        1,
+        EventKind::PostCreated(new_post("evil", "general", "now allowed")),
+    ));
+    insert(&remote(
+        2,
+        EventKind::ChannelCreated {
+            name: "Still Bad".into(),
+            topic: None,
+        },
+    ));
+    let stored_version = || -> String {
+        c.query_row(
+            "SELECT value FROM meta WHERE key = 'derive_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(stored_version(), DERIVE_VERSION.to_string());
+
+    // The same version: nothing is derived again.
+    assert_eq!(
+        bodies(&Store::open(&path, "pc").unwrap(), &PostQuery::default()),
+        ["kept"]
+    );
+
+    // A different one: the board is derived again from every event, under
+    // today's rules; what each handle read and joined stays.
+    c.execute(
+        "UPDATE meta SET value = '0' WHERE key = 'derive_version'",
+        [],
+    )
+    .unwrap();
+    let a = Store::open(&path, "pc").unwrap();
+    assert_eq!(bodies(&a, &PostQuery::default()), ["kept", "now allowed"]);
+    assert_eq!(names(&a), ["general"]);
+    let now_allowed = a.posts(&PostQuery::default()).unwrap().remove(1);
+    let arrival: i64 = c
+        .query_row(
+            "SELECT arrival FROM events WHERE origin = 'evil~abcdefgh' AND seq = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(now_allowed.arrival, arrival, "a post keeps its arrival");
+    assert_eq!(a.joins("pc-configs").unwrap(), ["general"]);
+    assert_eq!(stored_version(), DERIVE_VERSION.to_string());
+}
+
+/// A kind a newer peer made, as it arrives.
+const FUTURE_EVENT: &str = r#"{"origin":"next~abcdefgh","seq":1,"id":"01JDB7K4TR0000000000000077","ts":1000,"kind":"future_thing","data":{"what":["is", 2],"x":null}}"#;
+
+#[test]
+fn an_unknown_kind_is_stored_and_relayed_never_derived() {
+    let (mut a, mut b) = pair();
+    let future: Event = serde_json::from_str(FUTURE_EVENT).unwrap();
+    let hello = Event {
+        origin: "next~abcdefgh".into(),
+        seq: 2,
+        id: "01JDB7K4TR0000000000000078".into(),
+        ts: 1_001,
+        kind: EventKind::PostCreated(new_post("next", "general", "hello")),
+    };
+    let batch = a.apply_all(&[future.clone(), hello]).unwrap();
+    assert_eq!(batch.applied.len(), 2);
+    assert_eq!(a.version_vector()["next~abcdefgh"], 2);
+    assert_eq!(names(&a), ["general"]);
+    assert_eq!(bodies(&a, &PostQuery::default()), ["hello"]);
+
+    sync(&mut a, &mut b);
+    let relayed = event_at(&b, "next~abcdefgh", 1).unwrap();
+    assert_eq!(relayed, future);
+    assert_eq!(
+        serde_json::to_value(&relayed).unwrap(),
+        serde_json::from_str::<serde_json::Value>(FUTURE_EVENT).unwrap()
+    );
+}
