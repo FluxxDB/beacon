@@ -26,6 +26,7 @@ use crate::api::{
     PresenceJson, StatusJson,
 };
 use crate::model::AuthorKind;
+use crate::text::is_unsafe;
 use crate::timefmt::{age_short, clock_12h, day_label};
 
 /// Columns a post's body is indented by: the 8-wide time and two spaces.
@@ -95,15 +96,6 @@ fn new_count(n: u32) -> String {
         0 => "none new".to_string(),
         n => format!("{n} new"),
     }
-}
-
-/// Characters that must not reach a terminal as they are: controls and the
-/// bidi overrides that reorder what is shown.
-fn is_unsafe(c: char) -> bool {
-    c.is_control()
-        || matches!(c, '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}')
-        || ('\u{202a}'..='\u{202e}').contains(&c)
-        || ('\u{2066}'..='\u{2069}').contains(&c)
 }
 
 /// A one-line field (a name, a tag) with unsafe characters replaced by U+FFFD.

@@ -2,20 +2,23 @@
 //! [`crate::tui::state`] (ruling R12), so rendering never sees a wire type.
 //!
 //! Text from the server is shown as written, except that single-line fields
-//! lose any control characters here. (The canvas also refuses to draw them,
-//! so an escape sequence in a name or topic can never reach the terminal.)
-//! Bodies keep their newlines and tabs for wrapping; the posts widget cleans
-//! the rest when it draws them.
+//! lose here every character [`is_unsafe`] names: controls, and the bidi
+//! overrides and isolates that reorder what is shown, as the CLI does. (The
+//! canvas also refuses to draw controls, so an escape sequence in a name or
+//! topic can never reach the terminal.) Bodies keep their newlines and tabs
+//! for wrapping; the posts widget cleans the rest when it draws them.
 
 use jiff::Timestamp;
 use reqwest::Url;
 
 use crate::api::{ChannelJson, PeerJson, PostJson, PresenceJson};
+use crate::text::is_unsafe;
 use crate::tui::state::{AgentItem, AttachmentItem, ChannelItem, PeerItem, PostExtra, PostItem};
 
-/// `s` without control characters (newlines, tabs and escapes included).
+/// `s` without control characters (newlines, tabs and escapes included) or
+/// bidi overrides: without anything [`is_unsafe`].
 pub fn clean_line(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    s.chars().filter(|&c| !is_unsafe(c)).collect()
 }
 
 pub fn post_item(p: &PostJson) -> PostItem {

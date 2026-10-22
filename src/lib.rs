@@ -8,5 +8,6 @@ pub mod model;
 pub mod server;
 pub mod store;
 pub mod sync;
+pub mod text;
 pub mod timefmt;
 pub mod tui;

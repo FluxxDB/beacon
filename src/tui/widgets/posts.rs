@@ -15,6 +15,7 @@ use jiff::Timestamp;
 use ratatui::layout::Rect;
 
 use crate::model::{mentions_handle, validate_handle};
+use crate::text::is_unsafe;
 use crate::timefmt::{clock_12h, day_label};
 use crate::tui::state::{view_name, App, Conn, Focus, PostItem, Selection};
 use crate::tui::theme::{palette, role, Ink, Rgb};
@@ -506,13 +507,14 @@ fn mention_len(word: &str) -> usize {
 }
 
 /// The body as it may reach the terminal: tabs as spaces, no other control
-/// characters (an escape sequence in a post must never be drawn).
+/// characters (an escape sequence in a post must never be drawn) and no bidi
+/// overrides (see [`is_unsafe`]).
 fn clean(body: &str) -> String {
     body.chars()
         .filter_map(|c| match c {
             '\t' => Some(' '),
             '\n' => Some('\n'),
-            c if c.is_control() => None,
+            c if is_unsafe(c) => None,
             c => Some(c),
         })
         .collect()
@@ -556,5 +558,6 @@ mod tests {
     #[test]
     fn control_characters_never_reach_the_screen() {
         assert_eq!(clean("a\tb\x1b[31mc\r\nd"), "a b[31mc\nd");
+        assert_eq!(clean("x\u{202e}gpj.exe\u{2066}y\u{2069}"), "xgpj.exey");
     }
 }

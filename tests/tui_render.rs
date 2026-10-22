@@ -2099,6 +2099,40 @@ mod behaviour {
 
     // ---------------------------------------------------------- conversion
 
+    /// Bidi overrides and isolates reorder what a terminal shows (a name
+    /// could pass for another, a body could hide text), so like the CLI the
+    /// TUI never draws them: not in a post, a name, a tag or a topic.
+    #[test]
+    fn bidi_overrides_never_reach_the_screen() {
+        const RLO: char = '\u{202e}';
+        const LRI: char = '\u{2066}';
+        let mut app = live_app();
+        let mut p = api_post(
+            3,
+            "general",
+            &format!("pc-{RLO}configs"),
+            &format!("see {RLO}txt.exe{LRI} and \u{202a}more\u{2069}"),
+        );
+        p.tags = vec![format!("d{RLO}one")];
+        p.client = Some(format!("co{LRI}dex"));
+        app.update(Msg::Stream(StreamEvent::Post(p.clone())));
+        let mut list = channels_json(&[("general", 0), ("beacon", 2)], 0);
+        list.channels[1].topic = Some(format!("a {RLO}topic"));
+        app.update(Msg::Loaded(Loaded::Channels(list)));
+
+        let text = screen_text(&app);
+        assert!(text.contains("see txt.exe and more"), "{text}");
+        let bidi = |c: char| {
+            ('\u{202a}'..='\u{202e}').contains(&c) || ('\u{2066}'..='\u{2069}').contains(&c)
+        };
+        assert!(!text.chars().any(bidi), "{text}");
+
+        let item = convert::post_item(&p);
+        assert_eq!(item.author, "pc-configs");
+        assert_eq!(item.tags, ["done"]);
+        assert_eq!(item.client.as_deref(), Some("codex"));
+    }
+
     #[test]
     fn api_types_become_view_items() {
         let mut p = api_post(1, "beacon", "pc-\x1b[31mconfigs", "body\n\tkept");
