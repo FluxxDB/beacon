@@ -88,6 +88,25 @@ fi
 exec "${REAL_READLINK:?}" "$@"
 "#;
 
+/// A `mkfifo` that can be told to fail (for every path, or for those under a
+/// directory) or to hang once the FIFO is made, so a signal can arrive while
+/// the wrapper is still setting up the stdin for `watch` and `wait`.
+const FAKE_MKFIFO: &str = r#"#!/bin/sh
+if [ -n "${FAKE_MKFIFO_FAIL_ALL:-}" ]; then
+    exit 1
+fi
+if [ -n "${FAKE_MKFIFO_FAIL_UNDER:-}" ]; then
+    case $1 in
+    "$FAKE_MKFIFO_FAIL_UNDER"/*) exit 1 ;;
+    esac
+fi
+"${REAL_MKFIFO:?}" "$@" || exit $?
+if [ -n "${FAKE_MKFIFO_HANG:-}" ]; then
+    echo $$ > "${FAKE_DOCKER_DIR:?}/mkfifo.pid"
+    sleep 30
+fi
+"#;
+
 fn repo() -> PathBuf {
     fs::canonicalize(REPO).unwrap()
 }
@@ -1356,14 +1375,118 @@ fn the_stdin_for_watch_leaves_no_files_behind() {
     assert!(left.is_empty(), "left behind: {left:?}");
 }
 
+/// The probe of the fake docker: whether the stdin it was given is still open.
+fn stdin_state(sb: &Sandbox) -> String {
+    fs::read_to_string(sb.state.join("exec.stdin.state"))
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+fn sandbox_with_fake_mkfifo() -> (Sandbox, PathBuf) {
+    let sb = Sandbox::new();
+    write_script(&sb.bin.join("mkfifo"), FAKE_MKFIFO);
+    let tmp = sb.root.join("tmp");
+    fs::create_dir(&tmp).unwrap();
+    (sb, tmp)
+}
+
+#[test]
+fn the_stdin_for_watch_falls_back_to_tmp_when_tmpdir_wont_do() {
+    // A TMPDIR that is missing, or one where no FIFO can be made (some mounts
+    // refuse them), is not a reason to leave `watch` unlinked: /tmp is tried.
+    for fail_under_tmpdir in [false, true] {
+        let (sb, tmp) = sandbox_with_fake_mkfifo();
+        let mut cmd = sb.command(&["watch", "--as", "pc-vllm"]);
+        cmd.env("REAL_MKFIFO", find_on_path("mkfifo"))
+            .env("FAKE_EXEC_PROBE_STDIN", "1");
+        if fail_under_tmpdir {
+            cmd.env("TMPDIR", &tmp).env("FAKE_MKFIFO_FAIL_UNDER", &tmp);
+        } else {
+            cmd.env("TMPDIR", sb.root.join("no-such-dir"));
+        }
+        let run = sb.run(cmd);
+        assert_eq!(run.code, 0, "{}", run.stderr);
+        assert_eq!(run.stderr, "", "nothing to say: it worked");
+        assert_eq!(
+            sb.argv("exec"),
+            linked_exec_argv(&["watch", "--as", "pc-vllm"]),
+            "fail_under_tmpdir: {fail_under_tmpdir}"
+        );
+        assert_eq!(stdin_state(&sb), "open");
+        let left: Vec<_> = fs::read_dir(&tmp).unwrap().collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+    }
+}
+
 #[test]
 fn watch_still_runs_where_the_stdin_cannot_be_made() {
-    // No temp directory: run it as before, and do not ask it to end on stdin
-    // closing (it would end at once on the caller's /dev/null).
-    let sb = Sandbox::new();
+    // No FIFO anywhere: run it as before, and do not ask it to end on stdin
+    // closing (it would end at once on the caller's /dev/null). One line says
+    // what that costs.
+    let (sb, tmp) = sandbox_with_fake_mkfifo();
+    for args in [
+        &["watch", "--as", "pc-vllm"][..],
+        &["wait", "--timeout", "5"][..],
+    ] {
+        let mut cmd = sb.command(args);
+        cmd.env("TMPDIR", &tmp)
+            .env("REAL_MKFIFO", find_on_path("mkfifo"))
+            .env("FAKE_MKFIFO_FAIL_ALL", "1");
+        let run = sb.run(cmd);
+        assert_eq!(run.code, 0, "{args:?}: {}", run.stderr);
+        assert_eq!(sb.argv("exec"), exec_argv(args), "{args:?}");
+        assert_eq!(
+            run.stderr,
+            "beacon: couldn't link wait/watch to this terminal; it may keep running after you stop it\n",
+            "{args:?}"
+        );
+        let left: Vec<_> = fs::read_dir(&tmp).unwrap().collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+    }
+    // No temp directory at all, and a /tmp that takes nothing: the same.
     let mut cmd = sb.command(&["watch", "--as", "pc-vllm"]);
-    cmd.env("TMPDIR", sb.root.join("no-such-dir"));
+    cmd.env("TMPDIR", sb.root.join("no-such-dir"))
+        .env("REAL_MKFIFO", find_on_path("mkfifo"))
+        .env("FAKE_MKFIFO_FAIL_ALL", "1");
     let run = sb.run(cmd);
     assert_eq!(run.code, 0, "{}", run.stderr);
     assert_eq!(sb.argv("exec"), exec_argv(&["watch", "--as", "pc-vllm"]));
+    assert_eq!(run.stderr.lines().count(), 1, "{}", run.stderr);
+}
+
+#[test]
+fn a_signal_while_the_stdin_is_being_made_removes_its_directory() {
+    use std::os::unix::process::CommandExt;
+    // `exec` runs no EXIT trap, so the wrapper removes the directory itself
+    // right before it. Until then, a wrapper that is stopped must not leave it.
+    for (name, signal) in [("TERM", libc::SIGTERM), ("HUP", libc::SIGHUP)] {
+        let (sb, tmp) = sandbox_with_fake_mkfifo();
+        let mut cmd = sb.command(&["watch", "--as", "pc-vllm"]);
+        cmd.env("TMPDIR", &tmp)
+            .env("REAL_MKFIFO", find_on_path("mkfifo"))
+            .env("FAKE_MKFIFO_HANG", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Its own group, so the signal reaches the hanging mkfifo too.
+            .process_group(0);
+        let child = cmd.spawn().unwrap();
+        let group = -(child.id() as i32);
+        let hung = sb.state.join("mkfifo.pid");
+        for _ in 0..200 {
+            if hung.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let ready = hung.exists();
+        // SAFETY: plain kill(2) on the process group made for this child.
+        unsafe { libc::kill(group, signal) };
+        let out = child.wait_with_output().unwrap();
+        assert!(ready, "{name}: the wrapper never got to mkfifo");
+        assert_ne!(out.status.code(), Some(0), "{name}: {:?}", out.status);
+        assert!(!sb.called("exec"), "{name}: docker was run after a signal");
+        let left: Vec<_> = fs::read_dir(&tmp).unwrap().collect();
+        assert!(left.is_empty(), "{name}: left behind: {left:?}");
+    }
 }

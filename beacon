@@ -114,20 +114,37 @@ subcommand() {
     done
 }
 
-# Replaces this shell with the linked exec; returns only if the stdin could not
-# be made (then the caller runs the command as it always did).
-linked_exec() {
-    tmp=$(mktemp -d "${TMPDIR:-/tmp}/beacon.XXXXXX" 2>/dev/null) || return 0
+# Makes a directory under $1 with the FIFO in it (sets tmp). Returns 1, with
+# nothing left behind, if that cannot be done there.
+linked_fifo() {
+    tmp=$(mktemp -d "$1/beacon.XXXXXX" 2>/dev/null) || return 1
+    # exec runs no EXIT trap, so linked_exec removes the directory itself just
+    # before it; until then, this shell ending any other way must not leave it.
+    # (A signal trap that did not exit would let the script carry on.)
+    trap 'rm -rf "$tmp"' EXIT
+    trap 'rm -rf "$tmp"; exit 1' HUP INT TERM
     if mkfifo "$tmp/live" 2>/dev/null && (exec 3<>"$tmp/live") 2>/dev/null; then
-        exec 3<>"$tmp/live"
-        rm -rf "$tmp"
-        exec docker compose exec -T \
-            -e BEACON_AGENT -e BEACON_CLIENT -e TERM -e COLORTERM -e TZ \
-            -e BEACON_EXIT_ON_STDIN_EOF=1 \
-            beacon beacon "$@" <&3
+        return 0
     fi
     rm -rf "$tmp"
-    return 0
+    trap - EXIT HUP INT TERM
+    return 1
+}
+
+# Replaces this shell with the linked exec; returns only if the stdin could not
+# be made (then the caller runs the command as it always did). $TMPDIR may be
+# somewhere that takes no FIFO, so /tmp is tried too before giving up.
+linked_exec() {
+    if ! linked_fifo "${TMPDIR:-/tmp}" && ! linked_fifo /tmp; then
+        printf '%s\n' "beacon: couldn't link wait/watch to this terminal; it may keep running after you stop it" >&2
+        return 0
+    fi
+    exec 3<>"$tmp/live"
+    rm -rf "$tmp"
+    exec docker compose exec -T \
+        -e BEACON_AGENT -e BEACON_CLIENT -e TERM -e COLORTERM -e TZ \
+        -e BEACON_EXIT_ON_STDIN_EOF=1 \
+        beacon beacon "$@" <&3
 }
 
 # --- host-only: ./beacon skill install [claude|codex|all] --------------------
