@@ -310,10 +310,12 @@ pub enum Cmd {
         body: String,
     },
     /// Save a post's attachment into the exchange folder as `name` (or
-    /// `name (1)` and so on if that is taken).
+    /// `name (1)` and so on if that is taken), if what arrives is the
+    /// `size` bytes with hash `sha` the post describes.
     Save {
         post_id: String,
         sha: String,
+        size: u64,
         name: String,
     },
     CreateChannel {

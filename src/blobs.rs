@@ -113,7 +113,8 @@ struct Received {
     len: u64,
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// `bytes` as lowercase hex, the way a sha256 is written everywhere here.
+pub fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {

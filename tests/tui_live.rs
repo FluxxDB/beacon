@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use beacon::client::Client;
 use beacon::error::Error;
+use beacon::model::{Attachment, AuthorKind, Event, EventKind, NewPost};
 use beacon::tui::state::Msg;
 use beacon::tui::theme::{ColorMode, Theme};
 use beacon::tui::{drive, TuiConfig};
@@ -20,6 +21,7 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::{Buffer, CellWidth};
 use ratatui::Terminal;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -393,6 +395,73 @@ async fn attach_save_and_delete_through_the_keys() {
             .unwrap()
             .status();
         assert_eq!(gone, 404);
+        tui.quit().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// `s` checks what it fetched against the post, size and sha256, like `get`
+/// does: a file that does not match never shows up in the exchange folder
+/// (not even for a moment, under its name), and the toast says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_refuses_a_file_that_does_not_match_its_post() {
+    tokio::time::timeout(DEADLINE, async {
+        let node = spawn_node("pc", &[]).await;
+        // The node holds a file; a peer's post claims it is 1 byte long.
+        let bytes = b"the bytes the node holds\n";
+        let sha: String = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        std::fs::write(node.dir.path().join("files").join(&sha), bytes).unwrap();
+        let id = ulid::Ulid::generate().to_string();
+        let claim = Event {
+            origin: "mac~abcd1234".to_string(),
+            seq: 1,
+            id: id.clone(),
+            ts: beacon::server::now_ms(),
+            kind: EventKind::PostCreated(NewPost {
+                post_id: id,
+                channel: "general".to_string(),
+                author: "mac-agent".to_string(),
+                author_kind: AuthorKind::Agent,
+                client: Some("codex".to_string()),
+                node: "mac".to_string(),
+                body: "here is the log".to_string(),
+                tags: Vec::new(),
+                mentions: Vec::new(),
+                attachment: Some(Attachment {
+                    sha256: sha,
+                    name: "claimed.txt".to_string(),
+                    size: 1,
+                }),
+            }),
+        };
+        node.state().ingest(claim).await.unwrap().unwrap();
+
+        let exchange = tempfile::tempdir().unwrap();
+        let mut tui = Tui::start(&node.url, exchange.path());
+        tui.until(Duration::from_secs(5), "the post", |s| {
+            s.contains("here is the log") && s.contains("claimed.txt")
+        })
+        .await;
+        // From the composer: the sidebar, then the posts.
+        tui.press(KeyCode::Tab);
+        tui.press(KeyCode::Tab);
+        tui.press(KeyCode::Char('s'));
+        tui.until(Duration::from_secs(5), "the refusal", |s| {
+            s.contains("Not saved: attachment doesn't match what its post describes")
+        })
+        .await;
+        let left: Vec<_> = std::fs::read_dir(exchange.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "nothing saved, nothing left over: {left:?}"
+        );
         tui.quit().await;
     })
     .await

@@ -436,6 +436,7 @@ impl App {
         vec![Cmd::Save {
             post_id: id,
             sha,
+            size: attachment.size,
             name: attachment.name,
         }]
     }

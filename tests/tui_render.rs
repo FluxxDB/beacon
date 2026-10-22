@@ -1684,6 +1684,7 @@ mod behaviour {
             [Cmd::Save {
                 post_id: ulid(3),
                 sha: "ab".repeat(32),
+                size: 12 * 1024,
                 name: "test-report.txt".to_string()
             }]
         );
@@ -2391,6 +2392,7 @@ mod behaviour {
             [Cmd::Save {
                 post_id: ulid(3),
                 sha: "ab".repeat(32),
+                size: 3,
                 name: "r.txt".to_string()
             }]
         );

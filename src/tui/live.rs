@@ -37,12 +37,14 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::buffer::Buffer;
 use ratatui::Terminal;
 use reqwest::Method;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use tokio::io::AsyncWriteExt;
 
 use crate::api::{NewPostRequest, PostCreated, PostsResponse, WhoRequest};
+use crate::blobs::hex;
 use crate::client::{Client, Query};
 use crate::error::Error;
 use crate::model::{validate_handle, AuthorKind};
@@ -505,8 +507,12 @@ impl Worker {
                     .await
                     .map_err(|e| e.to_string()),
             )),
-            Cmd::Save { sha, name, .. } => Some(Msg::Saved(
-                self.save(&sha, &name).await.map_err(|e| e.to_string()),
+            Cmd::Save {
+                sha, size, name, ..
+            } => Some(Msg::Saved(
+                self.save(&sha, size, &name)
+                    .await
+                    .map_err(|e| e.to_string()),
             )),
             Cmd::CreateChannel { name, topic } => {
                 let created = client.create_channel(&name, topic.as_deref()).await;
@@ -572,10 +578,13 @@ impl Worker {
             .await
     }
 
-    /// Fetches the attachment `sha` and writes it into the exchange folder
-    /// as `name` (or the next free `name (n)`), piece by piece. A file that
-    /// did not arrive whole is removed. Returns the name used.
-    async fn save(&self, sha: &str, name: &str) -> Result<String, Error> {
+    /// Fetches the attachment `sha`, which its post says is `size` bytes,
+    /// and puts it in the exchange folder as `name` (or the next free
+    /// `name (n)`), the way `get -o` does: the bytes go into a hidden file
+    /// there first, which is checked against the post (size and sha256) and
+    /// only then renamed into place, so a file that did not arrive whole and
+    /// right never shows up under its name. Returns the name used.
+    async fn save(&self, sha: &str, size: u64, name: &str) -> Result<String, Error> {
         let mut download = self.client.file(sha).await.map_err(|e| match e {
             Error::NotFound(_) => Error::NotFound(
                 "attachment not synced yet; try again when a peer that has it is online"
@@ -584,31 +593,46 @@ impl Worker {
             e => e,
         })?;
         let dir = self.exchange.clone();
-        let wanted = name.to_string();
-        let (saved, path, file) = tokio::task::spawn_blocking(move || create_unique(&dir, &wanted))
+        let (temp, file) = tokio::task::spawn_blocking(move || create_hidden(&dir))
             .await
             .map_err(|e| Error::Internal(anyhow::anyhow!("{e}")))?
             .map_err(|e| Error::Usage(format!("can't write to ./exchange: {e}")))?;
         let mut file = tokio::fs::File::from_std(file);
-        let written = async {
+        let cannot = |e: io::Error| Error::Usage(format!("can't write to ./exchange: {e}"));
+        let checked = async {
+            let mut hasher = Sha256::new();
+            let mut got = 0u64;
             while let Some(chunk) = download.chunk().await? {
-                file.write_all(&chunk)
-                    .await
-                    .map_err(|e| Error::Usage(format!("can't write {saved}: {e}")))?;
+                got += chunk.len() as u64;
+                // Never more than the post said, whatever is sent.
+                if got > size {
+                    return Err(doesnt_match());
+                }
+                hasher.update(&chunk);
+                file.write_all(&chunk).await.map_err(cannot)?;
             }
-            file.sync_all()
-                .await
-                .map_err(|e| Error::Usage(format!("can't write {saved}: {e}")))
+            file.sync_all().await.map_err(cannot)?;
+            if got != size || hex(&hasher.finalize()) != sha {
+                return Err(doesnt_match());
+            }
+            Ok(())
         }
         .await;
-        match written {
-            Ok(()) => Ok(saved),
-            Err(e) => {
-                drop(file);
-                let _ = tokio::fs::remove_file(&path).await;
-                Err(e)
-            }
+        drop(file);
+        if let Err(e) = checked {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(e);
         }
+        let dir = self.exchange.clone();
+        let wanted = name.to_string();
+        let checked_file = temp.clone();
+        let placed = tokio::task::spawn_blocking(move || place(&dir, &wanted, &checked_file))
+            .await
+            .map_err(|e| Error::Internal(anyhow::anyhow!("{e}")))?;
+        placed.map_err(|e| {
+            let _ = std::fs::remove_file(&temp);
+            cannot(e)
+        })
     }
 
     async fn channels(&self) -> Option<Msg> {
@@ -665,6 +689,43 @@ pub fn list_exchange(dir: &Path) -> Result<Vec<ExchangeFile>, String> {
             .then_with(|| a.name.cmp(&b.name))
     });
     Ok(files)
+}
+
+/// What `save` says when the bytes are not the file the post describes (the
+/// words `get` uses).
+fn doesnt_match() -> Error {
+    Error::Internal(anyhow::anyhow!(
+        "attachment doesn't match what its post describes (size or hash)"
+    ))
+}
+
+/// A new hidden file in `dir` (made if missing) for a download to go into
+/// until it is checked; hidden, so the attach picker never lists it.
+fn create_hidden(dir: &Path) -> io::Result<(PathBuf, std::fs::File)> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!(
+        ".beacon-save.{}.{}",
+        std::process::id(),
+        ulid::Ulid::generate()
+    ));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    Ok((path, file))
+}
+
+/// Moves the checked file `from` into `dir` as `name`, or the next free
+/// `name (n)` ([`create_unique`] takes the name, then the rename fills it),
+/// never over another file. Returns the name used.
+fn place(dir: &Path, name: &str, from: &Path) -> io::Result<String> {
+    let (saved, path, file) = create_unique(dir, name)?;
+    drop(file);
+    if let Err(e) = std::fs::rename(from, &path) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
+    Ok(saved)
 }
 
 /// Creates a new file in `dir` named `name`, or `name (1)`, `name (2)`… if
