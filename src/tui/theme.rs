@@ -19,7 +19,8 @@ pub mod palette {
     pub const OBSIDIAN: Rgb = Rgb(0x16, 0x17, 0x18);
     pub const GRAPHITE: Rgb = Rgb(0x23, 0x25, 0x2a);
     pub const SMOKE: Rgb = Rgb(0x38, 0x3b, 0x3f);
-    pub const ASH: Rgb = Rgb(0x62, 0x66, 0x6d);
+    // ash, lifted to #787d85 for contrast (Dang, 2026-10-22)
+    pub const ASH: Rgb = Rgb(0x78, 0x7d, 0x85);
     pub const FOG: Rgb = Rgb(0x8a, 0x8f, 0x98);
     pub const MIST: Rgb = Rgb(0xd0, 0xd6, 0xe0);
     pub const PAPER: Rgb = Rgb(0xff, 0xff, 0xff);

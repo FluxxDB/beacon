@@ -15,6 +15,12 @@ For every screen this writes two fixtures into the output directory:
                     null when unset), bold is a boolean. Adjacent runs with
                     identical style are merged.
 
+The committed board/mac/modal.colors.json carry one approved substitution
+that the mockup HTML does not: the ash metadata grey #62666d is #787d85 in
+them (lifted for contrast, Dang, 2026-10-22). Re-running this script writes
+the original #62666d back; swap it again (sed 's/#62666d/#787d85/g') before
+committing. cli.colors.json is not used by the TUI tests and keeps #62666d.
+
 Usage (Python standard library only):
 
   python3 -I docs/design/extract_mockup.py [HTML_PATH] [OUT_DIR]

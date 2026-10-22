@@ -11,7 +11,7 @@ use beacon::tui::state::{
     AgentItem, App, AttachmentItem, ChannelItem, Conn, Dialog, Focus, FormField, NewChannelForm,
     PeerItem, PostItem, Selection,
 };
-use beacon::tui::theme::{palette, ColorMode, Rgb, Theme};
+use beacon::tui::theme::{nearest_xterm256, palette, ColorMode, Rgb, Theme};
 use beacon::tui::{view, wrap};
 use jiff::tz::TimeZone;
 use ratatui::backend::TestBackend;
@@ -649,6 +649,11 @@ fn ansi256_picks_nearest_xterm_color() {
     // lighter one, so a lifted row still stands off the carbon panel.
     assert_eq!(theme.c(palette::CARBON), Color::Indexed(233));
     assert_eq!(theme.c(palette::OBSIDIAN), Color::Indexed(234));
+    // Ash (#787d85, lifted from #62666d for contrast) takes its own nearest
+    // index: grey 244 (#808080), not the old ash's 242, and apart from fog.
+    assert_eq!(nearest_xterm256(Rgb(0x78, 0x7d, 0x85)), 244);
+    assert_eq!(theme.c(palette::ASH), Color::Indexed(244));
+    assert_ne!(theme.c(palette::ASH), theme.c(palette::FOG));
     // Every surface keeps its own step.
     let surfaces: BTreeSet<String> = [
         palette::VOID,
