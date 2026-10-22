@@ -459,6 +459,14 @@ impl Client {
         self.json(self.request(Method::GET, &["api", "who"])).await
     }
 
+    /// `DELETE /api/who/:handle`: takes `handle` off the list until it checks
+    /// in again, on behalf of `by` (the node's human when `None`).
+    pub async fn forget(&self, handle: &str, by: Option<&str>) -> Result<ForgetAck, Error> {
+        let query = Query::default().set("by", by);
+        self.json(self.request_with(Method::DELETE, &["api", "who", handle], query))
+            .await
+    }
+
     /// `GET /api/joins/:handle`.
     pub async fn joins(&self, handle: &str) -> Result<JoinsJson, Error> {
         self.json(self.request(Method::GET, &["api", "joins", handle]))

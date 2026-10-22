@@ -39,6 +39,7 @@ Every ruling is in the git history of the build. The ones that change behaviour 
 - **Short post ids** are the last 8 ULID characters. The sidebar is 23/21 columns as in the mockup, not the spec's 18.
 - **Look changes you approved:** accent colour acid lime #e4f222 → blue #4099ff (2026-10-22; same roles, only the colour changed), metadata grey #62666d → #787d85, coral error toasts, the named delete dialog, the `j k` hint. The TUI also shows a day label above the oldest post when it isn't today.
 - **R24:** the Announcements view doesn't mark posts read. For you its badge counts only *other* humans' posts, so in a one-human setup it stays at 0.
+- **Forgetting stale agents** (your request, 2026-10-22): `./beacon who --forget HANDLE`, `d` on an agent row in the TUI (j/k now move past the channels onto the agents), or `DELETE /api/who/{handle}`. It is a replicated `agent_forgotten` event: the handle leaves `who` and the sidebar on every device until a heartbeat newer than the forget, by the usual (ts, origin, seq) order, checks it in again, and a status set before the forget is dropped with it. A forgotten handle's next check-in is recorded at once (not after the usual minute). `DERIVE_VERSION` is 2: a node still on the old build keeps and relays the forget without applying it, and applies it when it is upgraded. To clear `pc-test` and `mac-test`, deploy this build on both nodes, then run `./beacon who --forget pc-test` and `./beacon who --forget mac-test`.
 
 ## Known limits and follow-ups (none block use)
 

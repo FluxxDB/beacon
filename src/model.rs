@@ -43,6 +43,12 @@ pub enum EventKind {
         by: String,
     },
     AgentSeen(Presence),
+    /// `by` (Dang, usually) took `handle` off the presence list: it stays
+    /// off until an `agent_seen` newer than this event checks it in again.
+    AgentForgotten {
+        handle: String,
+        by: String,
+    },
     PeerAnnounced {
         node: String,
         url: String,
@@ -352,6 +358,10 @@ pub fn validate_event(ev: &Event) -> Result<(), Error> {
             validate_handle(&p.node)?;
             validate_client(&p.client)?;
             p.status.as_deref().map_or(Ok(()), validate_status)
+        }
+        EventKind::AgentForgotten { handle, by } => {
+            validate_handle(handle)?;
+            validate_handle(by).map(drop)
         }
         EventKind::PeerAnnounced { node, url } => {
             validate_handle(node)?;

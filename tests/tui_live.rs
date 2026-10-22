@@ -508,6 +508,71 @@ async fn new_channel_from_the_keys() {
     .expect("test timed out");
 }
 
+/// The handles the node lists in `who`.
+async fn who(node: &TestNode) -> Vec<String> {
+    get_json(node, "/api/who").await["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["handle"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forget_a_stale_agent_from_the_sidebar() {
+    tokio::time::timeout(DEADLINE, async {
+        let node = spawn_node("pc", &[]).await;
+        let resp = node
+            .post("/api/who")
+            .json(&json!({ "handle": "pc-test", "kind": "agent", "client": "claude-code" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let exchange = tempfile::tempdir().unwrap();
+        let mut tui = Tui::start(&node.url, exchange.path());
+        tui.until(Duration::from_secs(5), "the agent in the sidebar", |s| {
+            s.contains("# general") && s.contains("● pc-test")
+        })
+        .await;
+
+        // Sidebar, past #general onto the agent, `d`, then ↵ in the dialog.
+        tui.press(KeyCode::Tab);
+        tui.press(KeyCode::Char('j'));
+        tui.until(Duration::from_secs(5), "the cursor on the agent", |s| {
+            s.contains("▍ ● pc-test")
+        })
+        .await;
+        tui.press(KeyCode::Char('d'));
+        tui.until(Duration::from_secs(5), "the forget dialog", |s| {
+            s.contains("Forget pc-test?") && s.contains("↵ forget")
+        })
+        .await;
+        tui.press(KeyCode::Enter);
+        tui.until(Duration::from_secs(5), "the row gone", |s| {
+            !s.contains("● pc-test") && s.contains("forgot pc-test")
+        })
+        .await;
+        assert!(who(&node).await.iter().all(|h| h != "pc-test"));
+
+        // It checks in again: back in the sidebar, live.
+        let resp = node
+            .post("/api/who")
+            .json(&json!({ "handle": "pc-test", "kind": "agent", "client": "claude-code" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        tui.until(Duration::from_secs(5), "the agent back", |s| {
+            s.contains("● pc-test")
+        })
+        .await;
+        tui.quit().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wrong_secret_shows_the_rejected_band() {
     tokio::time::timeout(DEADLINE, async {

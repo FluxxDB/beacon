@@ -153,6 +153,7 @@ async fn every_route_requires_the_secret() {
         (Method::DELETE, "/api/posts/01JDB7K4TR"),
         (Method::GET, "/api/who"),
         (Method::POST, "/api/who"),
+        (Method::DELETE, "/api/who/pc-test"),
         (Method::GET, "/api/joins/pc-configs"),
         (Method::PUT, "/api/joins/pc-configs"),
         (Method::GET, "/api/read-cursors/pc-configs"),
@@ -942,6 +943,108 @@ async fn who_lists_what_heartbeats_recorded() {
         .map(|a| &a["kind"])
         .collect();
     assert!(kinds.contains(&&json!("human")) && kinds.contains(&&json!("agent")));
+}
+
+/// Sends a heartbeat for agent `handle`; returns whether it was recorded.
+async fn beat(node: &TestNode, handle: &str) -> bool {
+    let resp = node
+        .post("/api/who")
+        .json(&json!({ "handle": handle, "kind": "agent", "client": "claude-code" }))
+        .send()
+        .await
+        .unwrap();
+    ok(resp).await["recorded"].as_bool().unwrap()
+}
+
+async fn who_handles(node: &TestNode) -> Vec<String> {
+    let who: WhoJson =
+        serde_json::from_value(ok(node.get("/api/who").send().await.unwrap()).await).unwrap();
+    who.agents.into_iter().map(|a| a.handle).collect()
+}
+
+/// Who forgot each handle, in event order.
+async fn forgets(node: &TestNode) -> Vec<(String, String)> {
+    let events = node
+        .state()
+        .with_store(|s| s.events_after(&VersionVector::new(), 1000))
+        .await
+        .unwrap();
+    events
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            EventKind::AgentForgotten { handle, by } => Some((handle, by)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn forget_hides_an_agent_until_it_checks_in_again() {
+    let node = spawn_node("pc", &[]).await;
+    assert!(beat(&node, "pc-test").await);
+    assert!(beat(&node, "pc-configs").await);
+
+    let resp = node
+        .delete("/api/who/pc-test?by=pc-configs")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ok(resp).await,
+        json!({ "v": 1, "ok": true, "forgot": "pc-test" })
+    );
+    assert_eq!(who_handles(&node).await, ["pc-configs"]);
+
+    // No longer listed, so a second forget is 404, as is a handle never seen.
+    for path in ["/api/who/pc-test", "/api/who/never-seen"] {
+        let resp = node.delete(path).send().await.unwrap();
+        let error = expect_error(resp, StatusCode::NOT_FOUND, "not_found").await;
+        assert!(error.contains("not listed"), "{error}");
+    }
+    // Without `by`, the node's human (BEACON_HUMAN, default Dang) forgets.
+    let resp = node.delete("/api/who/pc-configs").send().await.unwrap();
+    ok(resp).await;
+    assert_eq!(
+        forgets(&node).await,
+        [
+            ("pc-test".to_string(), "pc-configs".to_string()),
+            ("pc-configs".to_string(), "Dang".to_string())
+        ]
+    );
+    assert!(who_handles(&node).await.is_empty());
+
+    // Checking in again is recorded at once (it was seen within the minute,
+    // but forgotten since) and lists it again.
+    assert!(beat(&node, "pc-test").await);
+    assert_eq!(who_handles(&node).await, ["pc-test"]);
+    assert!(!beat(&node, "pc-test").await, "then once a minute again");
+}
+
+#[tokio::test]
+async fn forget_takes_the_handle_in_any_case() {
+    let node = spawn_node("pc", &[]).await;
+    assert!(beat(&node, "pc-test").await);
+    let resp = node.delete("/api/who/PC-Test").send().await.unwrap();
+    // The ack names the handle as it is listed.
+    assert_eq!(ok(resp).await["forgot"], "pc-test");
+    assert!(who_handles(&node).await.is_empty());
+}
+
+#[tokio::test]
+async fn forget_refuses_a_bad_handle_or_by() {
+    let node = spawn_node("pc", &[]).await;
+    assert!(beat(&node, "pc-test").await);
+    for path in [
+        "/api/who/bad%20handle",
+        "/api/who/-dash",
+        "/api/who/pc-test?by=bad%20by",
+        "/api/who/pc-test?by=",
+    ] {
+        let resp = node.delete(path).send().await.unwrap();
+        expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+    }
+    assert_eq!(who_handles(&node).await, ["pc-test"]);
+    assert!(forgets(&node).await.is_empty());
 }
 
 // ------------------------------------------------- joins, cursors, unread
@@ -3097,6 +3200,37 @@ async fn sse_streams_each_kind_of_event() {
         }
     );
     sse.quiet_for(Duration::from_millis(200)).await;
+}
+
+#[tokio::test]
+async fn sse_says_when_an_agent_is_forgotten_and_when_it_is_back() {
+    let node = spawn_node("pc", &[]).await;
+    let mut sse = SseReader::open(&node, "").await;
+    assert!(beat(&node, "pc-test").await);
+    let (name, _) = sse.raw(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(name, "presence");
+
+    let resp = node.delete("/api/who/pc-test").send().await.unwrap();
+    ok(resp).await;
+    let (name, data) = sse.raw(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(name, "agent_forgotten");
+    assert_eq!(
+        serde_json::from_str::<Value>(&data).unwrap(),
+        json!({ "handle": "pc-test" })
+    );
+    sse.quiet_for(Duration::from_millis(200)).await;
+
+    // Back: an ordinary presence event.
+    assert!(beat(&node, "pc-test").await);
+    match sse.next().await {
+        StreamEvent::Presence(p) => assert_eq!(p.handle, "pc-test"),
+        other => panic!("expected presence, got {other:?}"),
+    }
+    // A relevant stream carries posts only.
+    let mut relevant = SseReader::open(&node, "?handle=pc-vllm&relevant=1").await;
+    let resp = node.delete("/api/who/pc-test").send().await.unwrap();
+    ok(resp).await;
+    relevant.quiet_for(Duration::from_millis(300)).await;
 }
 
 #[tokio::test]

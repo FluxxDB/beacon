@@ -61,6 +61,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/posts", get(cross_channel_posts))
         .route("/api/posts/{id}", get(get_post).delete(delete_post))
         .route("/api/who", get(who).post(heartbeat))
+        .route("/api/who/{handle}", delete(forget))
         .route("/api/joins/{handle}", get(get_joins).put(put_joins))
         .route(
             "/api/read-cursors/{handle}",
@@ -687,6 +688,62 @@ async fn heartbeat(
         v: V,
         ok: true,
         recorded: recorded.is_some(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct ForgetQuery {
+    by: Option<String>,
+}
+
+/// `DELETE /api/who/:handle`: takes a handle `who` lists off the list on
+/// every device (an `agent_forgotten` event), until it checks in again. The
+/// handle matches case-insensitively; the event carries it as listed. Not
+/// listed (never seen, quiet for 2 hours, or forgotten already) is 404.
+async fn forget(
+    State(app): State<AppState>,
+    ApiPath(handle): ApiPath<String>,
+    ApiQuery(q): ApiQuery<ForgetQuery>,
+) -> ApiResult<ForgetAck> {
+    let asked = validate_handle(&handle)?;
+    // Without `by`, the person at the keyboard (BEACON_HUMAN) is forgetting.
+    let by = match q.by.as_deref() {
+        Some(by) => validate_handle(by)?,
+        None => app.cfg.human.clone(),
+    };
+    let lookup = asked.clone();
+    let listed = app
+        .with_store(move |s| {
+            let rows = s.who(now_ms())?;
+            let exact = rows.iter().find(|r| r.handle == lookup);
+            let any_case = || rows.iter().find(|r| r.handle.eq_ignore_ascii_case(&lookup));
+            Ok(exact.or_else(any_case).map(|r| r.handle.clone()))
+        })
+        .await?;
+    let not_listed = || {
+        Error::NotFound(format!(
+            "{asked} is not listed in who: never seen, quiet for 2 hours, or forgotten already"
+        ))
+    };
+    let handle = listed.ok_or_else(not_listed)?;
+    let check = handle.clone();
+    let forgot = app
+        .commit_if(
+            EventKind::AgentForgotten {
+                handle: handle.clone(),
+                by,
+            },
+            // Under the write's lock: two forgets at once record one event.
+            move |s, now| Ok(s.who(now)?.iter().any(|r| r.handle == check)),
+        )
+        .await?;
+    if forgot.is_none() {
+        return Err(not_listed().into());
+    }
+    Ok(Json(ForgetAck {
+        v: V,
+        ok: true,
+        forgot: handle,
     }))
 }
 

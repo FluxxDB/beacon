@@ -72,6 +72,10 @@ pub struct App {
     pub scroll: usize,
     /// Agents in the sidebar, in display order.
     pub agents: Vec<AgentItem>,
+    /// The agent row the sidebar's cursor is on (`j` past the last channel),
+    /// by handle; the view on screen stays. Only while the sidebar has the
+    /// keys: `None` whenever it does not.
+    pub selected_agent: Option<String>,
     /// Sync peers, for the header.
     pub peers: Vec<PeerItem>,
     /// When the last sync with the peers finished.
@@ -152,6 +156,7 @@ impl App {
             posts: Vec::new(),
             scroll: 0,
             agents: Vec::new(),
+            selected_agent: None,
             peers: Vec::new(),
             last_sync_ms: None,
             me: me.into(),
@@ -238,6 +243,8 @@ pub enum Msg {
     PostDeleted(Result<String, String>),
     /// The channel with this name was deleted, or was not.
     ChannelDeleted(Result<String, String>),
+    /// The agent with this handle was forgotten, or was not.
+    AgentForgotten(Result<String, String>),
     /// An attachment was saved to the exchange folder under this name.
     Saved(Result<String, String>),
     /// A problem worth a toast.
@@ -351,6 +358,8 @@ pub enum Cmd {
     },
     DeleteChannel(String),
     DeletePost(String),
+    /// Take this handle off the agents list on every device (as `me`).
+    ForgetAgent(String),
     /// `me` has read `channel` up to the post that arrived as `arrival`.
     MarkRead {
         channel: String,
@@ -496,8 +505,10 @@ impl App {
     pub fn update(&mut self, msg: Msg) -> Vec<Cmd> {
         let scrolled = self.scroll > 0;
         let filtered = !posts::shows_all(self);
+        let agent_at = self.selected_agent_index();
         let mut cmds = self.apply(msg);
         self.sync_mention();
+        self.keep_agent_cursor(agent_at);
         // Back down at the newest (by a key, a resize, a deletion or a sent
         // post), or the filter gone: what was out of sight is seen now.
         if self.scroll == 0 && (scrolled || (filtered && posts::shows_all(self))) {
@@ -546,6 +557,16 @@ impl App {
                     Vec::new()
                 }
             },
+            Msg::AgentForgotten(result) => {
+                match result {
+                    Ok(handle) => {
+                        self.agents.retain(|a| a.handle != handle);
+                        self.toast(format!("forgot {handle}"));
+                    }
+                    Err(e) => self.error(format!("Not forgotten: {e}")),
+                }
+                Vec::new()
+            }
             Msg::Saved(result) => {
                 match result {
                     Ok(name) => self.toast(format!("saved to ./exchange/{name}")),
@@ -968,6 +989,12 @@ impl App {
                 }
                 Vec::new()
             }
+            // Forgotten on some device: gone until a presence event brings it back.
+            StreamEvent::AgentForgotten { handle } => {
+                let handle = convert::clean_line(&handle);
+                self.agents.retain(|a| a.handle != handle);
+                Vec::new()
+            }
             StreamEvent::Peers(peers) => {
                 self.set_peers(&peers);
                 Vec::new()
@@ -1181,6 +1208,32 @@ impl App {
         self.extras.remove(id);
         self.clamp_scroll();
         true
+    }
+
+    // ------------------------------------------------------------ agents
+
+    /// Where the agent row under the sidebar's cursor is in `agents`.
+    pub(crate) fn selected_agent_index(&self) -> Option<usize> {
+        let handle = self.selected_agent.as_deref()?;
+        self.agents.iter().position(|a| a.handle == handle)
+    }
+
+    /// Keeps the agent cursor true after a message: only while the sidebar
+    /// has the keys, and on a row that is there. A row that went away
+    /// (forgotten, or quiet for 2 hours) passes the cursor to the row now in
+    /// its place, `was_at`, or the one above; with no agents left it goes
+    /// back to the view on screen.
+    fn keep_agent_cursor(&mut self, was_at: Option<usize>) {
+        if self.focus != Focus::Sidebar {
+            self.selected_agent = None;
+        }
+        if self.selected_agent.is_none() || self.selected_agent_index().is_some() {
+            return;
+        }
+        let last = self.agents.len().checked_sub(1);
+        self.selected_agent = was_at
+            .zip(last)
+            .map(|(at, last)| self.agents[at.min(last)].handle.clone());
     }
 
     // ------------------------------------------------------------ layout

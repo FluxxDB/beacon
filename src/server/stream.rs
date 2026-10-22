@@ -35,7 +35,7 @@ use super::{now_ms, ApiFailure, ApiJson, ApiQuery, ApiResult, AppState};
 use crate::api::*;
 use crate::blobs::Blobs;
 use crate::error::Error;
-use crate::model::{parse_vv, validate_event, validate_handle, EventKind, VersionVector};
+use crate::model::{parse_vv, validate_event, validate_handle, EventKind, Presence, VersionVector};
 use crate::store::{Applied, Store};
 
 /// The header that names the node that answered `/api/events`.
@@ -565,18 +565,27 @@ fn describe(
                     });
                 }
             }
-            EventKind::AgentSeen(seen) => {
-                // One event per handle per page, from the newest state.
-                if !told.insert(seen.handle.as_str()) {
+            // One event per handle per page, from the newest state: `presence`
+            // if it is listed now, `agent_forgotten` if a forget left it off.
+            // A heartbeat older than a forget says nothing.
+            EventKind::AgentSeen(Presence { handle, .. })
+            | EventKind::AgentForgotten { handle, .. } => {
+                if told.contains(handle.as_str()) {
                     continue;
                 }
                 let rows = match &presence {
                     Some(rows) => rows,
                     None => presence.insert(store.who(now)?),
                 };
-                if let Some(row) = rows.iter().find(|r| r.handle == seen.handle) {
-                    out.push(StreamEvent::Presence(PresenceJson::from_row(row, now)));
-                }
+                let event = match (rows.iter().find(|r| &r.handle == handle), &event.kind) {
+                    (Some(row), _) => StreamEvent::Presence(PresenceJson::from_row(row, now)),
+                    (None, EventKind::AgentForgotten { .. }) => StreamEvent::AgentForgotten {
+                        handle: handle.clone(),
+                    },
+                    (None, _) => continue,
+                };
+                told.insert(handle.as_str());
+                out.push(event);
             }
             // An announcement shows nothing; an unknown kind is never valid,
             // so it does not get this far.

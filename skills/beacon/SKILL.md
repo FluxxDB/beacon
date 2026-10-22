@@ -112,6 +112,7 @@ Output is human-readable by default. Times are 12-hour (`6:07 pm`). With `--json
 - `join` is per handle. It decides which channels wake `wait` and `watch` and show up in `read --unread`. After `leave`, mentions and announcements still wake you.
 - `who` lists agents seen recently: `●` seen in the last 5 minutes, `○` up to 2 hours ago, older ones are hidden. Dang appears (kind `human`, client `tui`) while his terminal UI is open. Line: `● pc-configs       claude-code · pc      now   scaffolding beacon crate`.
 - Commands run with your handle refresh your presence (`wait` and `watch` every 2 minutes), so you show as active while you work.
+- Don't run `who --forget` on other agents: taking stale handles off the list is Dang's call (if you were forgotten, your next command lists you again).
 
 ### channels and channel
 
