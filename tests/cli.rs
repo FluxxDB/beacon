@@ -3190,6 +3190,132 @@ async fn join_and_leave() {
     assert_eq!(out.json()["joined"], json!([]));
 }
 
+/// The channels `handle` has joined, as the node has them.
+async fn joins_on_node(node: &TestNode, handle: &str) -> Value {
+    let joins: Value = node
+        .get(&format!("/api/joins/{handle}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    joins["channels"].clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn join_all_joins_every_channel_and_never_leaves_one() {
+    let node = spawn_node("pc", &[]).await; // it has #general
+    new_channel(&node, "vllm").await;
+    new_channel(&node, "beacon").await;
+    new_channel(&node, "old").await;
+    join_channel(&node, "pc-dispatch", "vllm").await;
+    join_channel(&node, "pc-dispatch", "old").await;
+    beacon(&node, &["channel", "delete", "old"]).ok().await;
+
+    // Only what it had not joined yet, by name.
+    let out = beacon(&node, &["join", "--all", "--as", "pc-dispatch"])
+        .ok()
+        .await;
+    assert_eq!(
+        out.text(),
+        "joined #beacon #general · wait and watch will wake you for posts there"
+    );
+    // A deleted channel it had joined stays joined: `--all` never leaves one.
+    assert_eq!(
+        joins_on_node(&node, "pc-dispatch").await,
+        json!(["beacon", "general", "old", "vllm"])
+    );
+
+    // Again: nothing to add, and it says so.
+    let out = beacon(&node, &["join", "--all", "--as", "pc-dispatch"])
+        .ok()
+        .await;
+    assert_eq!(out.text(), "already in all 3 channels");
+    let out = beacon(&node, &["join", "--all", "--as", "pc-dispatch", "--json"])
+        .ok()
+        .await;
+    assert_eq!(
+        out.json(),
+        json!({ "v": 1, "ok": true, "added": [], "joined": ["beacon", "general", "old", "vllm"] })
+    );
+
+    // A channel it left is joined again.
+    beacon(&node, &["leave", "vllm", "--as", "pc-dispatch"])
+        .ok()
+        .await;
+    let out = beacon(&node, &["join", "--all", "--as", "pc-dispatch", "--json"])
+        .ok()
+        .await;
+    assert_eq!(
+        out.json(),
+        json!({ "v": 1, "ok": true, "added": ["vllm"], "joined": ["beacon", "general", "old", "vllm"] })
+    );
+
+    // Joins are per handle.
+    let out = beacon(&node, &["join", "--all", "--as", "pc-configs", "--json"])
+        .ok()
+        .await;
+    assert_eq!(
+        out.json(),
+        json!({ "v": 1, "ok": true, "added": ["beacon", "general", "vllm"], "joined": ["beacon", "general", "vllm"] })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn join_all_on_a_board_without_channels() {
+    let node = spawn_node("pc", &[]).await;
+    beacon(&node, &["channel", "delete", "general"]).ok().await;
+    let out = beacon(&node, &["join", "--all", "--as", "pc-dispatch"])
+        .ok()
+        .await;
+    assert_eq!(out.text(), "no channels yet");
+    let out = beacon(&node, &["join", "--all", "--as", "pc-dispatch", "--json"])
+        .ok()
+        .await;
+    assert_eq!(
+        out.json(),
+        json!({ "v": 1, "ok": true, "added": [], "joined": [] })
+    );
+    assert_eq!(joins_on_node(&node, "pc-dispatch").await, json!([]));
+
+    // One channel: joined, then already in it.
+    new_channel(&node, "beacon").await;
+    let out = beacon(&node, &["join", "--all", "--as", "pc-dispatch"])
+        .ok()
+        .await;
+    assert_eq!(
+        out.text(),
+        "joined #beacon · wait and watch will wake you for posts there"
+    );
+    let out = beacon(&node, &["join", "--all", "--as", "pc-dispatch"])
+        .ok()
+        .await;
+    assert_eq!(out.text(), "already in #beacon, the only channel");
+}
+
+/// `join` takes a channel or `--all`: exactly one of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn join_needs_a_channel_or_all_not_both() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    for args in [
+        &["join", "--as", "pc-dispatch"][..],
+        &["join", "beacon", "--all", "--as", "pc-dispatch"],
+        &["join", "--all", "beacon", "--as", "pc-dispatch"],
+    ] {
+        let out = beacon(&node, args).run().await;
+        assert_eq!(
+            (out.code, out.stdout.as_str()),
+            (1, ""),
+            "{args:?}: {out:?}"
+        );
+        assert!(out.stderr.contains("--all"), "{args:?}: {}", out.stderr);
+        assert!(out.stderr.contains("CHANNEL"), "{args:?}: {}", out.stderr);
+    }
+    assert_eq!(joins_on_node(&node, "pc-dispatch").await, json!([]));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn join_then_wait_wakes() {
     let node = spawn_node("pc", &[]).await;
@@ -3323,6 +3449,76 @@ async fn wait_wakes_for_mentions_and_announcements_not_for_chatter() {
     assert!(stdout.contains("announcement"), "{stdout}");
 }
 
+/// The line `wait` and `read --unread` add on stderr for a handle that has
+/// joined no channel.
+fn no_joins_hint(handle: &str) -> String {
+    format!(
+        "beacon: {handle} hasn't joined any channel, so only @mentions and announcements \
+         reach it; join your project's channel and general (./beacon join CHANNEL)\n"
+    )
+}
+
+/// A handle with no joins is told so, once, on stderr; the answers it gets are
+/// byte for byte those of a handle that joined a quiet channel.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_joins_adds_a_hint_and_changes_nothing_else() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    join_channel(&node, "pc-joined", "beacon").await;
+    // The one post that wakes both.
+    beacon(&node, &["post", "general", "heads up", "--human"])
+        .ok()
+        .await;
+    for args in [
+        &["wait", "--timeout", "0"][..],
+        &["wait", "--timeout", "0", "--json"],
+        &["read", "--unread", "--json"],
+        // Now read: nothing is new.
+        &["read", "--unread"],
+        &["wait", "--timeout", "0"],
+        &["wait", "--timeout", "0", "--json"],
+    ] {
+        let lone = beacon(&node, args).arg("--as").arg("pc-lone").run().await;
+        let joined = beacon(&node, args).arg("--as").arg("pc-joined").run().await;
+        assert_eq!(
+            (lone.code, &lone.raw),
+            (joined.code, &joined.raw),
+            "{args:?}: {lone:?} {joined:?}"
+        );
+        assert_eq!(
+            lone.stderr,
+            no_joins_hint("pc-lone") + &joined.stderr,
+            "{args:?}"
+        );
+    }
+
+    // Joined: no hint.
+    join_channel(&node, "pc-lone", "general").await;
+    let out = beacon(&node, &["read", "--unread", "--as", "pc-lone"])
+        .ok()
+        .await;
+    assert_eq!(out.stderr, "", "{out:?}");
+    let out = beacon(&node, &["wait", "--timeout", "0", "--as", "pc-lone"])
+        .run()
+        .await;
+    assert_eq!(out.stderr, "no new posts in 0s\n", "{out:?}");
+}
+
+/// `wait` says it when it starts, not again each time it asks the node anew.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_joins_hint_is_said_once_per_wait() {
+    let node = spawn_node("pc", &[]).await;
+    let out = beacon(&node, &["wait", "--timeout", "3", "--as", "pc-lone"])
+        .env("BEACON_HEARTBEAT_SECS", "1")
+        .run()
+        .await;
+    assert_eq!((out.code, out.stdout.as_str()), (6, ""), "{out:?}");
+    assert_eq!(
+        out.stderr,
+        no_joins_hint("pc-lone") + "no new posts in 3s\n"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_json_is_the_unread_page() {
     let node = spawn_node("pc", &[]).await;
@@ -3354,6 +3550,7 @@ async fn wait_and_watch_need_a_handle_and_a_node() {
         &["wait"][..],
         &["watch"],
         &["join", "general"],
+        &["join", "--all"],
         &["leave", "general"],
     ] {
         let out = beacon(&node, args).run().await;
@@ -3370,6 +3567,7 @@ async fn wait_and_watch_need_a_handle_and_a_node() {
         &["wait", "--timeout", "30", "--as", "pc-vllm"][..],
         &["watch", "--as", "pc-vllm"],
         &["join", "general", "--as", "pc-vllm"],
+        &["join", "--all", "--as", "pc-vllm"],
         &["who"],
     ] {
         let started = std::time::Instant::now();
@@ -4643,6 +4841,8 @@ async fn watch_ends_when_its_stdin_closes_if_asked() {
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_ends_when_its_stdin_closes_if_asked() {
     let node = spawn_node("pc", &[]).await;
+    // Joined, so stderr has only what this is about (no hint about joins).
+    join_channel(&node, "pc-vllm", "general").await;
     let before = listeners(&node);
     let mut wait = beacon(&node, &["wait", "--timeout", "120", "--as", "pc-vllm"])
         .env("BEACON_EXIT_ON_STDIN_EOF", "1")
@@ -4667,7 +4867,10 @@ async fn wait_ends_when_its_stdin_closes_if_asked() {
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_with_a_stdin_that_stays_open_ends_on_its_own() {
     let node = spawn_node("pc", &[]).await;
-    new_channel(&node, "general").await;
+    // Joined to a quiet channel, so stderr has only what this is about (no
+    // hint about joins) and what wakes it below is the mention in #general.
+    new_channel(&node, "beacon").await;
+    join_channel(&node, "pc-vllm", "beacon").await;
     let held = |timeout: &str| {
         beacon(&node, &["wait", "--timeout", timeout, "--as", "pc-vllm"])
             .env("BEACON_EXIT_ON_STDIN_EOF", "1")

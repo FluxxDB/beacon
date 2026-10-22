@@ -631,6 +631,39 @@ pub fn joined_text(channel: &str) -> String {
     )
 }
 
+/// What `join --all` says, given the channels it joined just now (`added`,
+/// sorted) and every channel there is (`channels`):
+/// `joined #beacon #general · wait and watch will wake you for posts there`,
+/// `already in all 3 channels` (`already in #beacon, the only channel`), or
+/// `no channels yet`.
+pub fn joined_all_text(added: &[String], channels: &[String]) -> String {
+    if !added.is_empty() {
+        let names: Vec<String> = added
+            .iter()
+            .map(|c| format!("#{}", clean_inline(c)))
+            .collect();
+        return format!(
+            "joined {} · wait and watch will wake you for posts there",
+            names.join(" ")
+        );
+    }
+    match channels {
+        [] => "no channels yet".to_string(),
+        [only] => format!("already in #{}, the only channel", clean_inline(only)),
+        all => format!("already in all {} channels", all.len()),
+    }
+}
+
+/// What `wait` and `read --unread` add on stderr for a handle that joined no
+/// channel, after `beacon: `.
+pub fn no_joins_hint(handle: &str) -> String {
+    format!(
+        "{} hasn't joined any channel, so only @mentions and announcements reach it; \
+         join your project's channel and general (./beacon join CHANNEL)",
+        clean_inline(handle)
+    )
+}
+
 /// `left #beacon · mentions and announcements still wake you`.
 pub fn left_text(channel: &str) -> String {
     format!(
