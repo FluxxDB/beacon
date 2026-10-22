@@ -21,6 +21,13 @@
 //! delivery; a peer we are waiting out (below) is reported undelivered without
 //! being dialled. Everything is idempotent, so all of these may overlap.
 //!
+//! **What a peer holds** is what its answers said, which only grows while it
+//! keeps its database. An answer (to a pull or a push) that holds less than
+//! our view of it when we asked means the peer lost events (its database was
+//! replaced, even if its head does not show it): the view becomes that
+//! answer, and the pusher sends the peer what it lost, whether or not
+//! anything new is written here.
+//!
 //! **When a peer is away.** A failed request marks the peer unreachable, and
 //! both of its tasks wait before the next try: 5 s, doubling, at most 2 min.
 //! A request from the peer itself (it is back, and pulling) cuts the wait short.
@@ -87,6 +94,10 @@ const IDLE_PULL_GAP: Duration = Duration::from_millis(100);
 const BLOB_SWEEP: Duration = Duration::from_secs(60);
 /// How long [`SyncHandle::stopped`] waits for the tasks to end.
 const STOP_WAIT: Duration = Duration::from_secs(5);
+/// A peer's URL may answer as another node, and start over, at most this
+/// often (or once per base backoff, if that is longer): two nodes answering
+/// at one address must not turn into steady traffic.
+const RENAME_GAP: Duration = Duration::from_secs(5);
 /// The header that carries a node's name: on our requests (who is asking),
 /// and on a peer's `/api/events` answers (who answered).
 pub const NODE_HEADER: &str = "x-beacon-node";
@@ -127,6 +138,17 @@ fn merge_vv(a: &mut VersionVector, b: &VersionVector) {
         let held = a.entry(origin.clone()).or_insert(0);
         *held = (*held).max(seq);
     }
+}
+
+/// Whether `answer` holds less than `view` of some origin.
+fn behind(answer: &VersionVector, view: &VersionVector) -> bool {
+    view.iter()
+        .any(|(origin, &seq)| answer.get(origin).copied().unwrap_or(0) < seq)
+}
+
+/// How many events `vv` covers, in all.
+fn total(vv: &VersionVector) -> u64 {
+    vv.values().fold(0, |sum, &seq| sum.saturating_add(seq))
 }
 
 /// Raises `have` (what a peer holds, gap-free per origin) by `events`, which
@@ -253,6 +275,13 @@ struct Peer {
     last_sync_ms: Option<i64>,
     /// Its version vector, as last heard (`None` before it ever answered).
     their_have: Option<VersionVector>,
+    /// The `have` of the last pull answer that `their_have` was lowered to
+    /// ([`Table::pulled`]). The same answer again lowers nothing, so a peer
+    /// whose pulls say less than its pushes is sent things again once, not
+    /// after every pull.
+    lowered_to: Option<VersionVector>,
+    /// When its URL last started over as another node ([`Table::learned`]).
+    renamed_at: Option<Instant>,
     /// Its newest arrival, as last heard from a pull. Going down means its
     /// database was replaced.
     their_head: Option<i64>,
@@ -356,6 +385,8 @@ impl Table {
             reachable: false,
             last_sync_ms: None,
             their_have: None,
+            lowered_to: None,
+            renamed_at: None,
             their_head: None,
             since: 0,
             push_mark: None,
@@ -498,16 +529,30 @@ impl Table {
             .peers
             .iter()
             .position(|p| p.id != id && p.node.as_deref() == Some(node));
+        let gap = self.base.max(RENAME_GAP);
         let Some(_) = other else {
             let peer = &mut self.peers[i];
             if let Some(old) = &peer.node {
+                let now = Instant::now();
+                if peer
+                    .renamed_at
+                    .is_some_and(|at| now.duration_since(at) < gap)
+                {
+                    // It changed hands moments ago: two nodes answering at
+                    // one address. Until the gap is over its answers count
+                    // as the current one's (they still say what it holds),
+                    // so starting over cannot become a loop.
+                    return Learned::Same;
+                }
                 // Another node took over the address: what we knew of the
                 // old one says nothing about this one.
                 tracing::info!(%url, "sync: {url} answers as {node}, not {old}");
                 peer.their_have = None;
+                peer.lowered_to = None;
                 peer.their_head = None;
                 peer.since = 0;
                 peer.push_mark = None;
+                peer.renamed_at = Some(now);
                 peer.wake();
             }
             peer.node = Some(node.to_string());
@@ -570,6 +615,76 @@ impl Table {
         peer.backoff.succeeded();
         if waiting {
             peer.wake();
+        }
+        back
+    }
+
+    /// A pull from peer `id`, sent while our view of it was `asked_with`,
+    /// answered with its version vector `have` and its head `head`. Returns
+    /// whether it was unreachable until now.
+    ///
+    /// A peer's version vector only grows while it keeps its database, and
+    /// the view holds nothing it had not said or shown by then, so an answer
+    /// that holds less of some origin than `asked_with` means the database
+    /// was replaced, even if its head did not go back: like a head that went
+    /// back, the view becomes the answer and the pusher is woken. (Comparing
+    /// with the view as it is now could mistake an answer that was merely
+    /// overtaken, by a push it acknowledged meanwhile, for a loss.)
+    ///
+    /// Otherwise the view is raised to `have` and never past it: the page's
+    /// events say no more, because each one the peer holds without a gap is
+    /// in `have` already and the others lie above a gap in it. Raising by
+    /// them from a view that was ahead of the truth would push it further.
+    fn pulled(
+        &mut self,
+        id: PeerId,
+        asked_with: Option<&VersionVector>,
+        have: VersionVector,
+        head: i64,
+    ) -> bool {
+        let back = self.answered(id);
+        let Some(peer) = self.get_mut(id) else {
+            return back;
+        };
+        let went_back = peer.their_head.is_some_and(|before| head < before);
+        let lost = asked_with.is_some_and(|view| behind(&have, view))
+            && peer.lowered_to.as_ref() != Some(&have);
+        if went_back || lost {
+            // A new database, which holds only what it says, whatever it
+            // held before.
+            tracing::info!("sync: {} has a new database", peer.label());
+            if lost {
+                peer.lowered_to = Some(have.clone());
+            }
+            peer.their_have = Some(have);
+            peer.push_mark = None;
+            peer.wake();
+        } else {
+            match &mut peer.their_have {
+                Some(known) => merge_vv(known, &have),
+                slot => *slot = Some(have),
+            }
+        }
+        peer.their_head = Some(head);
+        peer.since = head;
+        back
+    }
+
+    /// A push to peer `id`, of a batch chosen from our view `chosen_from`,
+    /// answered with its version vector `have`. Returns whether it was
+    /// unreachable until now.
+    ///
+    /// An answer that holds less of some origin than `chosen_from` means the
+    /// peer lost what it had (see [`Table::pulled`]): the view becomes the
+    /// answer, or it would never be sent those events again. Otherwise the
+    /// view is raised to it.
+    fn pushed(&mut self, id: PeerId, chosen_from: &VersionVector, have: &VersionVector) -> bool {
+        let back = self.answered(id);
+        if let Some(peer) = self.get_mut(id) {
+            match &mut peer.their_have {
+                Some(known) if !behind(have, chosen_from) => merge_vv(known, have),
+                slot => *slot = Some(have.clone()),
+            }
         }
         back
     }
@@ -812,9 +927,9 @@ impl SyncHandle {
     ///
     /// The first batch is chosen from what we know of the peer (R13); every
     /// later one from what the peer itself last answered. Our view of a peer
-    /// is only ever raised, so it can run ahead of the truth (a wiped database
-    /// not noticed yet): a batch chosen from it may lack what the peer needs,
-    /// and only the peer's own answer says what that is.
+    /// can run ahead of the truth (a wiped database not noticed yet): a batch
+    /// chosen from it may lack what the peer needs, and only the peer's own
+    /// answer says what that is.
     async fn deliver(
         &self,
         id: PeerId,
@@ -842,7 +957,7 @@ impl SyncHandle {
                         .map_err(|e| (url.clone(), e))?;
                     match self.learned(id, &url, &node) {
                         Learned::Same => {
-                            self.pushed(id, &answer.have);
+                            self.pushed(id, &VersionVector::new(), &answer.have);
                             told = Some(answer.have);
                         }
                         Learned::Retry => {}
@@ -876,12 +991,11 @@ impl SyncHandle {
                 }
                 Learned::Gone => return Ok(None),
             }
-            self.pushed(id, &answer.have);
+            self.pushed(id, &have, &answer.have);
             if covers(&answer.have, &ev.origin, ev.seq) {
                 return Ok(Some(true));
             }
             // Stop when its own word shows no progress since its last answer.
-            let total = |vv: &VersionVector| vv.values().fold(0u64, |t, &s| t.saturating_add(s));
             if told
                 .as_ref()
                 .is_some_and(|t| total(&answer.have) <= total(t))
@@ -933,54 +1047,28 @@ impl SyncHandle {
         }
     }
 
-    /// A pull from peer `id` answered with `events`, its version vector
-    /// `have` and its head `head`. Called before the events are stored: it
-    /// holds them, so the pusher, woken by each one stored, must not send
-    /// them straight back.
-    fn pulled(&self, id: PeerId, events: &[Event], have: VersionVector, head: i64) {
-        let back = {
-            let mut table = self.table();
-            let back = table.answered(id);
-            if let Some(peer) = table.get_mut(id) {
-                if peer.their_head.is_some_and(|before| head < before) {
-                    // Its arrivals went back: a new database, which holds
-                    // only what it says, whatever it held before.
-                    tracing::info!("sync: {} has a new database", peer.label());
-                    peer.their_have = Some(have);
-                    peer.push_mark = None;
-                    peer.wake();
-                } else {
-                    match &mut peer.their_have {
-                        Some(known) => merge_vv(known, &have),
-                        slot => *slot = Some(have),
-                    }
-                }
-                if let Some(known) = peer.their_have.as_mut() {
-                    raise_by(known, events);
-                }
-                peer.their_head = Some(head);
-                peer.since = head;
-            }
-            back
-        };
+    /// A pull from peer `id`, sent while our view of it was `asked_with`,
+    /// answered with its version vector `have` and its head `head` (see
+    /// [`Table::pulled`]). Called before the page's events are stored, so
+    /// the pusher, woken by each one stored, already knows the peer holds
+    /// them and does not send them straight back.
+    fn pulled(
+        &self,
+        id: PeerId,
+        asked_with: Option<&VersionVector>,
+        have: VersionVector,
+        head: i64,
+    ) {
+        let back = self.table().pulled(id, asked_with, have, head);
         if back {
             self.came_back(id);
         }
     }
 
-    /// A push to peer `id` answered with its version vector `have`.
-    fn pushed(&self, id: PeerId, have: &VersionVector) {
-        let back = {
-            let mut table = self.table();
-            let back = table.answered(id);
-            if let Some(peer) = table.get_mut(id) {
-                match &mut peer.their_have {
-                    Some(known) => merge_vv(known, have),
-                    slot => *slot = Some(have.clone()),
-                }
-            }
-            back
-        };
+    /// A push to peer `id`, of a batch chosen from our view `chosen_from`,
+    /// answered with its version vector `have` (see [`Table::pushed`]).
+    fn pushed(&self, id: PeerId, chosen_from: &VersionVector, have: &VersionVector) {
+        let back = self.table().pushed(id, chosen_from, have);
         if back {
             self.came_back(id);
         }
@@ -1186,7 +1274,11 @@ async fn pull_loop(state: AppState, id: PeerId) {
         if !sync.wait_turn(&mut task, &shutdown).await {
             return;
         }
-        let Some((url, since)) = sync.with_peer(id, |p| (p.url().to_string(), p.since)) else {
+        // `asked_with`: what we think it holds as we ask. An answer with less
+        // means it lost events (see `Table::pulled`).
+        let Some((url, since, asked_with)) =
+            sync.with_peer(id, |p| (p.url().to_string(), p.since, p.their_have.clone()))
+        else {
             return;
         };
         let wait = if follow { 0 } else { state.cfg.long_poll_secs };
@@ -1213,7 +1305,7 @@ async fn pull_loop(state: AppState, id: PeerId) {
             }
             Learned::Gone => return,
         }
-        sync.pulled(id, &page.events, page.have, page.head);
+        sync.pulled(id, asked_with.as_ref(), page.have, page.head);
         let mut newly = 0usize;
         let mut broken = None;
         for event in page.events {
@@ -1310,11 +1402,19 @@ async fn push_loop(state: AppState, id: PeerId) {
 }
 
 /// Sends peer `id` the events its version vector lacks, a batch at a time,
-/// while it keeps taking them. A selection that holds nothing that arrived
-/// since the last round, for a peer whose version vector has not changed,
-/// was sent already (it lies above a gap the peer shares) and is skipped.
+/// while it keeps taking them, and again from its answer when that holds
+/// less than the view the batch was chosen from (it lost events we thought
+/// it had). After the first push, another follows only an answer that holds
+/// more than the one before it, or a smaller batch, so a peer that takes
+/// nothing is not sent the same batch again. A selection that holds nothing
+/// that arrived since the last round, for a peer whose version vector has
+/// not changed, was sent already (it lies above a gap the peer shares) and
+/// is skipped.
 async fn push_round(state: &AppState, id: PeerId) -> Result<Round, (String, anyhow::Error)> {
     let sync = &state.sync;
+    // This round's last push: how many events it carried, and how many the
+    // peer said it held in all after it.
+    let mut last: Option<(usize, u64)> = None;
     loop {
         let Some((url, have, mark)) = sync.with_peer(id, |p| {
             (
@@ -1331,7 +1431,7 @@ async fn push_round(state: &AppState, id: PeerId) -> Result<Round, (String, anyh
                 .await
                 .map_err(|e| (url.clone(), e))?;
             match sync.learned(id, &url, &node) {
-                Learned::Same => sync.pushed(id, &answer.have),
+                Learned::Same => sync.pushed(id, &VersionVector::new(), &answer.have),
                 Learned::Retry => return Ok(Round::Retry),
                 Learned::Gone => return Ok(Round::Gone),
             }
@@ -1359,6 +1459,7 @@ async fn push_round(state: &AppState, id: PeerId) -> Result<Round, (String, anyh
         }
         let full = page.len() >= BATCH;
         let events: Vec<Event> = page.into_iter().map(|a| a.event).collect();
+        let sent = events.len();
         let (node, answer) = push(&sync.inner.client, &url, &events, PUSH_TIMEOUT)
             .await
             .map_err(|e| (url.clone(), e))?;
@@ -1367,12 +1468,19 @@ async fn push_round(state: &AppState, id: PeerId) -> Result<Round, (String, anyh
             Learned::Retry => return Ok(Round::Retry),
             Learned::Gone => return Ok(Round::Gone),
         }
-        sync.pushed(id, &answer.have);
+        sync.pushed(id, &have, &answer.have);
         let now = sync
             .with_peer(id, |p| p.their_have.clone().unwrap_or_default())
             .unwrap_or_default();
-        if full && now != have {
-            // It took them and there is more: next batch.
+        // More to send: it took a full batch and there is more, or it holds
+        // less than the view this batch came from (it lost events), and the
+        // next is chosen from what it said.
+        let more = (full || behind(&answer.have, &have)) && now != have;
+        let held = total(&answer.have);
+        let progress =
+            last.is_none_or(|(before_sent, before_held)| held > before_held || sent < before_sent);
+        last = Some((sent, held));
+        if more && progress {
             continue;
         }
         set_mark(sync, id, head, now);
@@ -1752,5 +1860,113 @@ mod tests {
         assert!(json.reachable);
         assert_eq!(json.node.as_deref(), Some("mac"));
         assert!(json.last_sync.is_some());
+    }
+
+    fn vv(entries: &[(&str, u64)]) -> VersionVector {
+        entries.iter().map(|&(o, s)| (o.to_string(), s)).collect()
+    }
+
+    /// A peer `mac` whose view is `have`.
+    fn known(have: VersionVector) -> (Table, PeerId) {
+        let mut t = table("pc", None);
+        let id = t.add_configured("http://mac:7700").unwrap();
+        t.learned(id, "http://mac:7700", "mac");
+        t.get_mut(id).unwrap().their_have = Some(have);
+        (t, id)
+    }
+
+    #[test]
+    fn a_push_answer_with_less_than_the_batch_was_chosen_from_is_believed() {
+        let view = vv(&[("pc~00000000", 9), ("mac~00000000", 4)]);
+        let (mut t, id) = known(view.clone());
+        // It lost pc's events and the old mac's, and has some of a new db.
+        let answer = vv(&[("pc~00000000", 2), ("mac~11111111", 3)]);
+        t.pushed(id, &view, &answer);
+        let peer = t.get(id).unwrap();
+        assert_eq!(peer.their_have.as_ref(), Some(&answer));
+        assert_eq!(peer.json(&view).queued, 7 + 4);
+
+        // An answer that holds what the batch was chosen from is no loss,
+        // even if the view went past it meanwhile (it heard more since).
+        let (mut t, id) = known(vv(&[("pc~00000000", 9)]));
+        t.pushed(id, &vv(&[("pc~00000000", 5)]), &vv(&[("pc~00000000", 6)]));
+        let peer = t.get(id).unwrap();
+        assert_eq!(peer.their_have, Some(vv(&[("pc~00000000", 9)])));
+    }
+
+    #[test]
+    fn a_pull_answer_with_less_than_it_was_asked_with_is_believed_once() {
+        let asked = vv(&[("pc~00000000", 4)]);
+        let (mut t, id) = known(asked.clone());
+        t.get_mut(id).unwrap().push_mark = Some((7, asked.clone()));
+        let mut woken = t.get(id).unwrap().retry.subscribe();
+        woken.borrow_and_update();
+        // Its head did not go back, but it holds less than it did.
+        t.pulled(id, Some(&asked), vv(&[("pc~00000000", 3)]), 10);
+        let peer = t.get(id).unwrap();
+        assert_eq!(peer.their_have, Some(vv(&[("pc~00000000", 3)])));
+        assert_eq!(peer.push_mark, None);
+        assert!(woken.has_changed().unwrap(), "the pusher hears of it");
+
+        // The same answer again (its pushes said more meanwhile) lowers
+        // nothing a second time.
+        t.get_mut(id).unwrap().their_have = Some(asked.clone());
+        woken.borrow_and_update();
+        t.pulled(id, Some(&asked), vv(&[("pc~00000000", 3)]), 10);
+        let peer = t.get(id).unwrap();
+        assert_eq!(peer.their_have, Some(asked.clone()));
+        assert!(!woken.has_changed().unwrap());
+    }
+
+    #[test]
+    fn a_pull_answer_raises_the_view_to_it_and_no_further() {
+        // Asked when it held 2; a push it took meanwhile raised the view to
+        // 5; the answer, given before that push, says 3. Overtaken, not lost.
+        let (mut t, id) = known(vv(&[("pc~00000000", 5)]));
+        let asked = vv(&[("pc~00000000", 2)]);
+        t.pulled(id, Some(&asked), vv(&[("pc~00000000", 3)]), 10);
+        assert_eq!(
+            t.get(id).unwrap().their_have,
+            Some(vv(&[("pc~00000000", 5)]))
+        );
+        // An answer that holds more raises it to what it says.
+        t.pulled(
+            id,
+            Some(&asked),
+            vv(&[("pc~00000000", 6), ("mac~00000000", 2)]),
+            11,
+        );
+        assert_eq!(
+            t.get(id).unwrap().their_have,
+            Some(vv(&[("pc~00000000", 6), ("mac~00000000", 2)]))
+        );
+    }
+
+    #[test]
+    fn a_url_that_changes_names_again_soon_does_not_start_over_again() {
+        let (mut t, id) = known(vv(&[("pc~00000000", 9)]));
+        assert_eq!(t.learned(id, "http://mac:7700", "mini"), Learned::Same);
+        assert_eq!(t.get(id).unwrap().their_have, None, "started over");
+        t.get_mut(id).unwrap().their_have = Some(vv(&[("pc~00000000", 9)]));
+        let mut woken = t.get(id).unwrap().retry.subscribe();
+        woken.borrow_and_update();
+        // Back to the first name at once: two nodes at one address. It keeps
+        // the name and what it knows, and its tasks are not woken.
+        assert_eq!(t.learned(id, "http://mac:7700", "mac"), Learned::Same);
+        let peer = t.get(id).unwrap();
+        assert_eq!(peer.node.as_deref(), Some("mini"));
+        assert_eq!(peer.their_have, Some(vv(&[("pc~00000000", 9)])));
+        assert!(!woken.has_changed().unwrap());
+        // Once the gap is over, it may start over again.
+        let long_ago = Instant::now().checked_sub(RENAME_GAP + Duration::from_secs(1));
+        let Some(long_ago) = long_ago else {
+            return; // the clock started too recently to go back that far
+        };
+        t.get_mut(id).unwrap().renamed_at = Some(long_ago);
+        assert_eq!(t.learned(id, "http://mac:7700", "mac"), Learned::Same);
+        let peer = t.get(id).unwrap();
+        assert_eq!(peer.node.as_deref(), Some("mac"));
+        assert_eq!(peer.their_have, None);
+        assert!(woken.has_changed().unwrap());
     }
 }
