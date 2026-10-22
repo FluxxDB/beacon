@@ -8,8 +8,10 @@
 //!   `Enter` sends, `Shift-Enter`, `Alt-Enter` or `Ctrl-J` start a new line;
 //!   `Esc` leaves for the posts.
 //! * **Sidebar and posts:** `j`/`k` and the arrows move (in the sidebar that
-//!   opens the channel), `n` `a` `s` `d` `/` `?` `q` are commands, and any
-//!   other printable key jumps to the composer and types itself.
+//!   opens the channel; past the last channel the cursor goes on through the
+//!   agent rows, where `d` forgets one), `n` `a` `s` `d` `/` `?` `q` are
+//!   commands, and any other printable key jumps to the composer and types
+//!   itself.
 //! * Anywhere: `Tab`/`Shift-Tab` cycle the focus, `PgUp`/`PgDn` scroll the
 //!   posts, `Esc` clears the filter.
 
@@ -35,7 +37,7 @@ pub const HELP: [(&str, &str); 14] = [
     ("n", "new channel"),
     ("a", "attach a file from ./exchange"),
     ("s", "save the post's file"),
-    ("d", "delete the post or channel"),
+    ("d", "delete, or forget an agent"),
     ("/", "filter by tag or @handle"),
     ("esc", "clear filter, leave composer"),
     ("?", "this help"),
@@ -231,8 +233,9 @@ impl App {
         }
     }
 
-    /// `j`/`↓` (+1) and `k`/`↑` (-1): the next view in the sidebar, or the
-    /// next newer / older post.
+    /// `j`/`↓` (+1) and `k`/`↑` (-1): the next view in the sidebar, then on
+    /// past the last channel into the agent rows (which leave the view on
+    /// screen as it is), or the next newer / older post.
     fn move_by(&mut self, delta: i32) -> Vec<Cmd> {
         match self.focus {
             Focus::Sidebar => {
@@ -243,12 +246,20 @@ impl App {
                             .map(|c| Selection::Channel(c.name.clone())),
                     )
                     .collect();
-                let at = views.iter().position(|v| v == &self.selected).unwrap_or(0);
+                let at = match self.selected_agent_index() {
+                    Some(agent) => views.len() + agent,
+                    None => views.iter().position(|v| v == &self.selected).unwrap_or(0),
+                };
                 let next = if delta > 0 {
-                    (at + 1).min(views.len() - 1)
+                    (at + 1).min(views.len() + self.agents.len() - 1)
                 } else {
                     at.saturating_sub(1)
                 };
+                if let Some(agent) = next.checked_sub(views.len()) {
+                    self.selected_agent = Some(self.agents[agent].handle.clone());
+                    return Vec::new();
+                }
+                self.selected_agent = None;
                 let view = views[next].clone();
                 self.select(view)
             }
@@ -442,10 +453,22 @@ impl App {
     }
 
     /// `d`: asks before deleting the selected post, or in the sidebar the
-    /// channel on screen.
+    /// channel on screen, or before forgetting the agent row under the cursor.
     fn ask_delete(&mut self) {
-        let (dialog, cmd) = match self.focus {
-            Focus::Sidebar => {
+        let agent = self
+            .selected_agent_index()
+            .map(|i| self.agents[i].handle.clone());
+        let (dialog, cmd) = match (self.focus, agent) {
+            (Focus::Sidebar, Some(handle)) => (
+                ConfirmDialog {
+                    title: format!("Forget {handle}?"),
+                    message: "It disappears from every device until it checks in again."
+                        .to_string(),
+                    action: "forget".to_string(),
+                },
+                Cmd::ForgetAgent(handle),
+            ),
+            (Focus::Sidebar, None) => {
                 let Selection::Channel(name) = &self.selected else {
                     self.toast("Announcements can't be deleted: pick a channel");
                     return;

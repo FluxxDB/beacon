@@ -102,6 +102,15 @@ CREATE TABLE IF NOT EXISTS presence_status (
     seq    INTEGER NOT NULL
 );
 
+-- The newest agent_forgotten per handle. `who` lists a handle only while its
+-- presence row is newer than this mark, and shows only a status set after it.
+CREATE TABLE IF NOT EXISTS forgotten (
+    handle TEXT PRIMARY KEY,
+    ts     INTEGER NOT NULL,
+    origin TEXT    NOT NULL,
+    seq    INTEGER NOT NULL
+);
+
 -- The newest peer_announced per node.
 CREATE TABLE IF NOT EXISTS peers_announced (
     node   TEXT PRIMARY KEY,

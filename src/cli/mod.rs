@@ -276,10 +276,18 @@ pub struct GetArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "--forget takes a handle off the list on every device until it checks in \
+again; without --as it is done as BEACON_HUMAN. Exit 2 if the handle is not listed."
+)]
 pub struct WhoArgs {
     /// Say you are here, and what you are working on (needs a handle)
     #[arg(long, value_name = "STATUS", num_args = 0..=1, default_missing_value = "")]
     pub here: Option<String>,
+
+    /// Take a stale handle off the list (Dang's call, not an agent's)
+    #[arg(long, value_name = "HANDLE", conflicts_with = "here")]
+    pub forget: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1129,6 +1137,9 @@ async fn receive(
 // ------------------------------------------------------- who, join and leave
 
 async fn who(ctx: &Ctx, args: WhoArgs) -> Result<(), Error> {
+    if let Some(handle) = &args.forget {
+        return forget(ctx, handle).await;
+    }
     match &args.here {
         Some(status) => {
             ctx.handle()?;
@@ -1140,6 +1151,25 @@ async fn who(ctx: &Ctx, args: WhoArgs) -> Result<(), Error> {
     }
     let who = ctx.client.who().await?;
     ctx.show(&who, || human::who_text(&who.agents, ctx.clock.now_ms))
+}
+
+/// `who --forget`: takes `handle` off the list on every device until it checks
+/// in again. Done as the caller's handle when it has one (like `delete`),
+/// else as the human (like `post --human`), which needs no handle.
+async fn forget(ctx: &Ctx, handle: &str) -> Result<(), Error> {
+    let handle = validate_handle(handle.trim())?;
+    let by = match &ctx.handle {
+        Some(own) => own.clone(),
+        None => human_handle()?,
+    };
+    ctx.announce().await?;
+    let ack = ctx.client.forget(&handle, Some(&by)).await?;
+    ctx.show(&ack, || {
+        format!(
+            "forgot {} · it reappears if it checks in again",
+            human::clean_inline(&ack.forgot)
+        )
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

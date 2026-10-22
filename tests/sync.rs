@@ -334,6 +334,89 @@ async fn converges_in_a_line() {
     assert!(bodies.contains(&"from c".to_string()), "{bodies:?}");
 }
 
+/// The handles `node` lists in `who`.
+async fn who(node: &TestNode) -> Vec<String> {
+    let body = ok_json(node.get("/api/who").send().await.unwrap()).await;
+    body["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["handle"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A heartbeat for agent `handle` on `node`; whether it was recorded.
+async fn beat(node: &TestNode, handle: &str) -> bool {
+    let resp = node
+        .post("/api/who")
+        .json(&json!({ "handle": handle, "kind": "agent", "client": "claude-code" }))
+        .send()
+        .await
+        .unwrap();
+    ok_json(resp).await["recorded"].as_bool().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forget_reaches_every_node_and_a_check_in_undoes_it() {
+    let (a, b, c) = line().await;
+    assert!(beat(&a, "pc-test").await);
+    assert!(beat(&c, "mac-test").await);
+    eventually(5, "every node to list both test agents", || async {
+        let want = |list: Vec<String>| list.len() == 2;
+        want(who(&a).await) && want(who(&b).await) && want(who(&c).await)
+    })
+    .await;
+
+    // Dang forgets both on the middle node; the TUIs on the ends hear of it.
+    let mut on_a = Sse::open(&a, "").await;
+    let mut on_c = Sse::open(&c, "").await;
+    for handle in ["pc-test", "mac-test"] {
+        let resp = b
+            .delete(&format!("/api/who/{handle}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_json(resp).await["forgot"], handle);
+    }
+    let forgotten = |handle: &'static str| move |e: &StreamEvent| matches!(e, StreamEvent::AgentForgotten { handle: h } if h == handle);
+    on_a.until(5, "pc-test forgotten on a", forgotten("pc-test"))
+        .await;
+    on_c.until(5, "mac-test forgotten on c", forgotten("mac-test"))
+        .await;
+    eventually(5, "no node to list them", || async {
+        who(&a).await.is_empty() && who(&b).await.is_empty() && who(&c).await.is_empty()
+    })
+    .await;
+
+    // pc-test checks in again on a: back everywhere; mac-test stays gone.
+    assert!(
+        beat(&a, "pc-test").await,
+        "a forgotten handle's check-in counts"
+    );
+    eventually(5, "pc-test to be back on every node", || async {
+        let back = |list: Vec<String>| list == ["pc-test"];
+        back(who(&a).await) && back(who(&b).await) && back(who(&c).await)
+    })
+    .await;
+    // And the logs settle: nothing loops.
+    eventually(5, "the version vectors to agree", || async {
+        let (va, vb, vc) = (
+            version_vector(&a).await,
+            version_vector(&b).await,
+            version_vector(&c).await,
+        );
+        va == vb && vb == vc
+    })
+    .await;
+    let settled = version_vector(&a).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        version_vector(&a).await,
+        settled,
+        "no new events by themselves"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn push_delivers_under_a_second() {
     let (a, b) = pair().await;

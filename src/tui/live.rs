@@ -531,6 +531,12 @@ impl Worker {
                     deleted.map(|ack| ack.deleted).map_err(|e| e.to_string()),
                 ))
             }
+            Cmd::ForgetAgent(handle) => {
+                let forgot = client.forget(&handle, Some(me)).await;
+                Some(Msg::AgentForgotten(
+                    forgot.map(|ack| ack.forgot).map_err(|e| e.to_string()),
+                ))
+            }
             Cmd::MarkRead { channel, arrival } => {
                 // Then the counts as they now stand.
                 let _ = client.set_cursor(me, &channel, arrival).await;

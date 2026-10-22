@@ -3016,6 +3016,111 @@ async fn who_here_needs_a_handle_and_a_valid_status() {
     assert!(out.text().starts_with("● pc-configs "), "{}", out.stdout);
 }
 
+/// Who forgot which handle, in event order.
+async fn forgets(node: &TestNode) -> Vec<(String, String)> {
+    let events = node
+        .state()
+        .with_store(|s| s.events_after(&Default::default(), 1000))
+        .await
+        .unwrap();
+    events
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            EventKind::AgentForgotten { handle, by } => Some((handle, by)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn who_forget_takes_a_stale_agent_off_the_list() {
+    let node = spawn_node("pc", &[]).await;
+    for handle in ["pc-test", "mac-test", "gpu-test"] {
+        beacon(&node, &["who", "--here", "e2e", "--as", handle])
+            .ok()
+            .await;
+    }
+
+    // Dang at a shell has no handle: BEACON_HUMAN (else Dang) forgets.
+    let out = beacon(&node, &["who", "--forget", "pc-test"]).ok().await;
+    assert_eq!(
+        out.text(),
+        "forgot pc-test · it reappears if it checks in again"
+    );
+    assert_eq!(out.stderr, "");
+    let list = beacon(&node, &["who"]).ok().await.stdout;
+    assert!(!list.contains("pc-test"), "{list}");
+    assert!(list.contains("mac-test"), "{list}");
+
+    // --json is the node's ack.
+    let out = beacon(&node, &["who", "--forget", "mac-test", "--json"])
+        .env("BEACON_HUMAN", "Boss")
+        .ok()
+        .await;
+    assert_eq!(
+        out.json(),
+        json!({ "v": 1, "ok": true, "forgot": "mac-test" })
+    );
+    // With a handle, that handle forgets (and is here, like any command).
+    beacon(
+        &node,
+        &["who", "--forget", "gpu-test", "--as", "pc-configs"],
+    )
+    .ok()
+    .await;
+    assert_eq!(
+        forgets(&node).await,
+        [
+            ("pc-test".to_string(), "Dang".to_string()),
+            ("mac-test".to_string(), "Boss".to_string()),
+            ("gpu-test".to_string(), "pc-configs".to_string()),
+        ]
+    );
+    let list = beacon(&node, &["who"]).ok().await;
+    assert!(list.text().starts_with("● pc-configs "), "{}", list.stdout);
+    assert_eq!(list.text().lines().count(), 1, "{}", list.stdout);
+
+    // Not listed (forgotten already, or never seen): exit 2, nothing written.
+    for handle in ["pc-test", "never-seen"] {
+        let out = beacon(&node, &["who", "--forget", handle]).run().await;
+        assert_eq!(out.code, 2, "{out:?}");
+        assert!(out.stderr.contains("is not listed"), "{}", out.stderr);
+        assert_eq!(out.stdout, "");
+    }
+    assert_eq!(forgets(&node).await.len(), 3);
+
+    // It comes back when it checks in.
+    beacon(&node, &["who", "--here", "--as", "pc-test"])
+        .ok()
+        .await;
+    let list = beacon(&node, &["who"]).ok().await.stdout;
+    assert!(list.contains("pc-test"), "{list}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn who_forget_refuses_bad_input() {
+    let node = spawn_node("pc", &[]).await;
+    beacon(&node, &["who", "--here", "--as", "pc-test"])
+        .ok()
+        .await;
+    for args in [
+        &["who", "--forget", "pc-test", "--here", "x"][..],
+        &["who", "--forget"][..],
+        &["who", "--forget", "bad handle"][..],
+    ] {
+        let out = beacon(&node, args).run().await;
+        assert_eq!(out.code, 1, "{args:?}: {out:?}");
+    }
+    let out = beacon(&node, &["who", "--forget", "pc-test"])
+        .env("BEACON_HUMAN", "not a handle")
+        .run()
+        .await;
+    assert_eq!(out.code, 1, "{out:?}");
+    assert!(forgets(&node).await.is_empty());
+    let list = beacon(&node, &["who"]).ok().await.stdout;
+    assert!(list.contains("pc-test"), "{list}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn join_and_leave() {
     let node = spawn_node("pc", &[]).await;

@@ -2,14 +2,14 @@
 //!
 //! [`Store::apply`] (one event) and [`Store::apply_all`] (a page of them, in
 //! one transaction) store each event once per `(origin, seq)` and update the
-//! derived tables (channels, posts, presence, announced peers) in the same
-//! transaction. An event whose payload breaks [`validate_event`] is stored
-//! and relayed but changes no derived state. The derived state depends only
-//! on the set of events stored, never on the order they arrived in, so nodes
-//! that hold the same events show the same board; a build whose rules derive
-//! differently bumps [`DERIVE_VERSION`], and opening the database then derives
-//! the board again from the log. See `schema.sql` for the tables and the
-//! visibility rule. What each handle has read and joined lives beside the
+//! derived tables (channels, posts, presence and forgets, announced peers) in
+//! the same transaction. An event whose payload breaks [`validate_event`] is
+//! stored and relayed but changes no derived state. The derived state depends
+//! only on the set of events stored, never on the order they arrived in, so
+//! nodes that hold the same events show the same board; a build whose rules
+//! derive differently bumps [`DERIVE_VERSION`], and opening the database then
+//! derives the board again from the log. See `schema.sql` for the tables and
+//! the visibility rule. What each handle has read and joined lives beside the
 //! log, local to the node; see [`Unread`].
 //!
 //! Every commit is synced to disk before it returns (`synchronous=FULL`): a
@@ -61,7 +61,9 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// board from the same events (a rule loosened, a new kind learned): opening
 /// a database built under another version derives the board again from its
 /// events. Stored in `meta` as `derive_version`.
-pub const DERIVE_VERSION: u32 = 1;
+///
+/// 2: `agent_forgotten` (an older build kept it as an unknown kind).
+pub const DERIVE_VERSION: u32 = 2;
 /// The `meta` key prefix of a database id this database wrote under before
 /// it moved to its current one (`Store::move_origin`).
 const FORMER_DB_ID: &str = "former_db_id:";
@@ -86,6 +88,17 @@ const SHOWN_POSTS: &str =
 const CHANNEL_SELECT: &str = "SELECT v.name, v.topic, \
      (SELECT MAX(p.ts) FROM posts AS p WHERE p.channel = v.name AND p.deleted = 0) \
      FROM visible_channels AS v";
+/// Each handle's newest heartbeat (`p`), its newest forget (`f`, if any) and
+/// the newest status set after that forget (`s`): a status from before a
+/// forget is forgotten with it.
+const PRESENCE_JOINS: &str = "presence AS p \
+     LEFT JOIN forgotten AS f ON f.handle = p.handle \
+     LEFT JOIN presence_status AS s ON s.handle = p.handle \
+         AND (f.handle IS NULL OR (s.ts, s.origin, s.seq) > (f.ts, f.origin, f.seq))";
+/// Whether a row of [`PRESENCE_JOINS`] is listed: never forgotten, or seen
+/// since its newest forget, by the order every register uses.
+const NOT_FORGOTTEN: &str =
+    "(f.handle IS NULL OR (p.last_seen_ms, p.origin, p.seq) > (f.ts, f.origin, f.seq))";
 
 /// One node's copy of the board: the event log plus the state derived from it.
 ///
@@ -756,14 +769,17 @@ impl Store {
         Ok(stmt.query_row([id], post_row).optional()?)
     }
 
-    /// Handles seen within the last 2 hours, most recently seen first.
+    /// Handles seen within the last 2 hours, most recently seen first. A
+    /// handle that was forgotten (`agent_forgotten`) is left out until a
+    /// heartbeat newer than the forget checks it in again.
     pub fn who(&self, now_ms: i64) -> Result<Vec<PresenceRow>> {
-        let mut stmt = self.conn.prepare_cached(
+        let sql = format!(
             "SELECT p.handle, p.kind, p.client, p.node, s.status, p.last_seen_ms
-             FROM presence AS p LEFT JOIN presence_status AS s ON s.handle = p.handle
-             WHERE p.last_seen_ms >= ?1
-             ORDER BY p.last_seen_ms DESC, p.handle",
-        )?;
+             FROM {PRESENCE_JOINS}
+             WHERE {NOT_FORGOTTEN} AND p.last_seen_ms >= ?1
+             ORDER BY p.last_seen_ms DESC, p.handle"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map([now_ms.saturating_sub(WHO_WINDOW_MS)], |r| {
             Ok(PresenceRow {
                 handle: r.get(0)?,
@@ -778,21 +794,30 @@ impl Store {
     }
 
     /// Whether heartbeat `p` should be recorded as an `agent_seen` event: the
-    /// handle has none in the last 60 s, or `p` sets a different status.
+    /// handle has none in the last 60 s, or `p` sets a different status than
+    /// the one shown, or the handle was forgotten and an event stamped
+    /// `now_ms` would check it in again (a clock behind the forget's could
+    /// not, so it waits for the minute like any heartbeat).
     pub fn presence_due(&self, p: &Presence, now_ms: i64) -> bool {
+        let sql = format!(
+            "SELECT p.last_seen_ms, s.status, {NOT_FORGOTTEN}, f.ts
+             FROM {PRESENCE_JOINS} WHERE p.handle = ?1"
+        );
         let last = self
             .conn
-            .query_row(
-                "SELECT p.last_seen_ms, s.status
-                 FROM presence AS p LEFT JOIN presence_status AS s ON s.handle = p.handle
-                 WHERE p.handle = ?1",
-                [&p.handle],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
-            )
+            .query_row(&sql, [&p.handle], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, bool>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
+            })
             .optional();
         match last {
-            Ok(Some((seen_ms, status))) => {
-                now_ms.saturating_sub(seen_ms) >= PRESENCE_INTERVAL_MS
+            Ok(Some((seen_ms, status, listed, forgot_ms))) => {
+                (!listed && forgot_ms.is_some_and(|f| now_ms > f))
+                    || now_ms.saturating_sub(seen_ms) >= PRESENCE_INTERVAL_MS
                     || (p.status.is_some() && p.status != status)
             }
             // Never seen, or the store could not tell: one extra heartbeat is harmless.
@@ -863,7 +888,8 @@ fn rederive_if_stale(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction()?;
     tx.execute_batch(
         "DELETE FROM channel_marks; DELETE FROM posts; DELETE FROM tombstones;
-         DELETE FROM presence; DELETE FROM presence_status; DELETE FROM peers_announced;",
+         DELETE FROM presence; DELETE FROM presence_status; DELETE FROM forgotten;
+         DELETE FROM peers_announced;",
     )?;
     let (mut derived, mut skipped) = (0u64, 0u64);
     {
@@ -962,6 +988,16 @@ fn derive(tx: &Connection, ev: &Event, arrival: i64) -> Result<()> {
                     params![p.handle, status, ev.ts, ev.origin, ev.seq],
                 )?;
             }
+        }
+        EventKind::AgentForgotten { handle, .. } => {
+            tx.execute(
+                "INSERT INTO forgotten (handle, ts, origin, seq) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (handle) DO UPDATE SET
+                     ts = excluded.ts, origin = excluded.origin, seq = excluded.seq
+                 WHERE (excluded.ts, excluded.origin, excluded.seq)
+                     > (forgotten.ts, forgotten.origin, forgotten.seq)",
+                params![handle, ev.ts, ev.origin, ev.seq],
+            )?;
         }
         // Never valid, so never derived.
         EventKind::Unknown(_) => {}

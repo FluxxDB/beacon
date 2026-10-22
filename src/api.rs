@@ -277,6 +277,15 @@ pub struct DeleteAck {
     pub deleted: String,
 }
 
+/// The answer to `DELETE /api/who/:handle` (and `who --forget --json`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgetAck {
+    pub v: u32,
+    pub ok: bool,
+    /// The handle, as `who` listed it.
+    pub forgot: String,
+}
+
 /// `POST /api/who`: a presence heartbeat. The node is the server's own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WhoRequest {
@@ -407,6 +416,9 @@ pub enum StreamEvent {
     Channel { channel: ChannelJson, deleted: bool },
     /// A handle was seen.
     Presence(PresenceJson),
+    /// A handle was forgotten: it leaves the list until a `presence` event
+    /// brings it back. (Clients that do not know this event skip it.)
+    AgentForgotten { handle: String },
     /// A peer's reachability changed: the whole peer list.
     Peers(Vec<PeerJson>),
 }
@@ -419,6 +431,7 @@ impl StreamEvent {
             StreamEvent::PostDeleted { .. } => "post_deleted",
             StreamEvent::Channel { .. } => "channel",
             StreamEvent::Presence(_) => "presence",
+            StreamEvent::AgentForgotten { .. } => "agent_forgotten",
             StreamEvent::Peers(_) => "peers",
         }
     }
@@ -502,6 +515,9 @@ mod tests {
                 deleted: true,
             },
             StreamEvent::Presence(presence),
+            StreamEvent::AgentForgotten {
+                handle: "pc-test".into(),
+            },
             StreamEvent::Peers(vec![peer]),
             StreamEvent::Peers(Vec::new()),
         ]
@@ -514,7 +530,14 @@ mod tests {
         names.dedup();
         assert_eq!(
             names,
-            ["post", "post_deleted", "channel", "presence", "peers"]
+            [
+                "post",
+                "post_deleted",
+                "channel",
+                "presence",
+                "agent_forgotten",
+                "peers"
+            ]
         );
         for event in &events {
             // The name is the serde tag and the data is the serde content:
@@ -548,7 +571,8 @@ mod tests {
             })
         );
         assert_eq!(events[3].data()["handle"], "pc-configs");
-        assert!(events[4].data().is_array());
+        assert_eq!(events[4].data(), serde_json::json!({ "handle": "pc-test" }));
+        assert!(events[5].data().is_array());
         // A name or data that does not fit is an error, not a guess.
         assert!(StreamEvent::from_sse("post", "{}").is_err());
         assert!(StreamEvent::from_sse("nonsense", "{}").is_err());

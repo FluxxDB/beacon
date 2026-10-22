@@ -21,6 +21,9 @@ const RIGHT_PAD: u16 = 2;
 struct Row {
     /// Lifted, with the lime edge rule: the view on screen.
     selected: bool,
+    /// Lifted, with a quiet edge rule: the agent row under the cursor (as a
+    /// selected post is marked; the accent stays on the view on screen).
+    cursor: bool,
     /// Drawn at the glyph column, the name then starting at the name column.
     glyph: Option<Seg>,
     name: String,
@@ -49,6 +52,7 @@ pub fn render(canvas: &mut Canvas, app: &App, rect: Rect) {
             let bright = Ink::new(role::STRONG, role::LIFTED);
             Row {
                 selected,
+                cursor: false,
                 glyph: None,
                 name: format!("# {}", ch.name),
                 name_ink: bright,
@@ -62,6 +66,7 @@ pub fn render(canvas: &mut Canvas, app: &App, rect: Rect) {
             };
             Row {
                 selected,
+                cursor: false,
                 glyph: Some(("# ".to_string(), panel(role::QUIET))),
                 name: ch.name.clone(),
                 name_ink: panel(fg),
@@ -82,20 +87,31 @@ pub fn render(canvas: &mut Canvas, app: &App, rect: Rect) {
         none.name_ink = panel(role::META);
         rows.push(Some(none));
     }
+    let under_cursor = match app.focus {
+        Focus::Sidebar => app.selected_agent.as_deref(),
+        _ => None,
+    };
     rows.extend(app.agents.iter().map(|agent| {
         let (dot, dot_fg, name_fg) = if agent.active {
             ("●", palette::GREEN, role::TEXT)
         } else {
             ("○", role::QUIET, role::META)
         };
+        let cursor = under_cursor == Some(agent.handle.as_str());
+        let (bg, name_fg) = if cursor {
+            (role::LIFTED, role::STRONG)
+        } else {
+            (role::SIDEBAR_BG, name_fg)
+        };
         Some(Row {
             selected: false,
-            glyph: Some((dot.to_string(), panel(dot_fg))),
+            cursor,
+            glyph: Some((dot.to_string(), Ink::new(dot_fg, bg))),
             name: agent.handle.clone(),
-            name_ink: panel(name_fg),
+            name_ink: Ink::new(name_fg, bg),
             right: Some((
                 age_short(app.now_ms - agent.last_seen_ms),
-                panel(role::QUIET),
+                Ink::new(role::QUIET, bg),
             )),
         })
     }));
@@ -115,6 +131,7 @@ fn panel(fg: Rgb) -> Ink {
 fn label(text: &str, right: Option<Seg>) -> Row {
     Row {
         selected: false,
+        cursor: false,
         glyph: None,
         name: text.to_string(),
         name_ink: panel(role::QUIET),
@@ -138,6 +155,7 @@ fn announcements(app: &App) -> Row {
     let ink = Ink::new(fg, bg);
     Row {
         selected,
+        cursor: false,
         glyph: Some(("◆".to_string(), ink)),
         name: "Announcements".to_string(),
         name_ink: ink,
@@ -156,6 +174,19 @@ fn draw(canvas: &mut Canvas, rect: Rect, y: u16, row: &Row) {
             y,
             "▍",
             Ink::new(role::ACCENT, role::LIFTED),
+            rect.right(),
+        );
+    }
+    if row.cursor {
+        canvas.fill(
+            Rect::new(rect.x, y, rect.width, 1),
+            Ink::new(role::TEXT, role::LIFTED),
+        );
+        canvas.text(
+            rect.x,
+            y,
+            "▍",
+            Ink::new(role::META, role::LIFTED),
             rect.right(),
         );
     }

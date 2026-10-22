@@ -1917,3 +1917,279 @@ fn an_unknown_kind_is_stored_and_relayed_never_derived() {
         serde_json::from_str::<serde_json::Value>(FUTURE_EVENT).unwrap()
     );
 }
+
+// ---- forgetting a handle (agent_forgotten) ----
+
+/// Records Dang forgetting `handle` on `s`.
+fn forget(s: &mut Store, handle: &str, ts: i64) -> Event {
+    let kind = EventKind::AgentForgotten {
+        handle: handle.into(),
+        by: "Dang".into(),
+    };
+    local(s, kind, ts)
+}
+
+fn listed(s: &Store, now: i64) -> Vec<String> {
+    s.who(now).unwrap().into_iter().map(|p| p.handle).collect()
+}
+
+/// A peer's `agent_forgotten` at `ts`, as if `append_local` had not checked it.
+fn remote_forget(handle: &str, by: &str, ts: i64) -> Event {
+    let kind = EventKind::AgentForgotten {
+        handle: handle.into(),
+        by: by.into(),
+    };
+    Event {
+        ts,
+        ..remote(1, kind)
+    }
+}
+
+#[test]
+fn forget_hides_a_handle_until_it_is_seen_again() {
+    let (mut a, _) = pair();
+    let t0 = 1_000 * MIN;
+    seen(&mut a, "pc-test", None, t0);
+    seen(&mut a, "pc-configs", None, t0 + 1);
+    assert_eq!(listed(&a, t0 + 2), ["pc-configs", "pc-test"]);
+
+    forget(&mut a, "pc-test", t0 + 10);
+    assert_eq!(listed(&a, t0 + 20), ["pc-configs"]);
+    // Forgetting it again changes nothing.
+    forget(&mut a, "pc-test", t0 + 11);
+    assert_eq!(listed(&a, t0 + 20), ["pc-configs"]);
+
+    // A heartbeat newer than the newest forget brings it back.
+    seen(&mut a, "pc-test", None, t0 + 30);
+    assert_eq!(listed(&a, t0 + 40), ["pc-test", "pc-configs"]);
+    let back = a.who(t0 + 40).unwrap().remove(0);
+    assert_eq!(back.last_seen_ms, t0 + 30);
+}
+
+#[test]
+fn a_heartbeat_older_than_the_forget_does_not_bring_it_back() {
+    let (mut a, mut b) = pair();
+    let t0 = 1_000 * MIN;
+    seen(&mut a, "mac-test", None, t0);
+    // On the Mac, a heartbeat written before Dang's forget, but synced after it.
+    let late = local(
+        &mut b,
+        EventKind::AgentSeen(heartbeat("mac-test", None)),
+        t0 + 5,
+    );
+    forget(&mut a, "mac-test", t0 + 10);
+    assert!(a.apply(&late).unwrap().is_some());
+    assert!(listed(&a, t0 + 20).is_empty());
+
+    sync(&mut a, &mut b);
+    assert!(listed(&b, t0 + 20).is_empty());
+    assert_eq!(a.who(t0 + 20).unwrap(), b.who(t0 + 20).unwrap());
+}
+
+#[test]
+fn forget_ties_break_like_every_other_register() {
+    // A heartbeat and a forget in the same ms: (ts, origin, seq) decides,
+    // the same on every node.
+    let (mut a, mut b) = pair();
+    let t0 = 1_000 * MIN;
+    seen(&mut a, "pc-test", None, t0);
+    forget(&mut b, "pc-test", t0);
+    sync(&mut a, &mut b);
+    // `mac~…` < `pc~…`: the heartbeat from pc sorts after the forget from mac.
+    assert_eq!(listed(&a, t0), ["pc-test"]);
+    assert_eq!(a.who(t0).unwrap(), b.who(t0).unwrap());
+}
+
+#[test]
+fn forget_converges_whatever_the_order() {
+    let (mut a, mut b) = pair();
+    let mut c = Store::open_in_memory("gpu").unwrap();
+    let t0 = 1_000 * MIN;
+    let seen_by = |s: &mut Store, handle: &str, status: Option<&str>, ts: i64| {
+        local(s, EventKind::AgentSeen(heartbeat(handle, status)), ts)
+    };
+    let events = vec![
+        seen_by(&mut a, "pc-test", Some("e2e"), t0),
+        seen_by(&mut b, "mac-test", None, t0 + 1),
+        forget(&mut c, "pc-test", t0 + 10),
+        forget(&mut c, "mac-test", t0 + 11),
+        seen_by(&mut b, "mac-test", None, t0 + 20),
+        seen_by(&mut a, "pc-test", None, t0 + 5),
+    ];
+
+    // Every order the six events can arrive in shows the same agents.
+    let mut want: Option<Vec<PresenceRow>> = None;
+    let mut order: Vec<usize> = (0..events.len()).collect();
+    let mut orders = 0;
+    loop {
+        let mut s = Store::open_in_memory("tv").unwrap();
+        for &i in &order {
+            assert!(s.apply(&events[i]).unwrap().is_some());
+        }
+        let who = s.who(t0 + 30).unwrap();
+        match &want {
+            None => want = Some(who),
+            Some(want) => assert_eq!(&who, want, "order {order:?}"),
+        }
+        orders += 1;
+        if !next_permutation(&mut order) {
+            break;
+        }
+    }
+    assert_eq!(orders, 720);
+    // mac-test checked in after its forget; pc-test did not.
+    let want = want.unwrap();
+    assert_eq!(want.len(), 1, "{want:?}");
+    assert_eq!(want[0].handle, "mac-test");
+    assert_eq!(want[0].last_seen_ms, t0 + 20);
+}
+
+/// Steps `v` to its next lexicographic permutation; false after the last.
+fn next_permutation(v: &mut [usize]) -> bool {
+    let Some(i) = (1..v.len()).rev().find(|&i| v[i - 1] < v[i]) else {
+        return false;
+    };
+    let j = (i..v.len()).rev().find(|&j| v[j] > v[i - 1]).unwrap();
+    v.swap(i - 1, j);
+    v[i..].reverse();
+    true
+}
+
+#[test]
+fn a_status_set_before_the_forget_stays_forgotten() {
+    let (mut a, _) = pair();
+    let t0 = 1_000 * MIN;
+    seen(&mut a, "pc-test", Some("cross-machine test"), t0);
+    forget(&mut a, "pc-test", t0 + 10);
+    seen(&mut a, "pc-test", None, t0 + 20);
+    let who = a.who(t0 + 20).unwrap();
+    assert_eq!(who.len(), 1);
+    assert_eq!(who[0].status, None, "the old status went with the forget");
+
+    // Setting that same status again is a change, and shows.
+    let busy = heartbeat("pc-test", Some("cross-machine test"));
+    assert!(a.presence_due(&busy, t0 + 25));
+    local(&mut a, EventKind::AgentSeen(busy), t0 + 25);
+    assert_eq!(
+        a.who(t0 + 25).unwrap()[0].status.as_deref(),
+        Some("cross-machine test")
+    );
+}
+
+#[test]
+fn presence_is_due_at_once_for_a_forgotten_handle() {
+    let (mut a, _) = pair();
+    let t0 = 1_000 * MIN;
+    let hb = heartbeat("pc-configs", None);
+    local(&mut a, EventKind::AgentSeen(hb.clone()), t0);
+    assert!(!a.presence_due(&hb, t0 + 5_000));
+    forget(&mut a, "pc-configs", t0 + 10_000);
+
+    // Seen within the minute, but forgotten since: its next check-in counts.
+    assert!(a.presence_due(&hb, t0 + 20_000));
+    local(&mut a, EventKind::AgentSeen(hb.clone()), t0 + 20_000);
+    assert_eq!(listed(&a, t0 + 20_000), ["pc-configs"]);
+    assert!(!a.presence_due(&hb, t0 + 30_000), "back to once a minute");
+
+    // A clock behind the forget's could not bring it back: no event per
+    // call then, only the usual one a minute.
+    let (mut b, _) = pair();
+    local(&mut b, EventKind::AgentSeen(hb.clone()), t0);
+    forget(&mut b, "pc-configs", t0 + 50_000);
+    assert!(!b.presence_due(&hb, t0 + 30_000));
+    assert!(b.presence_due(&hb, t0 + 61_000));
+}
+
+#[test]
+fn a_forget_that_breaks_the_rules_hides_nothing() {
+    let t0 = 1_000 * MIN;
+    let bad = [
+        ("pc test", "Dang"),
+        ("pc-test", "bad by"),
+        ("pc-test", ""),
+        ("pc\u{7}test", "Dang"),
+        ("pc-test", "Dang\u{0}"),
+        ("", "Dang"),
+    ];
+    for (handle, by) in bad {
+        let kind = EventKind::AgentForgotten {
+            handle: handle.into(),
+            by: by.into(),
+        };
+        let label = format!("{kind:?}");
+        let mut local_store = Store::open_in_memory("evil").unwrap();
+        assert!(
+            matches!(local_store.append_local(kind, t0), Err(Error::Usage(_))),
+            "append_local accepted {label}"
+        );
+
+        let (mut a, _) = pair();
+        seen(&mut a, "pc-test", None, t0);
+        let ev = remote_forget(handle, by, t0 + 10);
+        assert!(a.apply(&ev).unwrap().is_some(), "{label}: stored");
+        assert_eq!(a.version_vector()["evil~abcdefgh"], 1, "{label}");
+        assert_eq!(listed(&a, t0 + 20), ["pc-test"], "{label}");
+    }
+
+    // A valid one from the same peer hides it, as a control.
+    let (mut a, _) = pair();
+    seen(&mut a, "pc-test", None, t0);
+    a.apply(&remote_forget("pc-test", "Dang", t0 + 10)).unwrap();
+    assert!(listed(&a, t0 + 20).is_empty());
+}
+
+#[test]
+fn a_forget_an_older_build_kept_unread_applies_after_the_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("beacon.db");
+    let t0 = 1_000 * MIN;
+    {
+        let mut a = Store::open(&path, "pc").unwrap();
+        seen(&mut a, "pc-test", None, t0);
+    }
+    // An older build stored the forget as a kind it did not know, derived
+    // nothing from it, and recorded that it derived under the old rules.
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let ev = remote_forget("pc-test", "Dang", t0 + 10);
+    c.execute(
+        "INSERT INTO events (origin, seq, id, ts, json) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            ev.origin,
+            ev.seq,
+            ev.id,
+            ev.ts,
+            serde_json::to_string(&ev).unwrap()
+        ],
+    )
+    .unwrap();
+    c.execute(
+        "UPDATE meta SET value = '1' WHERE key = 'derive_version'",
+        [],
+    )
+    .unwrap();
+    assert_ne!(DERIVE_VERSION, 1, "forgetting is a new rule: a new version");
+
+    let a = Store::open(&path, "pc").unwrap();
+    assert!(listed(&a, t0 + 20).is_empty());
+}
+
+#[test]
+fn agent_forgotten_has_the_documented_wire_shape() {
+    let ev = Event {
+        origin: "pc~abcdefgh".into(),
+        seq: 7,
+        id: "01JDB7K4TR0000000000000077".into(),
+        ts: 1_000,
+        kind: EventKind::AgentForgotten {
+            handle: "pc-test".into(),
+            by: "Dang".into(),
+        },
+    };
+    let json = serde_json::to_value(&ev).unwrap();
+    assert_eq!(json["kind"], "agent_forgotten");
+    assert_eq!(
+        json["data"],
+        serde_json::json!({ "handle": "pc-test", "by": "Dang" })
+    );
+    assert_eq!(serde_json::from_value::<Event>(json).unwrap(), ev);
+}

@@ -1974,6 +1974,269 @@ mod behaviour {
         assert!(screen_text(&app).contains("1 offline · 3 queued"));
     }
 
+    // ---------------------------------------------- forgetting an agent
+
+    /// An agent as `/api/who` lists it, last seen `minutes_ago` before 6:40 pm.
+    fn agent_seen(handle: &str, minutes_ago: i64) -> PresenceJson {
+        PresenceJson {
+            handle: handle.to_string(),
+            kind: AuthorKind::Agent,
+            client: "claude-code".to_string(),
+            node: "pc".to_string(),
+            status: None,
+            last_seen: String::new(),
+            last_seen_ms: at(18, 40) - minutes_ago * 60_000,
+            active: minutes_ago <= 5,
+        }
+    }
+
+    /// `live_app` with three agents in the sidebar (pc-configs, pc-test,
+    /// mac-test, most recent first) and the sidebar focused on #general.
+    fn app_with_agents() -> App {
+        let mut app = live_app();
+        app.update(Msg::Loaded(Loaded::Agents(WhoJson {
+            v: 1,
+            agents: vec![
+                agent_seen("pc-test", 30),
+                agent_seen("mac-test", 50),
+                agent_seen("pc-configs", 1),
+            ],
+        })));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Sidebar);
+        app
+    }
+
+    fn agent_handles(app: &App) -> Vec<&str> {
+        app.agents.iter().map(|a| a.handle.as_str()).collect()
+    }
+
+    /// The sidebar's text, row by row.
+    fn sidebar_text(app: &App) -> String {
+        let buf = screen(app);
+        let (x0, _) = main_pane(W);
+        (0..H)
+            .map(|y| region_text(&buf, y, 0, x0 - 1))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The sidebar cells (left of the main pane) painted in the accent.
+    fn sidebar_accent_cells(buf: &Buffer) -> Vec<(u16, u16)> {
+        use beacon::tui::theme::role;
+        let accent = rgb(role::ACCENT);
+        let (x0, _) = main_pane(W);
+        let mut cells = Vec::new();
+        for y in 0..buf.area.height {
+            for x in 0..x0 - 1 {
+                if buf[(x, y)].fg == accent || buf[(x, y)].bg == accent {
+                    cells.push((x, y));
+                }
+            }
+        }
+        cells
+    }
+
+    #[test]
+    fn sidebar_selection_goes_on_from_the_channels_into_the_agents() {
+        use beacon::tui::theme::role;
+        let mut app = app_with_agents();
+        feed(&mut app, [ch('j'), ch('j')]);
+        assert_eq!(app.selected, Selection::Channel("vllm".to_string()));
+        assert!(app.update(ch('j')).is_empty(), "an agent row loads nothing");
+        assert_eq!(app.selected_agent.as_deref(), Some("pc-configs"));
+        assert_eq!(
+            app.selected,
+            Selection::Channel("vllm".to_string()),
+            "the channel stays on screen"
+        );
+        assert!(app.update(key(KeyCode::Down)).is_empty());
+        assert_eq!(app.selected_agent.as_deref(), Some("pc-test"));
+        feed(&mut app, [ch('j'), ch('j')]);
+        assert_eq!(
+            app.selected_agent.as_deref(),
+            Some("mac-test"),
+            "the last agent stays"
+        );
+
+        // The agent row is lifted with a quiet edge rule, like a selected
+        // post; the accent stays on the channel on screen alone.
+        let buf = screen(&app);
+        let y = row_of(&buf, "mac-test");
+        assert_eq!(
+            (buf[(1, y)].symbol(), buf[(1, y)].fg, buf[(1, y)].bg),
+            ("▍", rgb(role::META), rgb(role::LIFTED))
+        );
+        let name_x = column_of(&buf, y, "mac-test").unwrap();
+        assert_eq!(
+            (buf[(name_x, y)].fg, buf[(name_x, y)].bg),
+            (rgb(role::STRONG), rgb(role::LIFTED))
+        );
+        assert_eq!(buf[(22, y)].bg, rgb(role::LIFTED), "the whole row");
+        let (x0, _) = main_pane(W);
+        let channel_y = (0..H)
+            .find(|&y| region_text(&buf, y, 0, x0 - 1).contains("# vllm"))
+            .unwrap();
+        assert_eq!(sidebar_accent_cells(&buf), [(1, channel_y)]);
+        // The other agent rows are drawn as before.
+        let y = row_of(&buf, "pc-test");
+        assert_eq!(buf[(1, y)].symbol(), " ");
+        assert_eq!(buf[(1, y)].bg, rgb(role::SIDEBAR_BG));
+
+        // Back up: to the first agent, then the channel on screen, then on.
+        feed(&mut app, [ch('k'), key(KeyCode::Up)]);
+        assert_eq!(app.selected_agent.as_deref(), Some("pc-configs"));
+        assert!(app.update(ch('k')).is_empty(), "#vllm is already on screen");
+        assert_eq!(app.selected_agent, None);
+        assert_eq!(app.selected, Selection::Channel("vllm".to_string()));
+        assert!(!rows(&screen(&app)).iter().any(|r| r.contains("▍ ● pc")));
+        assert_eq!(
+            app.update(ch('k')),
+            [Cmd::LoadPosts {
+                channel: "beacon".to_string(),
+                before: None
+            }]
+        );
+    }
+
+    #[test]
+    fn leaving_the_sidebar_lets_go_of_the_agent_row() {
+        let mut app = app_with_agents();
+        feed(&mut app, [ch('j'), ch('j'), ch('j')]);
+        assert_eq!(app.selected_agent.as_deref(), Some("pc-configs"));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Posts);
+        assert_eq!(app.selected_agent, None);
+        // Back in the sidebar, the cursor starts from the channel on screen.
+        app.update(key(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(app.selected_agent, None);
+        app.update(ch('j'));
+        assert_eq!(app.selected_agent.as_deref(), Some("pc-configs"));
+        // A printable key jumps to the composer and lets go too; so does Enter.
+        app.update(ch('x'));
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.selected_agent, None);
+        app.focus = Focus::Sidebar;
+        app.update(ch('j'));
+        assert_eq!(app.selected_agent.as_deref(), Some("pc-configs"));
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.selected_agent, None);
+    }
+
+    #[test]
+    fn d_on_an_agent_row_asks_before_forgetting_it() {
+        use beacon::tui::state::ConfirmDialog;
+        use beacon::tui::theme::role;
+        let mut app = app_with_agents();
+        feed(&mut app, [ch('j'), ch('j'), ch('j'), ch('j')]);
+        assert_eq!(app.selected_agent.as_deref(), Some("pc-test"));
+
+        assert!(app.update(ch('d')).is_empty());
+        assert_eq!(
+            app.dialog,
+            Some(Dialog::Confirm(ConfirmDialog {
+                title: "Forget pc-test?".to_string(),
+                message: "It disappears from every device until it checks in again.".to_string(),
+                action: "forget".to_string(),
+            }))
+        );
+        let buf = screen(&app);
+        let text = rows(&buf).join("\n");
+        assert!(text.contains("Forget pc-test?"), "{text}");
+        // The message wraps inside the dialog.
+        for part in [
+            "It disappears from every device until it checks",
+            "in again.",
+        ] {
+            assert!(text.contains(part), "{part:?} missing:\n{text}");
+        }
+        assert!(text.contains("esc cancel   ↵ forget"), "{text}");
+        let y = row_of(&buf, "↵ forget");
+        let x = column_of(&buf, y, "↵ forget").unwrap();
+        assert_eq!(buf[(x, y)].bg, rgb(role::ACCENT), "the one primary action");
+
+        // Esc cancels: nothing is sent, the row and the cursor stay.
+        assert!(app.update(key(KeyCode::Esc)).is_empty());
+        assert!(app.dialog.is_none() && app.confirm.is_none());
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(app.selected_agent.as_deref(), Some("pc-test"));
+        assert_eq!(agent_handles(&app), ["pc-configs", "pc-test", "mac-test"]);
+
+        // Enter forgets; the row goes when the node says it is done, and the
+        // cursor stays in place, on the next agent.
+        app.update(ch('d'));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Cmd::ForgetAgent("pc-test".to_string())]
+        );
+        assert!(app.dialog.is_none());
+        app.update(Msg::AgentForgotten(Ok("pc-test".to_string())));
+        assert_eq!(agent_handles(&app), ["pc-configs", "mac-test"]);
+        assert_eq!(app.selected_agent.as_deref(), Some("mac-test"));
+        assert_eq!(app.toast.as_deref(), Some("forgot pc-test"));
+        assert!(!sidebar_text(&app).contains("pc-test"));
+
+        // A refusal says so and keeps the row.
+        app.update(ch('d'));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Cmd::ForgetAgent("mac-test".to_string())]
+        );
+        app.update(Msg::AgentForgotten(Err(
+            "mac-test is not listed in who".to_string()
+        )));
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("Not forgotten: mac-test is not listed in who")
+        );
+        assert!(app.toast_error);
+        assert_eq!(agent_handles(&app), ["pc-configs", "mac-test"]);
+    }
+
+    #[test]
+    fn a_forget_from_anywhere_drops_the_row_live() {
+        let mut app = app_with_agents();
+        feed(&mut app, [ch('j'), ch('j'), ch('j'), ch('j'), ch('j')]);
+        assert_eq!(app.selected_agent.as_deref(), Some("mac-test"));
+        let forgotten = |handle: &str| {
+            Msg::Stream(StreamEvent::AgentForgotten {
+                handle: handle.to_string(),
+            })
+        };
+        assert!(app.update(forgotten("mac-test")).is_empty());
+        assert_eq!(agent_handles(&app), ["pc-configs", "pc-test"]);
+        assert_eq!(
+            app.selected_agent.as_deref(),
+            Some("pc-test"),
+            "the cursor moves to the row above the last"
+        );
+        assert!(!sidebar_text(&app).contains("mac-test"));
+        // A handle the sidebar does not show changes nothing.
+        app.update(forgotten("nobody"));
+        assert_eq!(agent_handles(&app), ["pc-configs", "pc-test"]);
+        // Checking in again brings it back.
+        app.update(Msg::Stream(StreamEvent::Presence(agent_seen(
+            "mac-test", 0,
+        ))));
+        assert_eq!(agent_handles(&app), ["mac-test", "pc-configs", "pc-test"]);
+
+        // With every agent gone, the cursor is back on the channel on screen,
+        // and `d` there still deletes the channel.
+        for handle in ["mac-test", "pc-configs", "pc-test"] {
+            app.update(forgotten(handle));
+        }
+        assert!(app.agents.is_empty());
+        assert_eq!(app.selected_agent, None);
+        app.update(ch('d'));
+        assert!(screen_text(&app).contains("Delete #vllm?"));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Cmd::DeleteChannel("vllm".to_string())]
+        );
+    }
+
     #[test]
     fn server_down_then_back_reloads() {
         let mut app = live_app();
