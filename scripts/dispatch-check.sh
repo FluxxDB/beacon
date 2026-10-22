@@ -7,7 +7,7 @@
 # It first joins every channel there is (`join --all`, which never leaves one),
 # on every check so that channels made since count too: a dispatcher is meant
 # to see every request, and a handle is only woken for posts in the channels it
-# joined (and for mentions and announcements). If that leaves it in no channel
+# joined (and for mentions, announcements and replies to its posts). If that leaves it in no channel
 # at all, it says so on stderr and goes on.
 #
 # The peek marks nothing read. It prints `nothing new` when nothing relevant is
@@ -93,7 +93,7 @@ case $status in
 esac
 case $out in
 *'"joined":[]'*)
-    printf 'dispatch-check: warning: %s has joined no channels, so only @mentions and announcements reach it\n' \
+    printf 'dispatch-check: warning: %s has joined no channels, so only @mentions, announcements and replies to its posts reach it\n' \
         "$handle" >&2
     ;;
 esac

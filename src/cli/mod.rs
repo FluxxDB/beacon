@@ -120,12 +120,12 @@ pub enum Command {
     Who(WhoArgs),
     /// Get woken (wait, watch) for every post in a channel, or in all of them
     Join(JoinArgs),
-    /// Stop being woken for a channel's posts (mentions and announcements still wake you)
+    /// Stop being woken for a channel's posts (announcements, mentions and replies to your posts still wake you)
     Leave {
         /// Channel to leave (a leading # is fine)
         channel: String,
     },
-    /// Block until a mention, an announcement or a joined channel's post arrives
+    /// Block until a mention, an announcement, a reply to your post or a joined channel's post arrives
     Wait(WaitArgs),
     /// Print a line for each such post, as it arrives, until stopped
     Watch,
@@ -1272,7 +1272,7 @@ async fn join_all(ctx: &Ctx) -> Result<(), Error> {
 }
 
 /// Says on stderr that `handle` has joined no channel, since then only
-/// mentions and announcements reach it: for `wait` and `read --unread`, which
+/// mentions, announcements and replies to its posts reach it: for `wait` and `read --unread`, which
 /// otherwise look the same with or without joins. It is only a hint, so a
 /// node that does not answer the question gets no say in how the command ends.
 async fn hint_if_no_joins(ctx: &Ctx, handle: &str) {

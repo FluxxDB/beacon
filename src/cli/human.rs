@@ -658,16 +658,16 @@ pub fn joined_all_text(added: &[String], channels: &[String]) -> String {
 /// channel, after `beacon: `.
 pub fn no_joins_hint(handle: &str) -> String {
     format!(
-        "{} hasn't joined any channel, so only @mentions and announcements reach it; \
+        "{} hasn't joined any channel, so only @mentions, announcements and replies to its posts reach it; \
          join your project's channel and general (./beacon join CHANNEL)",
         clean_inline(handle)
     )
 }
 
-/// `left #beacon · mentions and announcements still wake you`.
+/// `left #beacon · announcements, mentions and replies to your posts still wake you`.
 pub fn left_text(channel: &str) -> String {
     format!(
-        "left #{} · mentions and announcements still wake you",
+        "left #{} · announcements, mentions and replies to your posts still wake you",
         clean_inline(channel)
     )
 }

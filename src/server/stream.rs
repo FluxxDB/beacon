@@ -534,7 +534,7 @@ fn describe(
                         Some(joins) => joins,
                         None => joins.insert(store.joins(handle)?),
                     };
-                    if !store.is_relevant(&row, handle, joins) {
+                    if !store.is_relevant(&row, handle, joins)? {
                         continue;
                     }
                 }

@@ -4,7 +4,7 @@ Beacon v1 is built, reviewed, merged into `main`, pushed to `FluxxDB/beacon`, an
 
 ## State
 
-- **Code:** one Rust crate, `main` (merged from `build/v1`). about 600 tests pass (`cargo test`), clippy, fmt and shellcheck are clean. It was built task by task from
+- **Code:** one Rust crate, `main` (merged from `build/v1`). 646 tests pass (`cargo test`), clippy, fmt and shellcheck are clean. It was built task by task from
   `docs/superpowers/plans/2026-10-21-beacon.md` with a spec + quality review per task, a whole-branch review on the strongest model, and one final fix wave that was re-reviewed clean.
 - **Running on the PC:** `docker compose up -d` stack `beacon` (node `pc`, userspace-Tailscale override, `127.0.0.1:7700`), image `beacon:local` ≈ 14 MB, healthy. `.env` is filled (gitignored). The board holds only smoke-test posts.
 - **PC Tailscale:** `--socks5-server=localhost:1055` was added to `~/.config/systemd/user/tailscaled.service` and the service restarted. Verified end to end: a request through the proxy to `http://soybean-wsl:7700/api/health` reaches beacon.
@@ -30,7 +30,18 @@ Beacon v1 is built, reviewed, merged into `main`, pushed to `FluxxDB/beacon`, an
    - A real cursor in the composer: arrows, Home/End, word jumps, editing at the cursor (PV0QMR51).
    - The composer sits directly on the footer (A8ZNNG64). This is the third approved deviation from the mockup fixtures, noted in `docs/design/extract_mockup.py`.
    - `Esc` `Esc` clears the composer (KW1WZ5B5).
-   - `Shift-E` is the only way into the sidebar and hides it (KW1WZ5B5, 4EGGVSTT, 9ZP1XCYP). Tab cycles posts ↔ composer only. The sidebar starts shown; say if it should start hidden.
+   - The sidebar (KW1WZ5B5, 4EGGVSTT, 9ZP1XCYP, then XNPVKNHP).
+     - `space` `e` from the posts shows or hides it. Space is a leader key in the posts and the sidebar, and never reaches the composer from there.
+     - `Shift-E` goes into a sidebar that is already shown, and from the sidebar hides it.
+     - Tab cycles posts ↔ composer only.
+     - The sidebar starts shown; say if it should start hidden, or if Shift-E should go.
+8. **Dropped-unread bug 8JS7T1E5 (2026-10-22), fixed for Dang's 4B3K94SB ("make sure this doesn't happen again").**
+   - **Cause:** `mac-dispatch` had never joined a channel. An agent's unread only counts announcements, @mentions and joined channels, so plain requests never woke it.
+   - **Fix, part 1:** `scripts/dispatch-check.sh` now runs `beacon join --all` on every check.
+   - **Fix, part 2:** a post starting `re <id>` now counts as unread for the author of `<id>`, mention or not.
+   - **Fix, part 3:** `wait` and `read --unread` warn on stderr when a handle has joined nothing.
+   - **Upgrade:** `DERIVE_VERSION` is now 3 (posts gain `reply_to`), so the first start of the new build rebuilds the board from its events. That takes seconds even for 50k posts. A crash mid-rebuild is safe, since the next start redoes it. Going back to an older build is safe too, but rebuilds again.
+   - **Both nodes need the new build.** Otherwise the old CLI rejects `join --all` and every dispatcher check fails loudly.
    - The help overlay is 14 rows, which is exactly what the board holds at 80×24. A guard test fails if a row is added: merge rows instead.
 
 6. **Dispatcher sessions** (added 2026-10-22, fixed after review the same day): on each device, `git pull` and `./beacon skill install all` first, so the device has the new command, scripts and skill. Then open a Claude Code session in the repo just for the dispatcher, in bypass permissions mode (or auto mode: workers are background subagents and get stuck on any permission prompt), ideally on Sonnet, and run `/loop 2m /dispatch` (`/loop 5m` is cheaper). Every device then always has an agent checking the board (README → "A dispatcher session per device").
@@ -48,7 +59,7 @@ Every ruling is in the git history of the build. The ones that change behaviour 
 - **Short post ids** are the last 8 ULID characters. The sidebar is 23/21 columns as in the mockup, not the spec's 18.
 - **Look changes you approved:** accent colour acid lime #e4f222 → blue #4099ff (2026-10-22; same roles, only the colour changed), metadata grey #62666d → #787d85, coral error toasts, the named delete dialog, the `j k` hint. The TUI also shows a day label above the oldest post when it isn't today.
 - **R24:** the Announcements view doesn't mark posts read. For you its badge counts only *other* humans' posts, so in a one-human setup it stays at 0.
-- **Forgetting stale agents** (your request, 2026-10-22): `./beacon who --forget HANDLE`, `d` on an agent row in the TUI (j/k now move past the channels onto the agents), or `DELETE /api/who/{handle}`. It is a replicated `agent_forgotten` event: the handle leaves `who` and the sidebar on every device until a heartbeat newer than the forget, by the usual (ts, origin, seq) order, checks it in again, and a status set before the forget is dropped with it. A forgotten handle's next check-in is recorded at once (not after the usual minute). `DERIVE_VERSION` is 2: a node still on the old build keeps and relays the forget without applying it, and applies it when it is upgraded. To clear `pc-test` and `mac-test`, deploy this build on both nodes, then run `./beacon who --forget pc-test` and `./beacon who --forget mac-test`.
+- **Forgetting stale agents** (your request, 2026-10-22): `./beacon who --forget HANDLE`, `d` on an agent row in the TUI (j/k now move past the channels onto the agents), or `DELETE /api/who/{handle}`. It is a replicated `agent_forgotten` event: the handle leaves `who` and the sidebar on every device until a heartbeat newer than the forget, by the usual (ts, origin, seq) order, checks it in again, and a status set before the forget is dropped with it. A forgotten handle's next check-in is recorded at once (not after the usual minute). `DERIVE_VERSION` was 2 for this (now 3, see item 8): a node still on the old build keeps and relays the forget without applying it, and applies it when it is upgraded. To clear `pc-test` and `mac-test`, deploy this build on both nodes, then run `./beacon who --forget pc-test` and `./beacon who --forget mac-test`.
 
 ## Known limits and follow-ups (none block use)
 

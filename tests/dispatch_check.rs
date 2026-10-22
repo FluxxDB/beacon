@@ -236,8 +236,8 @@ fn other_join_failures_are_passed_on() {
 }
 
 /// What `wait` says on stderr for a handle with no joins.
-const NO_JOINS_HINT: &str = "beacon: pc-dispatch hasn't joined any channel, so only @mentions \
-                             and announcements reach it; join your project's channel and \
+const NO_JOINS_HINT: &str = "beacon: pc-dispatch hasn't joined any channel, so only @mentions, \
+                             announcements and replies to its posts reach it; join your project's channel and \
                              general (./beacon join CHANNEL)";
 
 /// The peek's stderr lands in what the script reads; a hint there is no post.
@@ -272,7 +272,7 @@ fn the_no_joins_hint_is_not_counted() {
 
 /// What the script says when joining every channel left it in none.
 const NO_CHANNELS_WARNING: &str = "dispatch-check: warning: pc-dispatch has joined no channels, \
-                                   so only @mentions and announcements reach it\n";
+                                   so only @mentions, announcements and replies to its posts reach it\n";
 
 /// Joined to nothing after joining everything: the board has no channel.
 #[test]
@@ -535,6 +535,65 @@ async fn against_a_real_node() {
                 .unwrap();
         assert_eq!(unread["posts"].as_array().unwrap().len(), 50);
         assert_eq!(unread["remaining"], 1);
+    })
+    .await
+    .unwrap();
+}
+
+/// Bug 8JS7T1E5, replayed on a real node: the dispatcher asks in #beacon
+/// without joining it, and pc-beacon answers `re <id>:` mentioning only
+/// Dang. The answer is unread for the dispatcher. The peek it makes (`wait`)
+/// is checked before the script runs, with no channel joined, so it still
+/// shows a reply alone reaching its asker if the script comes to join
+/// channels itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_answer_to_the_dispatchers_question_is_unread() {
+    let node = common::spawn_node("pc", &[]).await;
+    let p = Project::real(Some("BEACON_NODE=pc\n"), &node.url, &node.secret);
+    let me = ["--as", "pc-dispatch", "--client", "claude-code"];
+    let (p, answer) = tokio::task::spawn_blocking(move || {
+        p.beacon(&["channel", "new", "beacon"]);
+        let ask = [
+            &["post", "beacon", "is task G merged yet?", "--json"][..],
+            &me,
+        ]
+        .concat();
+        let asked: Value = serde_json::from_str(&p.beacon(&ask)).unwrap();
+        let answer = format!(
+            "re {}: not yet, @Dang has it",
+            asked["post"]["short_id"].as_str().unwrap()
+        );
+        p.beacon(&["post", "beacon", &answer, "--as", "pc-beacon"]);
+        (p, answer)
+    })
+    .await
+    .unwrap();
+    let joins: Value = node
+        .get("/api/joins/pc-dispatch")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(joins["channels"], serde_json::json!([]));
+
+    tokio::task::spawn_blocking(move || {
+        let peek = std::process::Command::new(p.path().join("beacon"))
+            .args([&["wait", "--timeout", "0", "--json"][..], &me].concat())
+            .output()
+            .unwrap();
+        assert_eq!(peek.status.code(), Some(0), "nothing to wake it: {peek:?}");
+        let page: Value = serde_json::from_slice(&peek.stdout).unwrap();
+        assert_eq!(page["posts"].as_array().unwrap().len(), 1, "{page}");
+        assert_eq!(page["posts"][0]["body"], answer.as_str());
+
+        let run = check(&p, &[], &[]);
+        assert_eq!(
+            (run.code, run.stdout.as_str()),
+            (0, "unread: 1\n"),
+            "{run:?}"
+        );
     })
     .await
     .unwrap();

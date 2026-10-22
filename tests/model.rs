@@ -268,6 +268,42 @@ fn short_ids() {
     assert_eq!(short_id(""), "");
 }
 
+/// The one reply parser, shared by the TUI (`tests/tui_reply.rs` has its
+/// cases) and the store, which wakes the author of the post a reply names.
+#[test]
+fn a_reply_starts_with_re_and_a_post_id() {
+    let reply = parse_reply("re 7k4tr2mf: yes").unwrap();
+    assert_eq!((reply.id.as_str(), reply.rest), ("7K4TR2MF", "yes"));
+    let whole = "01JDB7K4TRABCDEFGH7K4TR2MF";
+    assert_eq!(parse_reply(&format!("Re {whole}")).unwrap().id, whole);
+    // A word can look like a short id; the store then only matches it to a
+    // post with exactly that id, and the TUI asks for a digit as well.
+    assert_eq!(parse_reply("re branches: x").unwrap().id, "BRANCHES");
+    for body in [
+        "see re 7K4TR2MF",
+        "re: 7K4TR2MF",
+        "re 7K4TR2MFX",
+        "re7K4TR2MF",
+    ] {
+        assert!(parse_reply(body).is_none(), "{body:?}");
+    }
+}
+
+#[test]
+fn a_reply_names_a_post_by_its_whole_or_short_id_in_any_case() {
+    let id = "01JDB7K4TRABCDEFGH7K4TR2MF";
+    for reference in [id, "7K4TR2MF", "7k4tr2mf", "01jdb7k4trabcdefgh7k4tr2mf"] {
+        assert!(names_post(reference, id), "{reference}");
+    }
+    for reference in ["7K4TR2MG", "01JDB7K4TRABCDEFGJ7K4TR2MF", "K4TR2MF"] {
+        assert!(!names_post(reference, id), "{reference}");
+    }
+    assert!(
+        !names_post("7K4TR2MF", "4TR2MF"),
+        "an id shorter than the reference"
+    );
+}
+
 #[test]
 fn version_vector_edges() {
     assert!(parse_vv("").unwrap().is_empty());

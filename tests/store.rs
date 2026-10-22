@@ -1086,6 +1086,41 @@ fn unread_agrees_with_is_relevant() {
             dang_post(&mut a, channel, body, ts);
         }
     }
+    // Replies, in `vllm`, to a post by each author: by short id, whole id or
+    // either in lowercase, then one that only says `re <id>` past its start.
+    // One more answers a deleted post, one a post that is not here, and one
+    // a whole id that is not here but ends in pc-configs's post's short id.
+    let mut targets: Vec<String> = Vec::new();
+    for author in ["pc-configs", "mac-agent"] {
+        ts += 1;
+        targets.push(post_id(&agent_post(&mut a, author, "beacon", "asks", ts)));
+    }
+    ts += 1;
+    targets.push(post_id(&dang_post(&mut a, "beacon", "asks", ts)));
+    ts += 1;
+    let gone = agent_post(&mut a, "PC-Configs", "beacon", "asks, then deletes", ts);
+    ts += 1;
+    delete_post(&mut a, &gone, ts);
+    targets.push(post_id(&gone));
+    targets.push("01JDB7K4TR00000000000ZZZZZ".into());
+    let phantom = format!("7ZZZZZZZZZZZZZZZZZ{}", short_id(&targets[0]));
+    targets.push(phantom.clone());
+    for author in ["pc-configs", "mac-agent"] {
+        for id in &targets {
+            let short = short_id(id);
+            let lower = id.to_ascii_lowercase();
+            for body in [
+                format!("re {short}: yes"),
+                format!("Re {id}, yes"),
+                format!("re {}: yes", short.to_ascii_lowercase()),
+                format!("RE  {lower}"),
+                format!("see re {short}"),
+            ] {
+                ts += 1;
+                agent_post(&mut a, author, "vllm", &body, ts);
+            }
+        }
+    }
     let every = every_post(&a);
 
     let cases: [(&str, &[&str]); 5] = [
@@ -1096,17 +1131,26 @@ fn unread_agrees_with_is_relevant() {
         ("nobody", &["general"]),
     ];
     let mut wider = false;
+    let mut only_as_replies = 0;
     for (handle, joined) in cases {
         a.set_joins(handle, &strings(joined)).unwrap();
         let joins = a.joins(handle).unwrap();
         let want: Vec<&PostRow> = every
             .iter()
-            .filter(|p| a.is_relevant(p, handle, &joins))
+            .filter(|p| a.is_relevant(p, handle, &joins).unwrap())
             .collect();
         assert!(
             !want.is_empty() && want.len() < every.len(),
             "{handle}: the cases should split the posts"
         );
+        only_as_replies += want
+            .iter()
+            .filter(|p| {
+                !p.announcement()
+                    && !mentions_handle(&p.mentions, handle)
+                    && !joins.contains(&p.channel)
+            })
+            .count();
 
         let mut want_ids: Vec<&str> = want.iter().map(|p| p.id.as_str()).collect();
         let unread = a.unread(handle, 1_000).unwrap();
@@ -1141,6 +1185,215 @@ fn unread_agrees_with_is_relevant() {
         wider,
         "some handle should have new posts that are not relevant"
     );
+    assert!(
+        only_as_replies > 0,
+        "some posts should be relevant only as replies"
+    );
+
+    // The phantom whole id answers nothing; shortened, it names pc-configs's
+    // post. (The loop above checked that the SQL says the same.)
+    let joins = a.joins("pc-configs").unwrap();
+    let relevant = |body: String| {
+        let p = every
+            .iter()
+            .find(|p| p.author == "mac-agent" && p.body == body)
+            .unwrap();
+        a.is_relevant(p, "pc-configs", &joins).unwrap()
+    };
+    assert!(!relevant(format!("Re {phantom}, yes")));
+    assert!(!relevant(format!("RE  {}", phantom.to_ascii_lowercase())));
+    assert!(relevant(format!("re {}: yes", short_id(&phantom))));
+}
+
+// ---- a reply wakes the author of the post it answers ----
+
+/// Bug 8JS7T1E5: the answer to mac-dispatch's question mentioned only Dang,
+/// in a channel mac-dispatch had not joined, and never reached it. A reply
+/// (`re <id>`) reaches the author of the post it names all the same.
+#[test]
+fn a_reply_to_your_post_is_unread_without_a_mention_or_a_join() {
+    let (mut a, _) = pair();
+    let me = "mac-dispatch";
+    let question = agent_post(&mut a, me, "beacon", "is task G merged yet?", 1_000);
+    agent_post(&mut a, "pc-configs", "beacon", "chatter in beacon", 2_000);
+    let answer = format!(
+        "re {}: not yet, @Dang has it",
+        short_id(&post_id(&question))
+    );
+    agent_post(&mut a, "pc-beacon", "beacon", &answer, 3_000);
+    assert!(a.joins(me).unwrap().is_empty());
+
+    assert_eq!(unread_bodies(&a, me, 50), [answer.as_str()]);
+    assert_eq!(
+        a.unread_relevant_counts(me).unwrap(),
+        std::collections::BTreeMap::from([("beacon".to_string(), 1)])
+    );
+    let shown = a.unread(me, 50).unwrap().posts;
+    a.mark_read(me, &shown).unwrap();
+    assert!(a.unread(me, 50).unwrap().posts.is_empty());
+}
+
+#[test]
+fn only_a_reply_to_your_own_post_counts() {
+    let (mut a, _) = pair();
+    let me = "mac-dispatch";
+    let mine = short_id(&post_id(&agent_post(&mut a, me, "beacon", "mine", 1_000))).to_string();
+    let theirs = agent_post(&mut a, "pc-configs", "beacon", "theirs", 2_000);
+    let theirs = short_id(&post_id(&theirs)).to_string();
+    // A reply to someone else's post, its own reply to its own post, and
+    // bodies that name its post without being a reply.
+    agent_post(
+        &mut a,
+        "pc-beacon",
+        "beacon",
+        &format!("re {theirs}: ok"),
+        3_000,
+    );
+    agent_post(&mut a, me, "beacon", &format!("re {mine}: more"), 4_000);
+    agent_post(
+        &mut a,
+        "pc-beacon",
+        "beacon",
+        &format!("see re {mine}"),
+        5_000,
+    );
+    agent_post(&mut a, "pc-beacon", "beacon", &format!("re: {mine}"), 6_000);
+    agent_post(&mut a, "pc-beacon", "beacon", &format!("re {mine}x"), 7_000);
+    assert!(unread_bodies(&a, me, 50).is_empty());
+    assert_eq!(
+        unread_bodies(&a, "pc-configs", 50),
+        [format!("re {theirs}: ok")]
+    );
+}
+
+#[test]
+fn a_reply_names_its_post_by_short_or_whole_id_in_any_case() {
+    let (mut a, _) = pair();
+    // The author's handle in another case is still its handle.
+    let question = agent_post(&mut a, "Mac-Dispatch", "beacon", "question", 1_000);
+    let id = post_id(&question);
+    let short = short_id(&id);
+    let replies = [
+        format!("re {short}: short id"),
+        format!("re {id}: whole id"),
+        format!("Re {}, lowercase", short.to_ascii_lowercase()),
+        format!("RE   {}", id.to_ascii_lowercase()),
+    ];
+    for (n, body) in (2_000..).zip(&replies) {
+        agent_post(&mut a, "pc-beacon", "beacon", body, n);
+    }
+    for me in ["mac-dispatch", "MAC-DISPATCH"] {
+        assert_eq!(unread_bodies(&a, me, 50), replies, "{me}");
+    }
+}
+
+#[test]
+fn a_reply_to_a_deleted_post_still_counts() {
+    let (mut a, _) = pair();
+    let me = "mac-dispatch";
+    let question = agent_post(&mut a, me, "beacon", "question", 1_000);
+    delete_post(&mut a, &question, 2_000);
+    let id = short_id(&post_id(&question)).to_string();
+    let answer = agent_post(&mut a, "pc-beacon", "beacon", &format!("re {id}: a"), 3_000);
+    assert_eq!(unread_bodies(&a, me, 50), [format!("re {id}: a")]);
+
+    // The reply itself follows the rules every post does: deleted, it is gone.
+    delete_post(&mut a, &answer, 4_000);
+    assert!(unread_bodies(&a, me, 50).is_empty());
+
+    // A question in a channel deleted since still counts as answered; a
+    // reply in that channel is hidden with it. (Posted before the delete: a
+    // post written into a deleted channel would bring it back.)
+    let (mut a, _) = pair();
+    let question = agent_post(&mut a, me, "old", "question", 1_000);
+    let id = short_id(&post_id(&question)).to_string();
+    let (hidden, shown) = (format!("re {id}: in old"), format!("re {id}: in beacon"));
+    agent_post(&mut a, "pc-beacon", "old", &hidden, 2_000);
+    delete_channel(&mut a, "old", 3_000);
+    agent_post(&mut a, "pc-beacon", "beacon", &shown, 4_000);
+    assert_eq!(unread_bodies(&a, me, 50), [shown]);
+}
+
+/// Sync is order-independent, so a reply can arrive before the post it
+/// answers (written on another device under the same handle). It counts once
+/// that post is here, if the handle has not read past it in its channel by
+/// then: a cursor never moves back. So `read --unread`, the channel counts
+/// and `wait` (which a new post wakes to look again) find it then; `watch`
+/// judges each post when it reads it, so it may miss this one.
+#[test]
+fn a_reply_that_arrives_before_its_post_counts_once_the_post_does() {
+    let (mut a, mut b) = pair();
+    let me = "mac-dispatch";
+    let question = agent_post(&mut b, me, "beacon", "question", 1_000);
+    let body = format!("re {}: answer", short_id(&post_id(&question)));
+    let answer = agent_post(&mut b, "pc-beacon", "beacon", &body, 2_000);
+
+    a.apply(&answer).unwrap();
+    assert!(unread_bodies(&a, me, 50).is_empty());
+    a.apply(&question).unwrap();
+    assert_eq!(unread_bodies(&a, me, 50), [body.as_str()]);
+
+    // Had `me` read a newer post in #beacon before the question arrived,
+    // the answer would stay read.
+    let (mut a, _) = pair();
+    a.apply(&answer).unwrap();
+    agent_post(&mut a, "pc-beacon", "beacon", "@mac-dispatch ping", 3_000);
+    let shown = a.unread(me, 50).unwrap().posts;
+    a.mark_read(me, &shown).unwrap();
+    a.apply(&question).unwrap();
+    assert!(unread_bodies(&a, me, 50).is_empty());
+}
+
+/// A database an older build made (posts without `reply_to`, derived under
+/// version 2: `fixtures/store/derive-v2.sql`) gets the new column and index
+/// when it is opened and derives its posts again, so the replies in it count;
+/// what each handle read and joined stays.
+#[test]
+fn an_older_database_upgrades_and_its_replies_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("beacon.db");
+    let old = rusqlite::Connection::open(&path).unwrap();
+    old.execute_batch(include_str!("fixtures/store/derive-v2.sql"))
+        .unwrap();
+    let schema = |c: &rusqlite::Connection| -> Vec<String> {
+        let mut stmt = c
+            .prepare(
+                "SELECT m.type || ' ' || m.name || ': ' || CASE m.type
+                     WHEN 'index' THEN m.sql
+                     ELSE COALESCE(group_concat(c.name || ' ' || c.type, ', '), '') END
+                 FROM sqlite_master AS m LEFT JOIN pragma_table_info(m.name) AS c
+                 WHERE m.name NOT LIKE 'sqlite_%' GROUP BY m.name ORDER BY m.name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let fresh_path = fresh_dir.path().join("beacon.db");
+    drop(Store::open(&fresh_path, "pc").unwrap());
+    let fresh = schema(&rusqlite::Connection::open(&fresh_path).unwrap());
+    assert_ne!(schema(&old), fresh, "the fixture should be the old schema");
+
+    let a = Store::open(&path, "mac").unwrap();
+    assert_eq!(schema(&old), fresh);
+    let me = "mac-dispatch";
+    assert_eq!(
+        unread_bodies(&a, me, 50),
+        ["re DAEWWCAJ: not yet, @Dang has it"]
+    );
+    assert_eq!(a.joins(me).unwrap(), ["general"]);
+    assert_eq!(
+        a.cursors(me).unwrap(),
+        std::collections::BTreeMap::from([("general".to_string(), 3)])
+    );
+    drop(a);
+
+    // Opening it again changes nothing.
+    let a = Store::open(&path, "mac").unwrap();
+    assert_eq!(schema(&old), fresh);
+    assert_eq!(unread_bodies(&a, me, 50).len(), 1);
 }
 
 /// The sidebar badges: every shown post by someone else after the cursor.

@@ -54,6 +54,11 @@ WHERE alive.kind = 'alive'
 
 -- Posts, immutable. `deleted` is set by a tombstone; a post is shown iff it is
 -- not deleted and its channel is visible. `arrival` is its event's arrival.
+-- `reply_to` is the id the body names if it is a reply (`re <id>`, see
+-- `model::parse_reply`), uppercase: a short id or a whole ULID; else NULL.
+--
+-- A column added here must also go in `ADDED_COLUMNS` (store/mod.rs), which
+-- adds it to a database made before it, and come with a new DERIVE_VERSION.
 CREATE TABLE IF NOT EXISTS posts (
     id            TEXT PRIMARY KEY,
     channel       TEXT    NOT NULL,
@@ -69,12 +74,16 @@ CREATE TABLE IF NOT EXISTS posts (
     att_name      TEXT,
     att_size      INTEGER,
     arrival       INTEGER NOT NULL,
-    deleted       INTEGER NOT NULL DEFAULT 0
+    deleted       INTEGER NOT NULL DEFAULT 0,
+    reply_to      TEXT
 );
 CREATE INDEX IF NOT EXISTS posts_by_channel ON posts (channel, ts, id);
 CREATE INDEX IF NOT EXISTS posts_by_time ON posts (ts, id);
 -- What is new to a handle: per channel, the posts past its cursor.
 CREATE INDEX IF NOT EXISTS posts_by_arrival ON posts (channel, arrival);
+-- The post a reply answers: by the short id it names, or the last 8
+-- characters of the whole ULID it names.
+CREATE INDEX IF NOT EXISTS posts_by_short_id ON posts (upper(substr(id, -8)));
 
 -- Every deleted post id, so a delete that arrives before its post still wins.
 CREATE TABLE IF NOT EXISTS tombstones (

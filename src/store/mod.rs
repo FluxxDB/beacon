@@ -48,8 +48,8 @@ pub use unread::Unread;
 
 use crate::error::Error;
 use crate::model::{
-    validate_event, validate_origin, Attachment, AuthorKind, Event, EventKind, NewPost, Presence,
-    VersionVector,
+    parse_reply, validate_event, validate_origin, Attachment, AuthorKind, Event, EventKind,
+    NewPost, Presence, VersionVector,
 };
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -63,7 +63,15 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// events. Stored in `meta` as `derive_version`.
 ///
 /// 2: `agent_forgotten` (an older build kept it as an unknown kind).
-pub const DERIVE_VERSION: u32 = 2;
+/// 3: `posts.reply_to`, which makes a reply relevant to the author of the
+/// post it names.
+pub const DERIVE_VERSION: u32 = 3;
+/// Columns added to a derived table after databases were made with it, as
+/// `(table, column, type)`. `CREATE TABLE IF NOT EXISTS` leaves a table that
+/// exists as it is, so opening a database adds each one it lacks before
+/// running the schema, whose indexes may use it. Each came with a new
+/// [`DERIVE_VERSION`], so the board derived again fills it in.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[("posts", "reply_to", "TEXT")];
 /// The `meta` key prefix of a database id this database wrote under before
 /// it moved to its current one (`Store::move_origin`).
 const FORMER_DB_ID: &str = "former_db_id:";
@@ -252,10 +260,12 @@ impl Store {
         Store::init(Connection::open_in_memory()?, node)
     }
 
-    /// Creates the tables and this database's id, derives the board again if
-    /// it was derived under another [`DERIVE_VERSION`], loads the version
-    /// vector and, on a board with no channel event yet, creates `general`.
+    /// Creates the tables (adding the [`ADDED_COLUMNS`] an older database
+    /// lacks) and this database's id, derives the board again if it was
+    /// derived under another [`DERIVE_VERSION`], loads the version vector
+    /// and, on a board with no channel event yet, creates `general`.
     fn init(mut conn: Connection, node: &str) -> Result<Store> {
+        add_missing_columns(&conn)?;
         conn.execute_batch(SCHEMA)?;
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('db_id', ?1) ON CONFLICT (key) DO NOTHING",
@@ -867,6 +877,23 @@ fn storable(ev: &Event) -> Result<()> {
     validate_origin(&ev.origin)
 }
 
+/// Adds each of the [`ADDED_COLUMNS`] to its table if the table exists
+/// without it (a database an older build made). A table not made yet gets
+/// every column from the schema.
+fn add_missing_columns(conn: &Connection) -> Result<()> {
+    let mut columns = conn.prepare("SELECT name FROM pragma_table_info(?1)")?;
+    for (table, column, kind) in ADDED_COLUMNS {
+        let have = columns
+            .query_map([table], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !have.is_empty() && !have.iter().any(|c| c == column) {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+            tracing::info!(table, column, "added a column an older build did not have");
+        }
+    }
+    Ok(())
+}
+
 /// If the board was derived under another [`DERIVE_VERSION`] (or before
 /// versions were recorded), derives it again from every event, in arrival
 /// order and under today's rules, in one transaction: an event that breaks
@@ -1038,15 +1065,18 @@ fn mark_channel(
     Ok(())
 }
 
-/// Inserts a post, already deleted if its tombstone arrived first.
+/// Inserts a post, already deleted if its tombstone arrived first, with the
+/// id it names if it is a reply.
 fn insert_post(tx: &Connection, post: &NewPost, ts: i64, arrival: i64) -> Result<()> {
     let tags = serde_json::to_string(&post.tags).map_err(anyhow::Error::from)?;
     let mentions = serde_json::to_string(&post.mentions).map_err(anyhow::Error::from)?;
     let att = post.attachment.as_ref();
+    let reply_to = parse_reply(&post.body).map(|reply| reply.id);
     tx.execute(
         "INSERT INTO posts (id, channel, ts, author, author_kind, client, node, body,
-                            tags_json, mentions_json, att_sha, att_name, att_size, arrival, deleted)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                            tags_json, mentions_json, att_sha, att_name, att_size, arrival,
+                            reply_to, deleted)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                  EXISTS (SELECT 1 FROM tombstones WHERE post_id = ?1))
          ON CONFLICT (id) DO NOTHING",
         params![
@@ -1064,6 +1094,7 @@ fn insert_post(tx: &Connection, post: &NewPost, ts: i64, arrival: i64) -> Result
             att.map(|a| &a.name),
             att.map(|a| a.size),
             arrival,
+            reply_to,
         ],
     )?;
     Ok(())
