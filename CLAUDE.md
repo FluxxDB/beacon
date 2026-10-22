@@ -52,9 +52,9 @@ irreversible. Questions for Dang go in the Claude Code app (he follows sessions 
 
 ## Repo
 
-Private GitHub repo `FluxxDB/beacon` (not created yet: the PC has no `gh`; either install
-`gh` without sudo and have Dang approve a device login, or ask the Mac agent; then add the
-remote and push `main`). Commits end with the Co-Authored-By trailer the harness specifies.
+Private GitHub repo `git@github.com:FluxxDB/beacon.git` (created by Dang 2026-10-22; `main`
+pushed from the PC, which pushes over SSH). Commits end with the Co-Authored-By trailer the
+harness specifies.
 
 PC specifics: the beacon stack runs from this checkout (`docker compose up -d`, userspace
 override via `COMPOSE_FILE` in `.env`); tailscaled has `--socks5-server=localhost:1055`.

@@ -13,8 +13,7 @@ Beacon v1 is built, reviewed and merged into `main` on the PC. What's left needs
 
 ## Next (needs Dang or the Mac)
 
-1. **GitHub repo.** Create private `FluxxDB/beacon` (Mac agent with `gh`, or install `gh` on the PC and approve the device login), then on the PC:
-   `git remote add origin git@github.com:FluxxDB/beacon.git && git push -u origin main`.
+1. ~~**GitHub repo.**~~ Done 2026-10-22: Dang created private `FluxxDB/beacon`; the PC pushed `main` (`origin`).
 2. **Mac side** (Mac agent): clone, `mkdir -p exchange`, `.env` from `.env.example` with `BEACON_NODE=mac`, `BEACON_URL=http://dangs-macbook-pro:7700`, `BEACON_PEERS=http://soybean-wsl:7700`, `BEACON_BIND=<mac tailnet IP>`, the same `BEACON_SECRET` as the PC (copy it from the PC's `.env`), `TZ=America/New_York`; base compose file only. `docker compose up -d --build`, `./beacon skill install all`. Then add `BEACON_PEERS=http://dangs-macbook-pro:7700` on the PC and `docker compose up -d`.
 3. **Cross-machine test** (plan Task 15 step 4): post both ways (`post` must say `delivered to …`), attachment both ways, `./beacon peers` on both, stop the Mac, post 3× on the PC (`mac unreachable, queued`), start it, catch-up + `queued 0`; `wait` on the Mac woken by a PC mention; the TUI side by side in iTerm2 and Windows Terminal. Also check, from the final review:
    - do single-label MagicDNS names (`soybean-wsl`) resolve inside a Docker Desktop container? If not, use the full `*.ts.net` name or the tailnet IP in `BEACON_PEERS`/`BEACON_URL`;
