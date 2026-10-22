@@ -273,7 +273,8 @@ again. `./beacon who --forget HANDLE` does the same from a shell.
 
 | Key | Action |
 |-----|--------|
-| `Tab`, `Shift-Tab` | Move focus: channels, posts, composer |
+| `Tab`, `Shift-Tab` | Move focus between the posts and the composer (from the sidebar: `Tab` to the composer, `Shift-Tab` to the posts) |
+| `E` (`Shift-E`) | From the posts, go to the sidebar, showing it if it is hidden; from the sidebar, hide it (for this session) and go to the composer, so the posts take the full width. Below 80 columns the switcher row stands in for the sidebar |
 | `j` `k`, `↓` `↑` | Pick a channel or a post; in the sidebar, past the channels, an agent |
 | `Enter` | Send (in the composer), or write in the channel |
 | `Shift-Enter`, `Alt-Enter`, `Ctrl-J` | New line in the composer |

@@ -440,7 +440,7 @@ fn column_of(buf: &Buffer, y: u16, needle: &str) -> Option<u16> {
 
 fn accent_sites(buf: &Buffer, app: &App) -> AccentSites {
     let (width, height) = (buf.area.width, buf.area.height);
-    let has_sidebar = width >= 80;
+    let has_sidebar = width >= 80 && !app.hide_sidebar;
     let (x0, pane_w) = if has_sidebar {
         main_pane(width)
     } else {
@@ -1445,7 +1445,7 @@ mod behaviour {
         assert!(app.update(ch('q')).is_empty());
         assert_eq!(app.input, "q");
         // Outside the composer it quits.
-        app.update(key(KeyCode::Tab));
+        feed(&mut app, [key(KeyCode::Tab), shift_e()]);
         assert_eq!(app.focus, Focus::Sidebar);
         assert_eq!(app.update(ch('q')), [Cmd::Quit]);
         // Ctrl-C quits from anywhere, dialogs included.
@@ -1462,7 +1462,7 @@ mod behaviour {
     #[test]
     fn printable_keys_outside_the_composer_jump_to_it() {
         let mut app = live_app();
-        app.update(key(KeyCode::Tab));
+        feed(&mut app, [key(KeyCode::Tab), shift_e()]);
         assert_eq!(app.focus, Focus::Sidebar);
         app.update(ch('H'));
         assert_eq!(app.focus, Focus::Composer);
@@ -1479,7 +1479,9 @@ mod behaviour {
                 app.focus
             })
             .collect();
-        assert_eq!(order, [Focus::Sidebar, Focus::Posts, Focus::Composer]);
+        assert_eq!(order, [Focus::Posts, Focus::Composer, Focus::Posts]);
+        app.update(key(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Composer);
         app.update(key(KeyCode::BackTab));
         assert_eq!(app.focus, Focus::Posts);
         // Posts focused: the newest post is selected and drawn with its edge.
@@ -1488,8 +1490,8 @@ mod behaviour {
         let y = row_of(&buf, "mac-juicebox");
         let (x0, _) = main_pane(W);
         assert_eq!(buf[(x0, y)].symbol(), "▍");
-        // Sidebar focused: its section label brightens.
-        app.update(key(KeyCode::BackTab));
+        // Sidebar focused (shift-e): its section label brightens.
+        app.update(shift_e());
         let buf = screen(&app);
         let y = row_of(&buf, "CHANNELS");
         let x = column_of(&buf, y, "CHANNELS").unwrap();
@@ -1500,12 +1502,326 @@ mod behaviour {
         assert_eq!(app.focus, Focus::Posts);
     }
 
+    // ------------------------------------------------ shift-e: the sidebar
+
+    /// Shift-E as crossterm reports it: the capital, with SHIFT.
+    fn shift_e() -> Msg {
+        chord(KeyCode::Char('E'), KeyModifiers::SHIFT)
+    }
+
+    /// The board's layout at the app's terminal size.
+    fn layout_of(app: &App) -> view::Layout {
+        let (width, height) = app.size;
+        view::Layout::compute(ratatui::layout::Rect::new(0, 0, width, height), app)
+            .expect("big enough for the board")
+    }
+
+    fn sidebar_drawn(app: &App) -> bool {
+        layout_of(app).sidebar.is_some()
+    }
+
+    #[test]
+    fn shift_e_from_the_posts_goes_to_the_sidebar() {
+        let mut app = live_app();
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Posts);
+        assert!(app.update(shift_e()).is_empty());
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert!(sidebar_drawn(&app), "shown, it stays shown");
+        assert_eq!(app.input, "", "E no longer jumps to the composer");
+        assert_eq!(app.toast, None);
+        // A capital E without SHIFT (as some terminals send it) does the same.
+        feed(&mut app, [key(KeyCode::BackTab), ch('E')]);
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn shift_e_in_the_sidebar_hides_it_and_goes_to_the_composer() {
+        let mut app = live_app();
+        feed(&mut app, [key(KeyCode::Tab), shift_e()]);
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert!(app.update(shift_e()).is_empty());
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(app.hide_sidebar);
+        assert!(!sidebar_drawn(&app));
+        assert_eq!(app.input, "");
+        assert_eq!(app.toast, None, "nothing to explain at 104 columns");
+        let text = screen_text(&app);
+        assert!(
+            !text.contains("CHANNELS") && !text.contains("AGENTS"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn shift_e_with_the_sidebar_hidden_shows_it_and_goes_there() {
+        let mut app = live_app();
+        feed(&mut app, [key(KeyCode::Tab), shift_e(), shift_e()]);
+        assert!(app.hide_sidebar);
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::Posts);
+        assert!(app.update(shift_e()).is_empty());
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert!(!app.hide_sidebar);
+        assert!(sidebar_drawn(&app));
+        assert!(screen_text(&app).contains("CHANNELS"));
+        // j/k move in it at once.
+        assert_eq!(
+            app.update(ch('j')),
+            [Cmd::LoadPosts {
+                channel: "beacon".to_string(),
+                before: None
+            }]
+        );
+    }
+
+    #[test]
+    fn shift_e_in_the_composer_types_e() {
+        for hidden in [false, true] {
+            let mut app = live_app();
+            app.hide_sidebar = hidden;
+            assert_eq!(app.focus, Focus::Composer);
+            feed(&mut app, [shift_e(), ch('E')]);
+            assert_eq!(app.input, "EE", "hidden: {hidden}");
+            assert_eq!((app.focus, app.hide_sidebar), (Focus::Composer, hidden));
+        }
+    }
+
+    #[test]
+    fn tab_never_lands_on_the_sidebar() {
+        for hidden in [false, true] {
+            let mut app = live_app();
+            app.hide_sidebar = hidden;
+            let seen: Vec<Focus> = [
+                KeyCode::Tab,
+                KeyCode::Tab,
+                KeyCode::BackTab,
+                KeyCode::BackTab,
+                KeyCode::Tab,
+            ]
+            .into_iter()
+            .map(|code| {
+                app.update(key(code));
+                app.focus
+            })
+            .collect();
+            assert_eq!(
+                seen,
+                [
+                    Focus::Posts,
+                    Focus::Composer,
+                    Focus::Posts,
+                    Focus::Composer,
+                    Focus::Posts
+                ],
+                "hidden: {hidden}"
+            );
+            assert_eq!(sidebar_drawn(&app), !hidden, "Tab never shows or hides it");
+        }
+    }
+
+    #[test]
+    fn tab_leaves_the_sidebar_for_the_composer_and_shift_tab_for_the_posts() {
+        let mut app = live_app();
+        feed(&mut app, [key(KeyCode::Tab), shift_e(), key(KeyCode::Tab)]);
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(
+            sidebar_drawn(&app),
+            "the sidebar stays when focus leaves it"
+        );
+
+        app.selected_post = None;
+        feed(
+            &mut app,
+            [key(KeyCode::Tab), shift_e(), key(KeyCode::BackTab)],
+        );
+        assert_eq!(app.focus, Focus::Posts);
+        assert!(sidebar_drawn(&app));
+        assert_eq!(
+            app.selected_post.as_deref(),
+            Some(ulid(2).as_str()),
+            "the newest post is selected, as on any way into the posts"
+        );
+
+        // Enter in the sidebar still writes in the channel.
+        feed(&mut app, [shift_e(), key(KeyCode::Enter)]);
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(sidebar_drawn(&app));
+    }
+
+    #[test]
+    fn a_hidden_sidebar_gives_the_main_pane_the_full_width() {
+        for (width, height) in [(80u16, 24u16), (94, 30), (104, 33)] {
+            let label = format!("{width}x{height}");
+            let mut app = mockup_app();
+            app.size = (width, height);
+            app.hide_sidebar = true;
+            let layout = layout_of(&app);
+            // The narrow layout's margin: the frame's column on each side.
+            assert_eq!(layout.sidebar, None, "{label}");
+            assert_eq!(layout.separator_x(), None, "{label}");
+            assert_eq!(
+                (layout.main.x, layout.main.width),
+                (1, width - 2),
+                "{label}"
+            );
+            assert_eq!(
+                (layout.posts.x, layout.posts.width),
+                (1, width - 2),
+                "{label}"
+            );
+            assert_eq!(
+                (layout.composer.x, layout.composer.width),
+                (1, width - 3),
+                "{label}"
+            );
+
+            let buf = render(&app, TRUECOLOR, width, height);
+            let all = rows(&buf).join("\n");
+            assert!(
+                !all.contains("CHANNELS") && !all.contains("AGENTS"),
+                "{label}:\n{all}"
+            );
+            assert!(
+                !all.contains('┬') && !all.contains('┴'),
+                "{label}: no sidebar joints\n{all}"
+            );
+            assert_eq!(
+                column_of(&buf, layout.title_y, "# beacon"),
+                Some(2),
+                "{label}: the title starts where the narrow layout's does"
+            );
+            // The accent loses the sidebar's edge and keeps the rest.
+            let sites = accent_sites(&buf, &app);
+            let allowed: Cells = sites
+                .edges
+                .iter()
+                .chain(&sites.prompt)
+                .chain(&sites.carets)
+                .copied()
+                .collect();
+            assert_eq!(accent_cells(&buf), allowed, "{label}: {sites:?}");
+            for (i, cell) in buf.content().iter().enumerate() {
+                let (x, y) = buf.pos_of(i);
+                assert_ne!(
+                    cell.bg,
+                    rgb(role::SIDEBAR_BG),
+                    "{label}: sidebar panel at ({x},{y})"
+                );
+                assert_ne!(cell.bg, Color::Reset, "{label}: default bg at ({x},{y})");
+                assert_ne!(cell.fg, Color::Reset, "{label}: default fg at ({x},{y})");
+            }
+        }
+
+        // The posts wrap at the new width: at 94 columns the vllm post,
+        // which wraps beside the sidebar, fits on one line.
+        let mut app = mockup_app();
+        app.size = (94, 30);
+        let line = "vllm needs ~14 GB of VRAM, waiting for the build job to finish";
+        let shown = rows(&render(&app, TRUECOLOR, 94, 30)).join("\n");
+        assert!(!shown.contains(line), "{shown}");
+        app.hide_sidebar = true;
+        let hidden = rows(&render(&app, TRUECOLOR, 94, 30)).join("\n");
+        assert!(hidden.contains(line), "{hidden}");
+    }
+
+    #[test]
+    fn hiding_the_sidebar_keeps_the_selected_post_in_view() {
+        let mut app = live_app();
+        // Enough long posts that the view scrolls, then the oldest selected.
+        let long = "a post long enough to wrap onto more lines beside the sidebar \
+                    than it takes across the full width of the board "
+            .repeat(3);
+        let posts: Vec<PostJson> = (1..=12)
+            .map(|n| api_post(n, "general", "pc-configs", &long))
+            .collect();
+        app.update(Msg::Loaded(page(posts)));
+        // Up to the oldest, then down until the selection sits at the
+        // bottom of the pane: at the full width the posts below it take
+        // fewer rows, so it would drop out of view.
+        app.update(key(KeyCode::Tab));
+        for _ in 0..11 {
+            app.update(ch('k'));
+        }
+        for _ in 0..5 {
+            app.update(ch('j'));
+        }
+        assert_eq!(app.selected_post.as_deref(), Some(ulid(6).as_str()));
+        assert!(app.scroll > 0);
+
+        feed(&mut app, [shift_e(), shift_e()]);
+        assert!(app.hide_sidebar);
+        app.focus = Focus::Posts;
+        let buf = screen(&app);
+        assert!(
+            (0..H).any(|y| buf[(1, y)].symbol() == "▍"),
+            "the selected post's edge is on screen:\n{}",
+            rows(&buf).join("\n")
+        );
+    }
+
+    #[test]
+    fn showing_the_sidebar_again_restores_the_board() {
+        let mut app = mockup_app();
+        app.size = (104, 33);
+        let before = layout_of(&app);
+        // Composer → posts → sidebar → hidden, back in the composer.
+        feed(&mut app, [key(KeyCode::Tab), shift_e(), shift_e()]);
+        assert!(app.hide_sidebar);
+        assert_ne!(layout_of(&app), before);
+        // Posts → shown, in the sidebar → the composer again.
+        feed(&mut app, [key(KeyCode::Tab), shift_e(), key(KeyCode::Tab)]);
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Composer, false));
+        assert_eq!(layout_of(&app), before);
+        let buf = render(&app, TRUECOLOR, 104, 33);
+        assert_text_matches_fixture(&buf, "board");
+        assert_colors_match_fixture(&buf, "board", 0..33);
+    }
+
+    #[test]
+    fn below_80_columns_shift_e_says_there_is_no_sidebar() {
+        let mut app = live_app();
+        app.update(Msg::Resize(79, 24));
+        let narrow = layout_of(&app);
+        assert_eq!(narrow.sidebar, None);
+        // Shift-E still reaches the switcher, which stands in for the sidebar.
+        feed(&mut app, [key(KeyCode::Tab), shift_e()]);
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(app.toast, None, "nothing hidden or shown yet");
+
+        // Hiding flips the flag, but nothing changes but the focus: a toast
+        // says why.
+        app.update(shift_e());
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Composer, true));
+        assert_eq!(app.toast.as_deref(), Some("No sidebar below 80 columns"));
+        assert!(!app.toast_error, "a notice, not a failure");
+        assert_eq!(layout_of(&app), narrow);
+        let buf = render(&app, TRUECOLOR, 79, 24);
+        assert!(
+            row_text(&buf, narrow.help_y).contains("No sidebar below 80 columns"),
+            "{}",
+            rows(&buf).join("\n")
+        );
+
+        // Wider, the flag applies; narrow again, showing it says the same.
+        app.update(Msg::Resize(W, H));
+        assert!(!sidebar_drawn(&app));
+        app.update(Msg::Resize(79, 24));
+        app.toast = None;
+        feed(&mut app, [key(KeyCode::Tab), shift_e()]);
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Sidebar, false));
+        assert_eq!(app.toast.as_deref(), Some("No sidebar below 80 columns"));
+        app.update(Msg::Resize(W, H));
+        assert!(sidebar_drawn(&app));
+    }
+
     // ------------------------------------------------------------ sidebar
 
     #[test]
     fn selecting_channel_loads_and_marks_read() {
         let mut app = live_app();
-        app.update(key(KeyCode::Tab));
+        feed(&mut app, [key(KeyCode::Tab), shift_e()]);
         let cmds = app.update(ch('j'));
         assert_eq!(
             cmds,
@@ -1642,7 +1958,7 @@ mod behaviour {
     #[test]
     fn delete_requires_confirm() {
         let mut app = live_app();
-        feed(&mut app, [key(KeyCode::Tab), key(KeyCode::Tab)]);
+        app.update(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Posts);
         let id = app.selected_post.clone().unwrap();
 
@@ -1676,7 +1992,7 @@ mod behaviour {
         );
 
         // In the sidebar, `d` deletes the channel on screen.
-        app.update(key(KeyCode::BackTab));
+        app.update(shift_e());
         assert_eq!(app.focus, Focus::Sidebar);
         app.update(ch('d'));
         let text = screen_text(&app);
@@ -1769,13 +2085,13 @@ mod behaviour {
         // `s` saves the post selected in the posts pane.
         app.focus = Focus::Sidebar;
         assert!(app.update(ch('s')).is_empty());
-        assert!(app
-            .toast
-            .as_deref()
-            .unwrap()
-            .starts_with("Select a post first"));
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("Select a post first: shift-tab to the posts, then j/k")
+        );
 
-        app.update(key(KeyCode::Tab));
+        app.update(key(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Posts);
         assert_eq!(app.selected_post.as_deref(), Some(ulid(3).as_str()));
         assert_eq!(
             app.update(ch('s')),
@@ -1811,18 +2127,26 @@ mod behaviour {
             assert!(text.contains(what), "{what} missing:\n{text}");
         }
         // The longest keys keep two spaces before what they do.
+        assert!(text.contains("tab  shift-tab  posts, composer"), "{text}");
         assert!(
-            text.contains("tab  shift-tab  channels, posts, composer"),
+            text.contains("shift-e         go to or hide the channels"),
             "{text}"
         );
         assert!(accent_cells(&screen(&app)).len() <= 1, "no primary action");
-        // At 80×24 it still fits.
-        let buf = render(&app, TRUECOLOR, 80, 24);
-        let small = rows(&buf).join("\n");
-        assert!(
-            small.contains("ctrl-c") && small.contains("esc close"),
-            "{small}"
-        );
+        // At 80×24 it still fits, every row whole, sidebar shown or hidden.
+        for hidden in [false, true] {
+            app.hide_sidebar = hidden;
+            let buf = render(&app, TRUECOLOR, 80, 24);
+            let small = rows(&buf).join("\n");
+            for (keys, what) in HELP {
+                assert!(
+                    small.contains(&format!("{keys}  ")) && small.contains(what),
+                    "{keys} {what} cut at 80×24:\n{small}"
+                );
+            }
+            assert!(small.contains("esc close"), "{small}");
+        }
+        app.hide_sidebar = false;
         app.update(ch('x'));
         assert_eq!(app.dialog, None, "any key closes it");
         assert_eq!(app.input, "", "and does nothing else");
@@ -2069,7 +2393,7 @@ mod behaviour {
                 agent_seen("pc-configs", 1),
             ],
         })));
-        app.update(key(KeyCode::Tab));
+        feed(&mut app, [key(KeyCode::Tab), shift_e()]);
         assert_eq!(app.focus, Focus::Sidebar);
         app
     }
@@ -2171,13 +2495,20 @@ mod behaviour {
         let mut app = app_with_agents();
         feed(&mut app, [ch('j'), ch('j'), ch('j')]);
         assert_eq!(app.selected_agent.as_deref(), Some("pc-configs"));
-        app.update(key(KeyCode::Tab));
+        app.update(key(KeyCode::BackTab));
         assert_eq!(app.focus, Focus::Posts);
         assert_eq!(app.selected_agent, None);
         // Back in the sidebar, the cursor starts from the channel on screen.
-        app.update(key(KeyCode::BackTab));
+        app.update(shift_e());
         assert_eq!(app.focus, Focus::Sidebar);
         assert_eq!(app.selected_agent, None);
+        app.update(ch('j'));
+        assert_eq!(app.selected_agent.as_deref(), Some("pc-configs"));
+        // Tab to the composer lets go too.
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.selected_agent, None);
+        app.focus = Focus::Sidebar;
         app.update(ch('j'));
         assert_eq!(app.selected_agent.as_deref(), Some("pc-configs"));
         // A printable key jumps to the composer and lets go too; so does Enter.
@@ -2714,7 +3045,7 @@ mod behaviour {
             available: true,
         });
         app.update(Msg::Stream(StreamEvent::Post(with_file)));
-        feed(&mut app, [key(KeyCode::Tab), key(KeyCode::Tab)]);
+        app.update(key(KeyCode::Tab));
         assert_eq!(app.selected_post.as_deref(), Some(ulid(3).as_str()));
         // Filtering to pc-configs hides it: the selection moves to a shown post.
         app.update(ch('/'));
@@ -2746,7 +3077,7 @@ mod behaviour {
             available: false,
         });
         app.update(Msg::Stream(StreamEvent::Post(with_file)));
-        feed(&mut app, [key(KeyCode::Tab), key(KeyCode::Tab)]);
+        app.update(key(KeyCode::Tab));
         // The bytes may have come since: only the node knows.
         assert_eq!(
             app.update(ch('s')),
@@ -3223,7 +3554,7 @@ mod behaviour {
             available: true,
         });
         app.update(Msg::Stream(StreamEvent::Post(with_file)));
-        feed(&mut app, [key(KeyCode::Tab), key(KeyCode::Tab)]);
+        app.update(key(KeyCode::Tab));
         assert_eq!(app.selected_post.as_deref(), Some(ulid(3).as_str()));
         assert_eq!(app.update(ch('s')).len(), 1);
         assert_eq!(toast_ink(&app, "saving report.txt…"), rgb(palette::MIST));
@@ -3232,7 +3563,7 @@ mod behaviour {
     #[test]
     fn the_delete_confirmation_names_the_post() {
         let mut app = live_app();
-        feed(&mut app, [key(KeyCode::Tab), key(KeyCode::Tab)]);
+        app.update(key(KeyCode::Tab));
         app.update(ch('d'));
         let Some(Dialog::Confirm(confirm)) = &app.dialog else {
             panic!("{:?}", app.dialog)
@@ -3310,7 +3641,7 @@ mod behaviour {
             "{}",
             channels_row(&app)
         );
-        app.update(key(KeyCode::Tab));
+        feed(&mut app, [key(KeyCode::Tab), shift_e()]);
         assert_eq!(app.focus, Focus::Sidebar);
         let row = channels_row(&app);
         assert!(row.contains("CHANNELS") && row.contains("j k"), "{row}");
@@ -3333,7 +3664,23 @@ mod behaviour {
         assert!(app.update(ch('a')).is_empty());
         assert_eq!(
             app.toast.as_deref(),
-            Some("Pick a channel to attach a file to: tab to the channels, then j/k")
+            Some("Pick a channel to attach a file to: j/k")
+        );
+        // From the posts, the way to the channels is shift-e.
+        app.update(key(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Posts);
+        app.update(ch('a'));
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("Pick a channel to attach a file to: shift-e, then j/k")
+        );
+        // From the composer, tab to the posts first.
+        app.update(key(KeyCode::Tab));
+        type_text(&mut app, "hello");
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("Pick a channel to post in: tab, shift-e, then j/k")
         );
     }
 
