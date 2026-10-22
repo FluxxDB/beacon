@@ -69,6 +69,12 @@ impl Run {
         self
     }
 
+    /// One more argument at the end of the command line.
+    fn arg(mut self, arg: &str) -> Run {
+        self.args.push(arg.to_string());
+        self
+    }
+
     fn server(mut self, url: &str) -> Run {
         self.server = url.to_string();
         self
@@ -2522,6 +2528,162 @@ async fn attach_over_the_limit_is_refused_in_the_nodes_words() {
     assert!(out.stderr.contains("1 MB"), "{}", out.stderr);
     assert!(!out.stderr.contains("docker compose"), "{}", out.stderr);
     assert!(api_posts(&node, "beacon").await.is_empty());
+}
+
+/// `attach - --size N` (what `./beacon` passes for a file on the host) must
+/// never post a file that is not N bytes long: a stdin that ends early is a
+/// killed `docker exec` client, not a shorter file.
+const FILES_LEFT_BEHIND: &str = "the node kept bytes of an upload that never finished";
+
+/// The attachment store, which holds nothing after an upload that was aborted.
+async fn assert_no_blobs(node: &TestNode) {
+    let files = node.dir.path().join("files");
+    let mut left = Vec::new();
+    for _ in 0..40 {
+        left = std::fs::read_dir(&files)
+            .map(|dir| dir.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        if left.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{FILES_LEFT_BEHIND}: {left:?}");
+}
+
+fn attach_sized(node: &TestNode, size: &str) -> Run {
+    beacon(
+        node,
+        &[
+            "attach",
+            "beacon",
+            "-",
+            "--name",
+            "data.bin",
+            "--size",
+            size,
+            "--as",
+            "pc-configs",
+            "a file",
+        ],
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_with_size_refuses_a_file_that_ended_early() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    // Small, large (several chunks on the wire) and nothing at all.
+    for (have, want) in [(400, 1000), (700_000, 1_000_000), (0, 10)] {
+        let out = attach_sized(&node, &want.to_string())
+            .stdin_bytes(binary_blob(have))
+            .run()
+            .await;
+        assert_eq!(out.code, 1, "{out:?}");
+        assert_eq!(
+            out.stderr,
+            format!(
+                "beacon: the file ended early (read {have} of {want} bytes); nothing was posted\n"
+            )
+        );
+        assert_eq!(out.stdout, "");
+        assert!(api_posts(&node, "beacon").await.is_empty(), "{have}/{want}");
+    }
+    assert_no_blobs(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_with_size_refuses_a_file_that_runs_long() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    // One byte too many is enough; so is a lot too many.
+    for (have, want) in [(101, 100), (500_000, 100), (1, 0)] {
+        let out = attach_sized(&node, &want.to_string())
+            .stdin_bytes(binary_blob(have))
+            .run()
+            .await;
+        assert_eq!(out.code, 1, "{out:?}");
+        assert_eq!(
+            out.stderr,
+            format!("beacon: the file ran longer than {want} bytes; nothing was posted\n")
+        );
+        assert!(api_posts(&node, "beacon").await.is_empty(), "{have}/{want}");
+    }
+    assert_no_blobs(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_with_size_posts_a_file_of_exactly_that_size() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    for len in [0, 1, 65_536, 300_000, 3 * 1024 * 1024 + 7] {
+        let bytes = binary_blob(len);
+        let out = attach_sized(&node, &len.to_string())
+            .arg("--json")
+            .stdin_bytes(bytes.clone())
+            .ok()
+            .await;
+        let attachment = &out.json()["post"]["attachment"];
+        assert_eq!(attachment["size"], len, "{len}");
+        assert_eq!(attachment["sha256"], sha256_hex(&bytes), "{len}");
+    }
+    assert_eq!(api_posts(&node, "beacon").await.len(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_size_goes_with_stdin_and_is_a_number() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("real.txt");
+    std::fs::write(&path, "bytes").unwrap();
+    let out = beacon(
+        &node,
+        &[
+            "attach",
+            "beacon",
+            path.to_str().unwrap(),
+            "--size",
+            "5",
+            "--as",
+            "pc-configs",
+        ],
+    )
+    .run()
+    .await;
+    assert_eq!(out.code, 1, "{out:?}");
+    assert!(out.stderr.contains("--size"), "{}", out.stderr);
+    assert!(out.stderr.contains("stdin"), "{}", out.stderr);
+    for bad in ["five", "-1", "1.5", ""] {
+        let out = attach_sized(&node, bad).stdin("hello").run().await;
+        assert_eq!(out.code, 1, "{bad:?}: {out:?}");
+    }
+    assert!(api_posts(&node, "beacon").await.is_empty());
+}
+
+/// The killed-client case: part of the file is on its way when the producer
+/// goes away (`docker compose exec` was interrupted, so the container's stdin
+/// closes), well after the upload has begun.
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_with_size_stops_when_the_producer_goes_away_mid_upload() {
+    use tokio::io::AsyncWriteExt;
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let mut child = attach_sized(&node, "5000000").spawn_with_stdin(std::process::Stdio::piped());
+    let mut stdin = child.child.stdin.take().unwrap();
+    stdin.write_all(&binary_blob(600_000)).await.unwrap();
+    stdin.flush().await.unwrap();
+    // The upload is under way: the node is receiving the file.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(stdin);
+    let (code, _) = child.finish_within(Duration::from_secs(10)).await;
+    assert_eq!(code, 1, "{}", child.stderr());
+    assert_eq!(
+        child.stderr(),
+        "beacon: the file ended early (read 600000 of 5000000 bytes); nothing was posted\n"
+    );
+    assert!(api_posts(&node, "beacon").await.is_empty());
+    assert_no_blobs(&node).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

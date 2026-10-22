@@ -12,6 +12,7 @@
 //! `watch` do ask again, but only for what they can ask for twice: a look at
 //! what is unread, and a new stream.)
 
+mod exact;
 pub mod human;
 
 use std::collections::BTreeMap;
@@ -227,7 +228,9 @@ pub struct DeleteArgs {
 #[derive(Debug, Args)]
 #[command(
     after_help = "`-` reads the file from stdin and then needs --name. The file is sent as it \
-is read, not held in memory. A message that starts with a dash needs `--` before it."
+is read, not held in memory. With --size BYTES (./beacon passes it for a file on the host) \
+nothing is posted unless stdin delivers exactly that many bytes. A message that starts with a \
+dash needs `--` before it."
 )]
 pub struct AttachArgs {
     /// Channel to post in (a leading # is fine)
@@ -243,6 +246,10 @@ pub struct AttachArgs {
     /// What the attachment is called (needed with `-`; otherwise the file's name)
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
+
+    /// With `-`: the file's size; post nothing if stdin ends early or runs long
+    #[arg(long, value_name = "BYTES")]
+    pub size: Option<u64>,
 
     /// Label the post (repeatable): claim, done, blocked, question, handoff, fyi...
     #[arg(long = "tag", value_name = "TAG")]
@@ -824,7 +831,8 @@ type Source = Pin<Box<dyn AsyncRead + Send + Sync>>;
 async fn attach(ctx: &Ctx, args: AttachArgs) -> Result<(), Error> {
     let handle = ctx.handle()?.to_string();
     let channel = normalize_channel(&args.channel)?;
-    let (file, name, len) = open_attachment(&args.path, args.name.as_deref()).await?;
+    let (file, name, len, verdict) =
+        open_attachment(&args.path, args.name.as_deref(), args.size).await?;
     let body = unix_newlines(args.message.as_deref().unwrap_or(""));
     ctx.announce().await?;
     let request = NewPostRequest {
@@ -839,26 +847,45 @@ async fn attach(ctx: &Ctx, args: AttachArgs) -> Result<(), Error> {
         .client
         .upload(&channel, &request, &name, file, len)
         .await
-        .map_err(|e| check_before_reposting(e, &channel))?;
+        .map_err(|e| match verdict.mismatch().zip(args.size) {
+            // The upload was dropped half-sent because stdin was not the file.
+            Some((mismatch, size)) => Error::Usage(mismatch.explain(size)),
+            None => check_before_reposting(e, &channel),
+        })?;
     ctx.show(&created, || human::posted_text(&created))
 }
 
 /// The file `attach` was pointed at (`-` for stdin), what to call it and, for
-/// a regular file, how long it is.
+/// a regular file, or stdin with `--size`, how long it is. With `--size` the
+/// reader fails unless stdin delivers exactly that many bytes, and the
+/// [`exact::Verdict`] says how it failed.
 async fn open_attachment(
     path: &str,
     name: Option<&str>,
-) -> Result<(Source, String, Option<u64>), Error> {
+    size: Option<u64>,
+) -> Result<(Source, String, Option<u64>, exact::Verdict), Error> {
     if name.is_some_and(|n| n.trim().is_empty()) {
         return Err(Error::Usage("--name cannot be empty".to_string()));
     }
+    let verdict = exact::Verdict::default();
     if path == "-" {
         let name = name.ok_or_else(|| {
             Error::Usage(
                 "a file read from stdin needs --name NAME to say what it is called".to_string(),
             )
         })?;
-        return Ok((Box::pin(tokio::io::stdin()), name.to_string(), None));
+        let stdin = tokio::io::stdin();
+        let file: Source = match size {
+            Some(size) => Box::pin(exact::Exact::new(stdin, size, verdict.clone())),
+            None => Box::pin(stdin),
+        };
+        return Ok((file, name.to_string(), size, verdict));
+    }
+    if size.is_some() {
+        return Err(Error::Usage(
+            "--size goes with a file read from stdin (`-`); a path's size is read from the file"
+                .to_string(),
+        ));
     }
     let unreadable = |e: std::io::Error| match e.kind() {
         std::io::ErrorKind::NotFound => Error::NotFound(format!("no such file: {path}")),
@@ -881,7 +908,7 @@ async fn open_attachment(
             })?,
     };
     let len = meta.is_file().then_some(meta.len());
-    Ok((Box::pin(file), name, len))
+    Ok((Box::pin(file), name, len, verdict))
 }
 
 /// What `get -o` answers.
