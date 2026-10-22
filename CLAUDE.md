@@ -7,17 +7,21 @@ terminal UI; agents use the same Rust binary as a CLI. Each device runs it with
 
 - **Spec (approved by Dang 2026-10-21):** `docs/superpowers/specs/2026-10-21-beacon-design.md`.
   It is the source of truth for behaviour; read it before planning or coding.
-- **Look:** `docs/design/tui-mockup.html` (rendered with xterm.js). The palette comes from
-  Dang's Linear-style design files, to be committed under `docs/design/` (see
-  `docs/HANDOFF.md`).
+- **Plan (executed):** `docs/superpowers/plans/2026-10-21-beacon.md`. v1 is built and merged into `main`.
+- **Look:** `docs/design/tui-mockup.html` (rendered with xterm.js); palette from Dang's Linear-style
+  files in `docs/design/` (`DESIGN.md`, `tokens.json`, `theme.css`, `variables.css`, his originals).
+  Mockup screens are decoded into `tests/fixtures/mockup/` and the TUI must match them exactly.
+- **Knowledge graph:** `graphify-out/` — run `graphify query "<question>"` before reading code.
+- **User docs:** `README.md` (setup per device kind), `skills/beacon/SKILL.md` (agent skill).
 - **Where work stands and what's next:** `docs/HANDOFF.md`.
 
 ## Workflow Dang asked for
 
-Build with the superpowers workflow (brainstorming is done; next is writing-plans, then
-execution), impeccable for the TUI's craft, web-design-guidelines where it applies to a
-terminal, and graphify on the finished repo. These skills aren't installed in Claude Code
-here; follow them from their upstream files:
+Built with the superpowers workflow (brainstorming → writing-plans → subagent-driven
+development with per-task spec + quality reviews), impeccable for the TUI's craft,
+web-design-guidelines where it applies to a terminal, and graphify on the finished repo.
+For changes, keep that bar: TDD, a review per change, `cargo test`, `cargo clippy
+--all-targets -- -D warnings`, `cargo fmt --check`, `shellcheck beacon`. Upstream skill sources:
 
 - superpowers: https://github.com/obra/superpowers (`skills/writing-plans/SKILL.md`,
   `skills/executing-plans`, `skills/subagent-driven-development`, ...)
@@ -49,5 +53,8 @@ irreversible. Questions for Dang go in the Claude Code app (he follows sessions 
 ## Repo
 
 Private GitHub repo `FluxxDB/beacon` (not created yet: the PC has no `gh`; either install
-`gh` without sudo and have Dang approve a device login, or ask the Mac agent). Commits end
-with the Co-Authored-By trailer the harness specifies.
+`gh` without sudo and have Dang approve a device login, or ask the Mac agent; then add the
+remote and push `main`). Commits end with the Co-Authored-By trailer the harness specifies.
+
+PC specifics: the beacon stack runs from this checkout (`docker compose up -d`, userspace
+override via `COMPOSE_FILE` in `.env`); tailscaled has `--socks5-server=localhost:1055`.
