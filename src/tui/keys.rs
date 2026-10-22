@@ -21,7 +21,7 @@
 //!   commands, and any other printable key jumps to the composer and types
 //!   itself.
 //! * Anywhere: `Tab`/`Shift-Tab` cycle the focus, `PgUp`/`PgDn` scroll the
-//!   posts, `Esc` clears the filter.
+//!   posts, `Esc` clears the filter (from the composer, once it is empty).
 //! * **`@` ghost** ([`crate::tui::mention`]): while the composer shows one,
 //!   `Tab` takes it, `↑`/`↓` pick another match and `Esc` puts it away (that
 //!   `Esc` neither arms nor fires a clear); without one those keys do what
@@ -192,15 +192,15 @@ impl App {
     }
 
     /// `Tab`, `↑` `↓` and `Esc` while the composer shows a ghost: take it
-    /// (and a space, unless one follows already), pick another match, put
-    /// it away. Whether the key was the ghost's.
+    /// (and a space, unless a space or line break follows already), pick
+    /// another match, put it away. Whether the key was the ghost's.
     fn ghost_key(&mut self, key: &KeyEvent) -> bool {
         let Some(ghost) = self.ghost() else {
             return false;
         };
         match key.code {
             KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                if self.input[self.cursor()..].starts_with(' ') {
+                if self.input[self.cursor()..].starts_with(char::is_whitespace) {
                     self.insert_text(&ghost.rest);
                 } else {
                     self.insert_text(&format!("{} ", ghost.rest));

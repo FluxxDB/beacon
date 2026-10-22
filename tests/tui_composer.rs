@@ -106,6 +106,23 @@ fn color(c: Rgb) -> Color {
     Color::Rgb(c.0, c.1, c.2)
 }
 
+/// The node's answer to Dang's post of `body` in #beacon: stored.
+fn sent(body: &str) -> Msg {
+    let created: beacon::api::PostCreated = serde_json::from_value(serde_json::json!({
+        "v": 1,
+        "post": {
+            "v": 1, "id": "01JAN000000000000000000001", "short_id": "00000001",
+            "channel": "beacon", "ts": "", "ts_ms": 0, "author": "Dang",
+            "author_kind": "human", "client": "tui", "node": "pc", "body": body,
+            "tags": [], "mentions": [], "announcement": true, "attachment": null,
+            "arrival": 1
+        },
+        "delivery": []
+    }))
+    .unwrap();
+    Msg::Sent(Ok(created))
+}
+
 /// Every cell inside the composer box drawn as the caret (on the accent).
 fn caret_cells(app: &App, buf: &Buffer) -> Vec<(u16, u16)> {
     let c = composer(app);
@@ -139,9 +156,9 @@ fn wrap_ranges_say_which_bytes_each_line_shows() {
         assert_eq!(wrap::wrap_ranges(text, width), want, "{text:?} at {width}");
     }
 
-    // Always the same lines as `wrap`, and nothing between them but the
-    // spaces of a soft break, or the `\n` of a hard one (and any
-    // indentation dropped after it).
+    // Nothing between the lines but the spaces of a soft break, or the `\n`
+    // of a hard one (and any indentation dropped after it). (What `wrap`
+    // itself makes is pinned in tests/tui_render.rs.)
     let texts = [
         "on my way, tagging after the PC smoke test",
         "one\n\n  two  three   four\nfive ",
@@ -154,10 +171,14 @@ fn wrap_ranges_say_which_bytes_each_line_shows() {
     for text in texts {
         for width in [1u16, 2, 3, 5, 8, 13, 80] {
             let ranges = wrap::wrap_ranges(text, width);
-            let lines: Vec<&str> = ranges.iter().map(|r| &text[r.clone()]).collect();
-            assert_eq!(lines, wrap::wrap(text, width), "{text:?} at {width}");
             let mut end = 0;
             for range in &ranges {
+                // Within the width (a lone wide grapheme may take two).
+                let line = &text[range.clone()];
+                assert!(
+                    wrap::display_width(line) <= width.max(2),
+                    "{text:?} at {width}: {line:?}"
+                );
                 let gap = &text[end..range.start];
                 let soft = gap.chars().all(|c| c == ' ');
                 let hard = gap
@@ -385,19 +406,7 @@ fn the_cursor_stays_put_when_the_sent_text_leaves_the_front() {
     assert_eq!(press(&mut app, KeyCode::Enter).len(), 1);
     type_text(&mut app, " and more");
     presses(&mut app, KeyCode::Left, 3);
-    let created: beacon::api::PostCreated = serde_json::from_value(serde_json::json!({
-        "v": 1,
-        "post": {
-            "v": 1, "id": "01JAN000000000000000000001", "short_id": "00000001",
-            "channel": "beacon", "ts": "", "ts_ms": 0, "author": "Dang",
-            "author_kind": "human", "client": "tui", "node": "pc", "body": "first",
-            "tags": [], "mentions": [], "announcement": true, "attachment": null,
-            "arrival": 1
-        },
-        "delivery": []
-    }))
-    .unwrap();
-    app.update(Msg::Sent(Ok(created)));
+    app.update(sent("first"));
     // Still before `ore`.
     assert_eq!((app.input.as_str(), app.cursor()), (" and more", 6));
 }
@@ -604,6 +613,16 @@ fn tab_puts_the_ghost_in_at_the_cursor() {
     type_text(&mut app, ",");
     assert_eq!(app.input, "hey @pc-configs, and more");
 
+    // Nor before a line break.
+    let mut app = composing();
+    paste(&mut app, "hey @pc\nmore");
+    app.set_cursor(7);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(
+        (app.input.as_str(), app.cursor()),
+        ("hey @pc-configs\nmore", 15)
+    );
+
     // At the end of the input it still brings its space.
     let mut app = composing();
     type_text(&mut app, "x @pc");
@@ -682,11 +701,14 @@ fn any_other_key_disarms_the_clear_and_does_its_own_thing() {
     press(&mut app, KeyCode::Esc);
     assert_eq!(app.input, "drafxyt", "a paste disarms too");
 
-    // Tab leaves with the text kept and the clear disarmed.
+    // Tab leaves (for whichever pane comes next) with the text kept and the
+    // clear (armed by that last Esc) disarmed.
+    assert!(app.clear_armed);
     press(&mut app, KeyCode::Tab);
-    assert_eq!((app.focus, app.input.as_str()), (Focus::Sidebar, "drafxyt"));
-    press(&mut app, KeyCode::BackTab);
-    assert_eq!(app.focus, Focus::Composer);
+    assert_ne!(app.focus, Focus::Composer);
+    assert_eq!(app.input, "drafxyt");
+    assert!(!app.clear_armed);
+    app.focus = Focus::Composer;
     press(&mut app, KeyCode::Esc);
     assert_eq!(
         app.input, "drafxyt",
@@ -737,4 +759,136 @@ fn an_armed_clear_says_so_in_the_hint() {
     // Disarmed, the usual hint is back.
     press(&mut app, KeyCode::Left);
     assert!(top(&app).contains(" enter send "), "{}", top(&app));
+}
+
+#[test]
+fn a_send_that_empties_the_composer_disarms_the_clear() {
+    let mut app = composing();
+    type_text(&mut app, "hello");
+    assert_eq!(press(&mut app, KeyCode::Enter).len(), 1);
+    // Esc while the post is on its way: the text is still there, so it arms.
+    press(&mut app, KeyCode::Esc);
+    assert!(app.clear_armed);
+    app.update(sent("hello"));
+    assert_eq!((app.input.as_str(), app.clear_armed), ("", false));
+    let c = composer(&app);
+    let hint = row(&screen(&app), c.y, c.x, c.right());
+    assert!(
+        hint.contains(" enter send ") && !hint.contains("esc again"),
+        "{hint}"
+    );
+    // Empty, Esc leaves as always.
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.focus, Focus::Posts);
+}
+
+#[test]
+fn an_empty_composer_never_says_esc_again_to_clear() {
+    let mut app = composing();
+    // However it came about.
+    app.clear_armed = true;
+    let c = composer(&app);
+    let hint = row(&screen(&app), c.y, c.x, c.right());
+    assert!(
+        hint.contains(" enter send ") && !hint.contains("esc again"),
+        "{hint}"
+    );
+}
+
+// ------------------------------------------------------- review follow-ups
+
+#[test]
+fn a_ghost_never_leaves_a_stale_cell_where_a_wide_character_is_cut() {
+    let mut app = composing();
+    // One full row: `@pc `, 58 a's, then `日bbbbbbZ` on its last nine cells.
+    paste(&mut app, &format!("@pc {}日bbbbbbZ more", "a".repeat(58)));
+    app.set_cursor(3);
+    assert!(app.ghost().is_some());
+    let c = composer(&app);
+    assert_eq!(c.width - 6, 71, "text cells at 104 columns");
+    let (x, y) = (c.x + 4, c.y + 1);
+    let buf = screen(&app);
+    // `-configs` pushes the row along: the a's end on cell 69 and `日` no
+    // longer fits, so cell 70 is blank, not the `Z` that was there.
+    let want = format!("@pc-configs {} ", "a".repeat(58));
+    assert_eq!(row(&buf, y, x, x + 71), want);
+    let last = &buf[(x + 70, y)];
+    assert_eq!(
+        (last.fg, last.bg),
+        (color(role::TEXT), color(role::MAIN_BG))
+    );
+    assert_eq!(row(&buf, y, x + 71, x + 73), " │", "padding and border");
+}
+
+#[test]
+fn inserting_mid_text_stops_at_the_post_limit_and_keeps_the_rest() {
+    let max = beacon::model::BODY_MAX;
+    let mut app = composing();
+    // Six bytes of room, the cursor before `TAIL`.
+    paste(&mut app, &format!("{}TAIL", "a".repeat(max - 10)));
+    presses(&mut app, KeyCode::Left, 4);
+    paste(&mut app, "0123456789");
+    assert_eq!(app.input.len(), max);
+    assert!(
+        app.input.ends_with("a012345TAIL"),
+        "the text after it stays"
+    );
+    assert_eq!(app.cursor(), max - 4, "after what went in");
+    assert_eq!(
+        (app.toast.as_deref(), app.toast_error),
+        (Some("A post holds up to 64 KB of text"), true)
+    );
+    // Full: typing changes nothing, and the cursor stays good.
+    type_text(&mut app, "é");
+    assert_eq!(app.input.len(), max);
+    assert_eq!(app.cursor(), max - 4);
+    press(&mut app, KeyCode::Right);
+    assert_eq!(app.cursor(), max - 3);
+}
+
+#[test]
+fn the_caret_after_a_full_row_sits_on_the_padding_cell_not_the_border() {
+    let width = usize::from(composer(&composing()).width - 6);
+    let full = "a".repeat(width);
+    // A full row before a line break, and before a soft break.
+    for text in [format!("{full}\nnext"), format!("{full} next")] {
+        let mut app = composing();
+        paste(&mut app, &text);
+        app.set_cursor(width);
+        let c = composer(&app);
+        let y = c.y + 1;
+        let buf = screen(&app);
+        assert_eq!(caret_cells(&app, &buf), [(c.right() - 2, y)], "{text:?}");
+        let border = &buf[(c.right() - 1, y)];
+        assert_eq!(
+            (border.symbol(), border.fg, border.bg),
+            ("│", color(role::DIM), color(role::MAIN_BG)),
+            "{text:?}: the border keeps its ink"
+        );
+    }
+}
+
+#[test]
+fn a_tab_is_one_blank_cell_that_the_cursor_steps_over() {
+    let mut app = composing();
+    paste(&mut app, "a\tb");
+    let c = composer(&app);
+    let (x, y) = (c.x + 4, c.y + 1);
+    assert_eq!(row(&screen(&app), y, x, x + 4), "a b ");
+    let mut carets = Vec::new();
+    for _ in 0..4 {
+        carets.push(caret_cells(&app, &screen(&app)));
+        press(&mut app, KeyCode::Left);
+    }
+    // After `b`, on `b`, on the tab's cell, on `a`.
+    assert_eq!(
+        carets,
+        [
+            vec![(x + 3, y)],
+            vec![(x + 2, y)],
+            vec![(x + 1, y)],
+            vec![(x, y)]
+        ]
+    );
+    assert_eq!(app.input, "a\tb", "the text keeps its tab");
 }

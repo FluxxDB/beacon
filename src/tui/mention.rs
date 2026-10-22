@@ -6,7 +6,7 @@
 //! whitespace, the composer draws the rest of the best matching handle from
 //! the caret on in fog: the ghost. It is never part of the input, so sending
 //! never sends it. `Tab` puts it in at the cursor with a space after it
-//! (unless a space follows already), `↑` `↓` pick another match and `Esc`
+//! (unless whitespace follows already), `↑` `↓` pick another match and `Esc`
 //! puts it away for that word (the next `@` brings it back); the keys are in
 //! [`crate::tui::keys`]. Every `@` that can show a ghost is one
 //! [`crate::model::parse_mentions`] reads as a mention.

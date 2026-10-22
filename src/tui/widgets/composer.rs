@@ -2,7 +2,10 @@
 //! `›` prompt, the text being typed (wrapped, growing up to five lines, then
 //! scrolling) and a block caret on the cell under the cursor.
 
+use std::borrow::Cow;
 use std::ops::Range;
+
+use ratatui::layout::Rect;
 
 use crate::tui::state::{App, Focus, Selection};
 use crate::tui::theme::{palette, role, Ink};
@@ -31,7 +34,19 @@ pub fn text_width(box_width: u16) -> u16 {
 
 /// Lines the composer needs for the current input, caret included.
 pub fn line_count(app: &App, text_width: u16) -> u16 {
-    u16::try_from(rows(&app.input, text_width).len()).unwrap_or(u16::MAX)
+    u16::try_from(rows(&shown(&app.input), text_width).len()).unwrap_or(u16::MAX)
+}
+
+/// The input as the composer draws it: a tab is one blank cell, as in the
+/// posts. It is byte for byte as long as the input (a tab and a space are
+/// one byte each), so a cursor position in one is a position in the other.
+/// [`rows`], [`caret`] and [`at_column`] take this text.
+pub fn shown(input: &str) -> Cow<'_, str> {
+    if input.contains('\t') {
+        Cow::Owned(input.replace('\t', " "))
+    } else {
+        Cow::Borrowed(input)
+    }
 }
 
 /// One row of the composer's text.
@@ -144,7 +159,7 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
     let hint = match &ghost {
         Some(g) if g.count > 1 => format!(" tab complete · ↑↓ {}/{} ", g.index + 1, g.count),
         Some(_) => GHOST_HINT.to_string(),
-        None if focused && app.clear_armed => CLEAR_HINT.to_string(),
+        None if focused && app.clear_armed && !app.input.is_empty() => CLEAR_HINT.to_string(),
         None if layout.wide => HINT_WIDE.to_string(),
         None => HINT.to_string(),
     };
@@ -186,7 +201,8 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
     }
 
     let width = limit - text_x;
-    let input = app.input.as_str();
+    let drawn = shown(&app.input);
+    let input = drawn.as_ref();
     let rows = rows(input, width);
     let at = app.cursor();
     let (caret_row, caret_col) = caret(input, &rows, width, at);
@@ -222,6 +238,9 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
         // edge cuts them. Nothing before the cursor moves, no other row
         // moves, and nothing wraps.
         Some(rest) => {
+            // Blank first: a wide character pushed past the edge leaves
+            // nothing of what was drawn there.
+            canvas.fill(Rect::new(x, y, limit.saturating_sub(x), 1), text);
             let mut letters = rest.graphemes(true);
             let lead = letters.next().unwrap_or(" ");
             let x = canvas.text(x, y, lead, block, limit + 1);

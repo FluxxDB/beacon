@@ -65,8 +65,9 @@ impl App {
     /// they started from. With no row there, nothing happens.
     fn move_row(&mut self, down: bool) {
         let width = self.composer_text_width();
-        let rows = composer::rows(&self.input, width);
-        let (row, col) = composer::caret(&self.input, &rows, width, self.cursor());
+        let text = composer::shown(&self.input);
+        let rows = composer::rows(&text, width);
+        let (row, col) = composer::caret(&text, &rows, width, self.cursor());
         let target = if down {
             row.checked_add(1)
         } else {
@@ -76,7 +77,8 @@ impl App {
             return;
         };
         let goal = self.cursor_goal.unwrap_or(col);
-        self.set_cursor(composer::at_column(&self.input, target, goal));
+        let to = composer::at_column(&text, target, goal);
+        self.set_cursor(to);
         self.cursor_goal = Some(goal);
     }
 
@@ -117,8 +119,9 @@ impl App {
             return;
         };
         let width = composer::text_width(layout.composer.width);
-        let rows = composer::rows(&self.input, width);
-        let (row, _) = composer::caret(&self.input, &rows, width, self.cursor());
+        let text = composer::shown(&self.input);
+        let rows = composer::rows(&text, width);
+        let (row, _) = composer::caret(&text, &rows, width, self.cursor());
         let shown = usize::from(layout.composer.height.saturating_sub(2));
         self.composer_top = composer::first_row(self.composer_top, row, rows.len(), shown);
     }

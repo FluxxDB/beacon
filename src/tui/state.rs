@@ -1089,6 +1089,10 @@ impl App {
                 self.input.drain(..body.len());
             }
         }
+        // An Esc pressed while it was on its way has nothing left to clear.
+        if self.input.is_empty() {
+            self.clear_armed = false;
+        }
         let item = convert::post_item(&created.post);
         self.add_to_view(item, convert::post_extra(&created.post));
         // Down to the newest, to see it; what came in meanwhile is seen too
