@@ -9,7 +9,8 @@ use beacon::api::{
     AttachmentJson, ChannelJson, ChannelsJson, PostJson, PostsResponse, StreamEvent,
 };
 use beacon::model::{parse_mentions, AuthorKind};
-use beacon::tui::reply;
+use beacon::tui::convert;
+use beacon::tui::reply::{self, Quote};
 use beacon::tui::state::{App, Cmd, Conn, Focus, Loaded, Msg, Selection};
 use beacon::tui::theme::{palette, role, ColorMode, Rgb, Theme};
 use beacon::tui::view::{self, Layout};
@@ -860,6 +861,36 @@ fn an_id_without_a_digit_that_resolves_draws_its_line() {
         "╭─ nas-backup in #beacon  nightly done"
     );
     assert_eq!(body_of(&app, &buf, "pc-vllm"), "nice");
+}
+
+/// Agents often post one huge line: the cache keeps only its start, far
+/// more than any pane shows.
+#[test]
+fn a_huge_first_line_is_kept_short() {
+    let body = "build log ".repeat(6_000);
+    assert_eq!(body.chars().count(), 60_000);
+    let huge = || api_post("AB7K4TR2MF", 60, "beacon", "pc-configs", &body);
+
+    // The line is cut to the pane as it always was: 36 characters fit
+    // before the ellipsis.
+    let (mut app, cmds) = board(vec![api_post(
+        "E5F6G7H9",
+        10,
+        "general",
+        "pc-vllm",
+        "re 7K4TR2MF: seen it",
+    )]);
+    assert_eq!(fetches(&cmds), ["7K4TR2MF"]);
+    app.update(answer("7K4TR2MF", Ok(Some(huge()))));
+    assert_eq!(
+        line_above(&app, &screen(&app), "pc-vllm"),
+        "╭─ pc-configs in #beacon  build log build log build log build …"
+    );
+
+    let quote = Quote::of(&convert::post_item(&huge()));
+    let kept = quote.text.chars().count();
+    assert!((100..=1_000).contains(&kept), "kept {kept} characters");
+    assert!(body.starts_with(&quote.text), "the start of the line");
 }
 
 #[test]

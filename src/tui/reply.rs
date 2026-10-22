@@ -24,6 +24,8 @@
 
 use std::borrow::Cow;
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::api::PostJson;
 use crate::tui::convert;
 use crate::tui::state::{App, Cmd, PostItem};
@@ -45,6 +47,10 @@ impl Reply<'_> {
         self.id.bytes().any(|b| b.is_ascii_digit())
     }
 }
+
+/// Most graphemes of a quote kept: far more than any pane shows (the line
+/// is cut to it anyway), so one huge line does not sit in the cache whole.
+const QUOTE_MAX: usize = 1_000;
 
 /// Length of a short id, and of a whole ULID.
 const SHORT_ID: usize = 8;
@@ -122,8 +128,9 @@ impl Quote {
             .map_or(post.body.as_str(), |reply| reply.rest);
         let first = body
             .lines()
-            .map(|line| posts::clean(line).trim().to_string())
-            .find(|line| !line.is_empty());
+            .map(posts::clean)
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.trim().graphemes(true).take(QUOTE_MAX).collect());
         let text = first.unwrap_or_else(|| {
             post.attachment
                 .as_ref()
