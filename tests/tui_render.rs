@@ -1145,12 +1145,15 @@ fn render_never_panics_at_any_size() {
         message: "It disappears on every device.".to_string(),
         action: "delete".to_string(),
     }));
+    let mut hidden = mockup_app();
+    hidden.hide_sidebar = true;
     let apps = [
         mockup_app(),
         modal_app(),
         busy,
         confirm,
         App::new("pc", "Dang", new_york()),
+        hidden,
     ];
     for app in &apps {
         for width in [0u16, 1, 2, 10, 30, 39, 40, 41, 60, 79, 80, 99, 100, 160] {
@@ -1726,10 +1729,11 @@ mod behaviour {
         assert!(hidden.contains(line), "{hidden}");
     }
 
-    #[test]
-    fn hiding_the_sidebar_keeps_the_selected_post_in_view() {
+    /// `live_app` with twelve posts long enough to scroll the pane, which
+    /// take more rows beside the sidebar than across the full width; the
+    /// posts focused, on the oldest.
+    fn at_the_oldest_of_long_posts() -> App {
         let mut app = live_app();
-        // Enough long posts that the view scrolls, then the oldest selected.
         let long = "a post long enough to wrap onto more lines beside the sidebar \
                     than it takes across the full width of the board "
             .repeat(3);
@@ -1737,28 +1741,48 @@ mod behaviour {
             .map(|n| api_post(n, "general", "pc-configs", &long))
             .collect();
         app.update(Msg::Loaded(page(posts)));
-        // Up to the oldest, then down until the selection sits at the
-        // bottom of the pane: at the full width the posts below it take
-        // fewer rows, so it would drop out of view.
         app.update(key(KeyCode::Tab));
         for _ in 0..11 {
             app.update(ch('k'));
         }
+        assert_eq!(app.selected_post.as_deref(), Some(ulid(1).as_str()));
+        app
+    }
+
+    #[test]
+    fn hiding_the_sidebar_keeps_the_selected_post_in_view() {
+        // Down from the oldest until the selection sits at the bottom of the
+        // pane: at the full width the posts below it take fewer rows, so it
+        // would drop out of view.
+        let mut app = at_the_oldest_of_long_posts();
         for _ in 0..5 {
             app.update(ch('j'));
         }
         assert_eq!(app.selected_post.as_deref(), Some(ulid(6).as_str()));
         assert!(app.scroll > 0);
 
-        feed(&mut app, [shift_e(), shift_e()]);
+        feed(&mut app, [shift_e(), shift_e(), key(KeyCode::Tab)]);
         assert!(app.hide_sidebar);
-        app.focus = Focus::Posts;
+        assert_eq!(app.focus, Focus::Posts);
         let buf = screen(&app);
         assert!(
             (0..H).any(|y| buf[(1, y)].symbol() == "▍"),
             "the selected post's edge is on screen:\n{}",
             rows(&buf).join("\n")
         );
+    }
+
+    #[test]
+    fn hiding_the_sidebar_keeps_the_scroll_in_range() {
+        // Scrolled to the top, then fewer rows at the full width: the scroll
+        // is the new top, so PgUp has nowhere to go.
+        let mut app = at_the_oldest_of_long_posts();
+        feed(&mut app, [shift_e(), shift_e()]);
+        assert!(app.hide_sidebar);
+        let top = app.scroll;
+        assert!(top > 0);
+        app.update(key(KeyCode::PageUp));
+        assert_eq!(app.scroll, top);
     }
 
     #[test]
@@ -1780,40 +1804,78 @@ mod behaviour {
     }
 
     #[test]
-    fn below_80_columns_shift_e_says_there_is_no_sidebar() {
+    fn below_80_columns_shift_e_moves_to_and_from_the_switcher() {
+        // The switcher stands in for the sidebar: shift-e goes to it and back
+        // to the composer, and there is nothing to show or hide.
         let mut app = live_app();
         app.update(Msg::Resize(79, 24));
         let narrow = layout_of(&app);
         assert_eq!(narrow.sidebar, None);
-        // Shift-E still reaches the switcher, which stands in for the sidebar.
-        feed(&mut app, [key(KeyCode::Tab), shift_e()]);
-        assert_eq!(app.focus, Focus::Sidebar);
-        assert_eq!(app.toast, None, "nothing hidden or shown yet");
-
-        // Hiding flips the flag, but nothing changes but the focus: a toast
-        // says why.
-        app.update(shift_e());
-        assert_eq!((app.focus, app.hide_sidebar), (Focus::Composer, true));
-        assert_eq!(app.toast.as_deref(), Some("No sidebar below 80 columns"));
-        assert!(!app.toast_error, "a notice, not a failure");
-        assert_eq!(layout_of(&app), narrow);
-        let buf = render(&app, TRUECOLOR, 79, 24);
-        assert!(
-            row_text(&buf, narrow.help_y).contains("No sidebar below 80 columns"),
-            "{}",
-            rows(&buf).join("\n")
-        );
-
-        // Wider, the flag applies; narrow again, showing it says the same.
-        app.update(Msg::Resize(W, H));
-        assert!(!sidebar_drawn(&app));
-        app.update(Msg::Resize(79, 24));
-        app.toast = None;
         feed(&mut app, [key(KeyCode::Tab), shift_e()]);
         assert_eq!((app.focus, app.hide_sidebar), (Focus::Sidebar, false));
-        assert_eq!(app.toast.as_deref(), Some("No sidebar below 80 columns"));
+        app.update(shift_e());
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Composer, false));
+        assert_eq!((app.input.as_str(), app.toast.as_deref()), ("", None));
+        assert_eq!(layout_of(&app), narrow);
+
+        // In the sidebar at 104, narrowed, out and in and out again: wider
+        // again, the sidebar is still shown.
+        let mut app = live_app();
+        feed(&mut app, [key(KeyCode::Tab), shift_e()]);
+        app.update(Msg::Resize(79, 24));
+        feed(
+            &mut app,
+            [shift_e(), key(KeyCode::Tab), shift_e(), shift_e()],
+        );
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Composer, false));
+        assert_eq!((app.input.as_str(), app.toast.as_deref()), ("", None));
         app.update(Msg::Resize(W, H));
         assert!(sidebar_drawn(&app));
+    }
+
+    #[test]
+    fn widening_onto_a_hidden_sidebar_takes_the_keys_off_it() {
+        // Hidden at 104, then the switcher focused at 79: wider again the
+        // sidebar is still hidden, so the keys go to the composer, as when
+        // shift-e hides it, and j can't switch channels out of sight.
+        let mut app = live_app();
+        feed(&mut app, [key(KeyCode::Tab), shift_e(), shift_e()]);
+        assert!(app.hide_sidebar);
+        app.update(Msg::Resize(79, 24));
+        feed(&mut app, [key(KeyCode::Tab), shift_e()]);
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Sidebar, true));
+        app.update(Msg::Resize(W, H));
+        assert!(!sidebar_drawn(&app));
+        assert_eq!(app.focus, Focus::Composer);
+    }
+
+    #[test]
+    fn shift_e_in_the_filter_is_typed_into_it() {
+        let mut app = live_app();
+        feed(&mut app, [key(KeyCode::Tab), ch('/'), shift_e()]);
+        assert!(app.filter_editing);
+        assert_eq!(app.filter.as_deref(), Some("E"));
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Posts, false));
+    }
+
+    #[test]
+    fn shift_e_in_the_new_channel_form_is_typed_into_the_name() {
+        let mut app = live_app();
+        feed(&mut app, [key(KeyCode::Tab), ch('n'), shift_e()]);
+        let Some(Dialog::NewChannel(form)) = &app.dialog else {
+            panic!("not the form: {:?}", app.dialog);
+        };
+        assert_eq!(form.name, "e", "lowercased, as every typed name is");
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Posts, false));
+    }
+
+    #[test]
+    fn shift_e_closes_the_help_and_does_nothing_else() {
+        let mut app = live_app();
+        feed(&mut app, [key(KeyCode::Tab), ch('?'), shift_e()]);
+        assert_eq!(app.dialog, None);
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Posts, false));
+        assert_eq!(app.input, "");
     }
 
     // ------------------------------------------------------------ sidebar
@@ -2129,11 +2191,12 @@ mod behaviour {
         // The longest keys keep two spaces before what they do.
         assert!(text.contains("tab  shift-tab  posts, composer"), "{text}");
         assert!(
-            text.contains("shift-e         go to or hide the channels"),
+            text.contains("shift-e         go to or hide the sidebar"),
             "{text}"
         );
         assert!(accent_cells(&screen(&app)).len() <= 1, "no primary action");
-        // At 80×24 it still fits, every row whole, sidebar shown or hidden.
+        // At 80×24 it still fits, every row whole, sidebar shown or hidden,
+        // and above the footer: its rule and key row stay whole.
         for hidden in [false, true] {
             app.hide_sidebar = hidden;
             let buf = render(&app, TRUECOLOR, 80, 24);
@@ -2145,11 +2208,38 @@ mod behaviour {
                 );
             }
             assert!(small.contains("esc close"), "{small}");
+            let footer = view::Layout::compute(ratatui::layout::Rect::new(0, 0, 80, 24), &app)
+                .unwrap()
+                .help_y;
+            let rule = row_text(&buf, footer - 1);
+            assert!(
+                rule.chars().all(|c| "├─┴┤".contains(c)),
+                "the footer's rule is covered: |{rule}|\n{small}"
+            );
+            assert!(row_text(&buf, footer).contains("? help"), "{small}");
         }
         app.hide_sidebar = false;
         app.update(ch('x'));
         assert_eq!(app.dialog, None, "any key closes it");
         assert_eq!(app.input, "", "and does nothing else");
+    }
+
+    /// The help is its rows plus six: the borders, the title, a blank row
+    /// above and below the list, and `esc close`. At 80×24, the smallest
+    /// supported terminal, that must fit between the top border and the
+    /// footer's rule, so a key added to HELP can't cover the footer or cut
+    /// the list.
+    #[test]
+    fn every_help_row_fits_the_smallest_terminal() {
+        let app = live_app();
+        let layout = view::Layout::compute(ratatui::layout::Rect::new(0, 0, 80, 24), &app).unwrap();
+        let body = usize::from(layout.help_y - 1 - (layout.area.y + 1));
+        assert!(
+            HELP.len() + 6 <= body,
+            "{} keys need {} rows; 80×24 has {body}",
+            HELP.len(),
+            HELP.len() + 6
+        );
     }
 
     // ------------------------------------------------------------- filter

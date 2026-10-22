@@ -14,7 +14,8 @@
 //!   itself.
 //! * **`E` (shift-e)** is the only way into the sidebar: from the posts it
 //!   goes there, showing it first if it is hidden; from the sidebar it hides
-//!   it and goes to the composer.
+//!   it and goes to the composer. Below 80 columns it goes to the switcher
+//!   row (which stands in for the sidebar) and back, hiding nothing.
 //! * Anywhere: `Tab`/`Shift-Tab` move between the posts and the composer,
 //!   never into the sidebar (from it, `Tab` goes to the composer and
 //!   `Shift-Tab` to the posts), `PgUp`/`PgDn` scroll the posts, `Esc` clears
@@ -36,10 +37,12 @@ use crate::tui::view::SIDEBAR_MIN_WIDTH;
 use crate::tui::widgets::posts::{self, Span};
 
 /// What every key in the help overlay does, in its order.
-/// Each description fits the dialog at 80 columns.
-pub const HELP: [(&str, &str); 15] = [
+/// Each description fits the dialog at 80 columns, and the whole list fits
+/// the board at 80×24 (the dialog is six rows more than the list): `?` is
+/// left out, since the footer always shows it.
+pub const HELP: [(&str, &str); 13] = [
     ("tab  shift-tab", "posts, composer"),
-    ("shift-e", "go to or hide the channels"),
+    ("shift-e", "go to or hide the sidebar"),
     ("j k  ↓ ↑", "pick a channel or a post"),
     ("enter", "send, or write in the channel"),
     ("shift-enter", "new line (or alt-enter, ctrl-j)"),
@@ -50,9 +53,7 @@ pub const HELP: [(&str, &str); 15] = [
     ("d", "delete, or forget an agent"),
     ("/", "filter by tag or @handle"),
     ("esc", "clear filter, leave composer"),
-    ("?", "this help"),
-    ("q", "quit (not from the composer)"),
-    ("ctrl-c", "quit from anywhere"),
+    ("q  ctrl-c", "quit; ctrl-c from anywhere"),
 ];
 
 /// What a `Select a post` hint says where.
@@ -60,7 +61,6 @@ const PICK_POST: &str = "Select a post first: j/k";
 const PICK_POST_FROM_SIDEBAR: &str = "Select a post first: shift-tab to the posts, then j/k";
 const STILL_SENDING: &str = "Still sending the last post…";
 const BODY_FULL: &str = "A post holds up to 64 KB of text";
-const NO_SIDEBAR: &str = "No sidebar below 80 columns";
 
 impl App {
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> Vec<Cmd> {
@@ -258,7 +258,7 @@ impl App {
             }
             Some('q') => vec![Cmd::Quit],
             Some('E') => {
-                self.sidebar_key();
+                self.toggle_sidebar();
                 Vec::new()
             }
             Some(c) => {
@@ -433,25 +433,29 @@ impl App {
 
     /// `shift-e` in the posts or the sidebar: goes to the sidebar, showing it
     /// first if it is hidden; from the sidebar, hides it and goes to the
-    /// composer. Below 80 columns there is no sidebar to show or hide (the
-    /// switcher row stands in for it and takes the keys instead): the flag
-    /// still flips, for when the terminal widens, and a toast says why the
-    /// board looks the same.
-    fn sidebar_key(&mut self) {
-        let hide = !self.hide_sidebar && self.focus == Focus::Sidebar;
-        self.focus = if hide {
+    /// composer. Below 80 columns the switcher row stands in for the sidebar
+    /// and there is nothing to show or hide: `shift-e` only goes to the
+    /// switcher and back to the composer.
+    fn toggle_sidebar(&mut self) {
+        let leave = self.focus == Focus::Sidebar;
+        self.focus = if leave {
             Focus::Composer
         } else {
             Focus::Sidebar
         };
-        if hide == self.hide_sidebar {
+        if self.size.0 < SIDEBAR_MIN_WIDTH || self.hide_sidebar == leave {
             return;
         }
-        self.hide_sidebar = hide;
-        if self.size.0 < SIDEBAR_MIN_WIDTH {
-            self.toast(NO_SIDEBAR);
-        } else {
-            self.refit();
+        self.hide_sidebar = leave;
+        self.refit();
+    }
+
+    /// After a resize: the keys can't stay on a sidebar that is hidden at the
+    /// new width (focused below 80 columns, where the switcher stands in for
+    /// it). They go to the composer, as when `shift-e` hides it.
+    pub(crate) fn leave_hidden_sidebar(&mut self) {
+        if self.focus == Focus::Sidebar && self.hide_sidebar && self.size.0 >= SIDEBAR_MIN_WIDTH {
+            self.focus = Focus::Composer;
         }
     }
 
