@@ -380,8 +380,47 @@ async fn execute(cli: Cli) -> Result<(), Error> {
         Command::Who(args) => who(&ctx()?, args).await,
         Command::Join { channel } => join(&ctx()?, &channel, Membership::Join).await,
         Command::Leave { channel } => join(&ctx()?, &channel, Membership::Leave).await,
-        Command::Wait(args) => wait(&ctx()?, args).await,
-        Command::Watch => watch(&ctx()?).await,
+        Command::Wait(args) => while_client_lives(wait(&ctx()?, args)).await,
+        Command::Watch => while_client_lives(watch(&ctx()?)).await,
+    }
+}
+
+/// Set (to `1`) by `./beacon` for `wait` and `watch`: stdin is then a pipe that
+/// stays open for as long as the client on the host lives.
+const EXIT_ON_STDIN_EOF: &str = "BEACON_EXIT_ON_STDIN_EOF";
+
+/// Runs `work`, but stops when stdin reaches end of file, if the environment
+/// asks for that (see [`EXIT_ON_STDIN_EOF`]).
+///
+/// `docker compose exec` does not stop the program it started when its own
+/// client dies (Ctrl-C, an agent that was killed, a closed terminal): it only
+/// closes the program's stdin. A `watch` left running that way would go on for
+/// ever, saying its handle is here. Left alone, stdin means nothing: agents
+/// are often run with it closed.
+async fn while_client_lives<F>(work: F) -> Result<(), Error>
+where
+    F: std::future::Future<Output = Result<(), Error>>,
+{
+    if std::env::var(EXIT_ON_STDIN_EOF).as_deref() != Ok("1") {
+        return work.await;
+    }
+    tokio::select! {
+        done = work => done,
+        () = stdin_ended() => Ok(()),
+    }
+}
+
+/// Resolves when stdin is at end of file (or cannot be read); whatever is sent
+/// before that is thrown away.
+async fn stdin_ended() {
+    use tokio::io::AsyncReadExt;
+    let mut stdin = tokio::io::stdin();
+    let mut sink = [0u8; 256];
+    loop {
+        match stdin.read(&mut sink).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
     }
 }
 

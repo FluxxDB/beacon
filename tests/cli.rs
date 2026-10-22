@@ -132,11 +132,16 @@ impl Run {
     /// Starts the binary and leaves it running: for `wait` and `watch`, whose
     /// output arrives while the test posts. Dropping the child kills it.
     fn spawn(self) -> Child {
+        self.spawn_with_stdin(std::process::Stdio::null())
+    }
+
+    /// [`Run::spawn`] with `stdin` given to the child.
+    fn spawn_with_stdin(self, stdin: std::process::Stdio) -> Child {
         use std::process::Stdio;
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
         let mut cmd = tokio::process::Command::from(self.command());
-        cmd.stdin(Stdio::null())
+        cmd.stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -4280,6 +4285,66 @@ impl Proxy {
         }
         back.abort();
     }
+}
+
+/// `docker compose exec` leaves the program it started running when its client
+/// goes away (Ctrl-C, a killed agent, a closed terminal), and the only thing
+/// the program can see is its stdin reaching end of file. The wrapper asks for
+/// that with BEACON_EXIT_ON_STDIN_EOF and keeps stdin open while it lives, so
+/// `watch` does not run on, and keep its handle looking present, for ever.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_ends_when_its_stdin_closes_if_asked() {
+    let node = spawn_node("pc", &[]).await;
+    let before = listeners(&node);
+    let mut watch = beacon(&node, &["watch", "--as", "pc-vllm"])
+        .env("BEACON_EXIT_ON_STDIN_EOF", "1")
+        .spawn_with_stdin(std::process::Stdio::piped());
+    let stdin = watch.child.stdin.take().expect("piped stdin");
+    until_listening(&node, before).await;
+    // Still going while the other end is there, whatever it sends.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(watch.child.try_wait().unwrap().is_none(), "ended early");
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = stdin;
+        stdin.write_all(b"ignored\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(watch.child.try_wait().unwrap().is_none(), "ended on input");
+        drop(stdin);
+    }
+    let (code, _) = watch.finish_within(Duration::from_secs(5)).await;
+    assert_eq!(code, 0, "stderr: {}", watch.stderr());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_ends_when_its_stdin_closes_if_asked() {
+    let node = spawn_node("pc", &[]).await;
+    let before = listeners(&node);
+    let mut wait = beacon(&node, &["wait", "--timeout", "120", "--as", "pc-vllm"])
+        .env("BEACON_EXIT_ON_STDIN_EOF", "1")
+        .spawn_with_stdin(std::process::Stdio::piped());
+    let stdin = wait.child.stdin.take().expect("piped stdin");
+    until_listening(&node, before).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(wait.child.try_wait().unwrap().is_none(), "ended early");
+    drop(stdin);
+    let (code, _) = wait.finish_within(Duration::from_secs(5)).await;
+    assert_eq!(code, 0, "stderr: {}", wait.stderr());
+}
+
+/// Without the variable stdin means nothing: an agent harness runs commands
+/// with stdin closed, and `watch` must still watch.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_ignores_a_closed_stdin_unless_asked() {
+    let node = spawn_node("pc", &[]).await;
+    let before = listeners(&node);
+    let mut watch = beacon(&node, &["watch", "--as", "pc-vllm"]).spawn();
+    until_listening(&node, before).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(watch.child.try_wait().unwrap().is_none(), "ended early");
+    post_as(&node, "pc-configs", "general", "@pc-vllm still there?").await;
+    assert!(watch.line().await.ends_with("@pc-vllm still there?"));
+    watch.kill().await;
 }
 
 /// `watch` runs for hours. It says it is here as `wait` does, so the handle

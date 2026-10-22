@@ -49,7 +49,28 @@ case "$1 $2" in
     printf '%s\0' "$@" > "$dir/exec.argv"
     pwd -P > "$dir/exec.cwd"
     env > "$dir/exec.env"
-    [ -t 0 ] || cat > "$dir/exec.stdin"
+    case " $* " in
+    *" BEACON_EXIT_ON_STDIN_EOF=1 "*)
+        # The wrapper promises that stdin stays open while the client lives, so
+        # there is no end to read to. With FAKE_EXEC_PROBE_STDIN, look whether
+        # it is still open after a second.
+        if [ -n "${FAKE_EXEC_PROBE_STDIN:-}" ]; then
+            exec 4<&0
+            cat <&4 > "$dir/exec.stdin" &
+            pid=$!
+            sleep 1
+            if kill -0 "$pid" 2>/dev/null; then
+                echo open > "$dir/exec.stdin.state"
+                kill "$pid"
+            else
+                echo ended > "$dir/exec.stdin.state"
+            fi
+        fi
+        ;;
+    *)
+        [ -t 0 ] || cat > "$dir/exec.stdin"
+        ;;
+    esac
     if [ -n "${FAKE_EXEC_STDOUT_FILE:-}" ]; then
         cat "$FAKE_EXEC_STDOUT_FILE"
     fi
@@ -205,6 +226,16 @@ fn exec_argv(args: &[&str]) -> Vec<String> {
     let mut v: Vec<&str> = vec!["compose", "exec", "-T"];
     v.extend(ENV_FLAGS);
     v.extend(["beacon", "beacon"]);
+    v.extend(args);
+    v.into_iter().map(String::from).collect()
+}
+
+/// The argv the wrapper must hand to docker for `watch` and `wait`: the same,
+/// plus the request that the program ends when its stdin does.
+fn linked_exec_argv(args: &[&str]) -> Vec<String> {
+    let mut v: Vec<&str> = vec!["compose", "exec", "-T"];
+    v.extend(ENV_FLAGS);
+    v.extend(["-e", "BEACON_EXIT_ON_STDIN_EOF=1", "beacon", "beacon"]);
     v.extend(args);
     v.into_iter().map(String::from).collect()
 }
@@ -1184,4 +1215,88 @@ fn tui_without_a_terminal_explains_itself() {
         assert_eq!(run.stdout, b"");
         assert!(!sb.called("ps") && !sb.called("exec"), "args {args:?}");
     }
+}
+
+// `docker compose exec` leaves the program it started running when its client
+// dies (Ctrl-C, a killed agent, a closed terminal); all that program sees is its
+// stdin closing. So `watch` and `wait`, which read no stdin, are given one that
+// stays open for as long as the client lives, and are asked to end when it
+// closes. (The sandbox gives the wrapper /dev/null as stdin: no lifeline of its
+// own to pass on.)
+
+#[test]
+fn watch_and_wait_get_a_stdin_that_stays_open() {
+    let cases: &[&[&str]] = &[
+        &["watch", "--as", "pc-vllm"],
+        &["wait", "--timeout", "5"],
+        &["--as", "pc-vllm", "watch"],
+        &["--json", "--client", "codex", "wait"],
+        &["--as=pc-vllm", "--strict", "watch", "--json"],
+    ];
+    std::thread::scope(|scope| {
+        for args in cases {
+            scope.spawn(move || {
+                let sb = Sandbox::new();
+                let mut cmd = sb.command(args);
+                cmd.env("FAKE_EXEC_PROBE_STDIN", "1");
+                let run = sb.run(cmd);
+                assert_eq!(run.code, 0, "{args:?}: {}", run.stderr);
+                assert_eq!(sb.argv("exec"), linked_exec_argv(args), "{args:?}");
+                let state = fs::read_to_string(sb.state.join("exec.stdin.state")).unwrap();
+                assert_eq!(
+                    state.trim(),
+                    "open",
+                    "{args:?}: stdin must not end while the client lives"
+                );
+            });
+        }
+    });
+}
+
+#[test]
+fn other_commands_keep_the_stdin_they_were_given() {
+    // `wait` and `watch` as words in a message or a channel name are not commands.
+    let cases: &[&[&str]] = &[
+        &["read", "general"],
+        &["post", "general", "wait"],
+        &["post", "general", "--as", "pc-vllm", "watch"],
+        &["read", "watch"],
+        &["--as", "wait", "who"],
+        &["who"],
+    ];
+    for args in cases {
+        let sb = Sandbox::new();
+        let run = sb.run(sb.command(args));
+        assert_eq!(run.code, 0, "{args:?}: {}", run.stderr);
+        assert_eq!(sb.argv("exec"), exec_argv(args), "{args:?}");
+    }
+}
+
+#[test]
+fn the_stdin_for_watch_leaves_no_files_behind() {
+    let sb = Sandbox::new();
+    let tmp = sb.root.join("tmp");
+    fs::create_dir(&tmp).unwrap();
+    let mut cmd = sb.command(&["watch", "--as", "pc-vllm"]);
+    cmd.env("TMPDIR", &tmp);
+    let run = sb.run(cmd);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(
+        sb.argv("exec"),
+        linked_exec_argv(&["watch", "--as", "pc-vllm"])
+    );
+    let left: Vec<_> = fs::read_dir(&tmp).unwrap().collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
+}
+
+#[test]
+fn watch_still_runs_where_the_stdin_cannot_be_made() {
+    // No temp directory: run it as before, and do not ask it to end on stdin
+    // closing (it would end at once on the caller's /dev/null).
+    let sb = Sandbox::new();
+    let mut cmd = sb.command(&["watch", "--as", "pc-vllm"]);
+    cmd.env("TMPDIR", sb.root.join("no-such-dir"));
+    let run = sb.run(cmd);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(sb.argv("exec"), exec_argv(&["watch", "--as", "pc-vllm"]));
 }
