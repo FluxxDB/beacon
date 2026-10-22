@@ -1831,6 +1831,15 @@ mod behaviour {
         assert_eq!((app.input.as_str(), app.toast.as_deref()), ("", None));
         app.update(Msg::Resize(W, H));
         assert!(sidebar_drawn(&app));
+
+        // The switcher focused at 79, then wider: the sidebar is shown, so
+        // it keeps the keys.
+        app.update(Msg::Resize(79, 24));
+        feed(&mut app, [key(KeyCode::Tab), shift_e()]);
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.update(Msg::Resize(W, H));
+        assert!(sidebar_drawn(&app));
+        assert_eq!(app.focus, Focus::Sidebar);
     }
 
     #[test]
@@ -1844,6 +1853,9 @@ mod behaviour {
         app.update(Msg::Resize(79, 24));
         feed(&mut app, [key(KeyCode::Tab), shift_e()]);
         assert_eq!((app.focus, app.hide_sidebar), (Focus::Sidebar, true));
+        // Still below 80: the switcher keeps the keys.
+        app.update(Msg::Resize(70, 24));
+        assert_eq!(app.focus, Focus::Sidebar);
         app.update(Msg::Resize(W, H));
         assert!(!sidebar_drawn(&app));
         assert_eq!(app.focus, Focus::Composer);
