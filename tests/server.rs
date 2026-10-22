@@ -8,10 +8,15 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use beacon::api::{ChannelsJson, PostCreated, PostJson, PostsResponse, WhoJson};
+use beacon::api::{
+    ChannelJson, ChannelsJson, EventsResponse, PostCreated, PostJson, PostsResponse, StreamEvent,
+    WhoJson,
+};
 use beacon::config::Config;
 use beacon::error::Error;
-use beacon::model::{AuthorKind, Event, EventKind, NewPost, VersionVector};
+use beacon::model::{
+    format_vv, parse_mentions, AuthorKind, Event, EventKind, NewPost, VersionVector,
+};
 use beacon::server::{now_ms, secret_matches};
 use common::*;
 use reqwest::multipart::{Form, Part};
@@ -2098,6 +2103,1055 @@ async fn commit_if_stamps_the_event_after_taking_the_lock() {
         "stamped {}ms after the request, before the lock was free",
         now - asked_at
     );
+}
+
+// ------------------------------------------------------------ live arrivals
+
+/// Bounds something that must finish, so a hang fails the test instead of
+/// blocking the run.
+async fn within<T>(secs: u64, what: &str, fut: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(secs), fut)
+        .await
+        .unwrap_or_else(|_| panic!("timed out after {secs}s waiting for {what}"))
+}
+
+fn events_page(body: Value) -> EventsResponse {
+    serde_json::from_value(body).expect("an events response")
+}
+
+/// Everything the node holds, as a peer with an empty copy would pull it.
+async fn pull_all(node: &TestNode) -> EventsResponse {
+    events_page(ok(node.get("/api/events").send().await.unwrap()).await)
+}
+
+/// A request that is answered later: how long it took to get its headers,
+/// and the response.
+type Pending = tokio::task::JoinHandle<(Duration, Response)>;
+
+fn start(request: reqwest::RequestBuilder) -> Pending {
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let resp = request.send().await.unwrap();
+        (started.elapsed(), resp)
+    })
+}
+
+/// `GET /api/events` as a peer holding `after` that last saw head `since`.
+fn start_poll(node: &TestNode, after: &VersionVector, since: i64, wait: u64) -> Pending {
+    start(node.get(&events_path(after, since, wait)))
+}
+
+/// The path of a pull. (Origins are `node~id` and a vector is `a:1,b:2`:
+/// nothing in it needs escaping in a query.)
+fn events_path(after: &VersionVector, since: i64, wait: u64) -> String {
+    format!(
+        "/api/events?after={}&since={since}&wait={wait}",
+        format_vv(after)
+    )
+}
+
+fn start_wait(node: &TestNode, handle: &str, timeout: u64) -> Pending {
+    start(node.get(&format!("/api/wait?handle={handle}&timeout={timeout}")))
+}
+
+async fn join(node: &TestNode, handle: &str, channels: &[&str]) {
+    let resp = node
+        .put(&format!("/api/joins/{handle}"))
+        .json(&json!({ "channels": channels }))
+        .send()
+        .await
+        .unwrap();
+    ok(resp).await;
+}
+
+/// An event as another device would have made it.
+fn remote_event(origin: &str, seq: u64, kind: EventKind) -> Event {
+    Event {
+        origin: origin.into(),
+        seq,
+        id: ulid::Ulid::generate().to_string(),
+        ts: 1_000 + seq as i64,
+        kind,
+    }
+}
+
+fn remote_post(origin: &str, seq: u64, channel: &str, author: &str, body: &str) -> Event {
+    remote_event(
+        origin,
+        seq,
+        EventKind::PostCreated(NewPost {
+            post_id: ulid::Ulid::generate().to_string(),
+            channel: channel.into(),
+            author: author.into(),
+            author_kind: AuthorKind::Agent,
+            client: Some("claude-code".into()),
+            node: "mac".into(),
+            body: body.into(),
+            tags: vec![],
+            mentions: parse_mentions(body),
+            attachment: None,
+        }),
+    )
+}
+
+fn event_post_id(ev: &Event) -> String {
+    match &ev.kind {
+        EventKind::PostCreated(p) => p.post_id.clone(),
+        other => panic!("not a post_created: {other:?}"),
+    }
+}
+
+/// The body of the post a stream event announces.
+fn post_body(ev: &StreamEvent) -> &str {
+    match ev {
+        StreamEvent::Post(p) => &p.body,
+        other => panic!("expected a post event, got {other:?}"),
+    }
+}
+
+/// A reader for `GET /api/stream`.
+struct SseReader {
+    resp: Response,
+    buf: Vec<u8>,
+}
+
+impl SseReader {
+    async fn open(node: &TestNode, query: &str) -> SseReader {
+        let resp = within(
+            5,
+            "the stream to open",
+            node.get(&format!("/api/stream{query}")).send(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let content_type = resp.headers()["content-type"].to_str().unwrap().to_string();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "{content_type}"
+        );
+        SseReader {
+            resp,
+            buf: Vec::new(),
+        }
+    }
+
+    /// The next frame, comments included; `None` if the stream ended or
+    /// nothing came within `limit`.
+    async fn frame(&mut self, limit: Duration) -> Option<String> {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(end) = self.buf.windows(2).position(|w| w == b"\n\n") {
+                let frame = String::from_utf8(self.buf[..end].to_vec()).unwrap();
+                self.buf.drain(..end + 2);
+                return Some(frame);
+            }
+            let left = deadline.checked_duration_since(Instant::now())?;
+            match tokio::time::timeout(left, self.resp.chunk()).await {
+                Ok(Ok(Some(bytes))) => self.buf.extend_from_slice(&bytes),
+                _ => return None,
+            }
+        }
+    }
+
+    /// The next event (comments skipped) as its `event:` name and `data:` text.
+    async fn raw(&mut self, limit: Duration) -> Option<(String, String)> {
+        loop {
+            let frame = self.frame(limit).await?;
+            if frame.lines().all(|l| l.starts_with(':')) {
+                continue;
+            }
+            let name = frame
+                .lines()
+                .find_map(|l| l.strip_prefix("event:"))
+                .expect("an event name")
+                .trim()
+                .to_string();
+            let data: Vec<&str> = frame
+                .lines()
+                .filter_map(|l| l.strip_prefix("data:"))
+                .map(|l| l.strip_prefix(' ').unwrap_or(l))
+                .collect();
+            return Some((name, data.join("\n")));
+        }
+    }
+
+    /// The next event, decoded; fails the test if none comes in 5 s.
+    async fn next(&mut self) -> StreamEvent {
+        let (name, data) = self
+            .raw(Duration::from_secs(5))
+            .await
+            .expect("a stream event within 5 s");
+        StreamEvent::from_sse(&name, &data)
+            .unwrap_or_else(|e| panic!("bad {name} event {data}: {e}"))
+    }
+
+    /// Fails the test if an event arrives within `limit`.
+    async fn quiet_for(&mut self, limit: Duration) {
+        if let Some((name, data)) = self.raw(limit).await {
+            panic!("expected nothing, got {name}: {data}");
+        }
+    }
+}
+
+// ----------------------------------------------------------- GET /api/events
+
+#[tokio::test]
+async fn events_page_has_the_agreed_shape_and_names_the_node() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+
+    let resp = node.get("/api/events").send().await.unwrap();
+    assert_eq!(resp.headers()["x-beacon-node"], "pc");
+    let body = ok(resp).await;
+    assert_eq!(body["v"], 1);
+    assert_eq!(body["more"], false);
+    let page = events_page(body);
+    // `general` and `beacon`, in arrival order, with their arrival as the head.
+    assert_eq!(page.events.len(), 2);
+    assert_eq!(page.head, 2);
+    let have = node
+        .state()
+        .with_store(|s| Ok(s.version_vector()))
+        .await
+        .unwrap();
+    assert_eq!(page.have, have);
+
+    // Caught up: nothing to send, and the head is still reported.
+    let after = format_vv(&page.have);
+    let resp = node
+        .get(&format!("/api/events?after={after}"))
+        .send()
+        .await
+        .unwrap();
+    let caught_up = events_page(ok(resp).await);
+    assert!(caught_up.events.is_empty());
+    assert_eq!(caught_up.head, 2);
+    assert!(!caught_up.more);
+
+    // Every /api/events answer carries the node, errors included.
+    let resp = node.get("/api/events?after=garbage").send().await.unwrap();
+    assert_eq!(resp.headers()["x-beacon-node"], "pc");
+    expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+    let resp = node
+        .post("/api/events")
+        .json(&json!({ "events": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.headers()["x-beacon-node"], "pc");
+    ok(resp).await;
+    // Other routes do not.
+    let resp = node.get("/api/health").send().await.unwrap();
+    assert!(resp.headers().get("x-beacon-node").is_none());
+}
+
+#[tokio::test]
+async fn events_limit_marks_a_cut_page_as_more() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    agent_post(&node, "beacon", "pc-configs", "one", &[]).await;
+    agent_post(&node, "beacon", "pc-configs", "two", &[]).await;
+
+    let page = events_page(ok(node.get("/api/events?limit=2").send().await.unwrap()).await);
+    // The lowest seqs first: `general`, then `beacon`.
+    assert_eq!(page.events.len(), 2);
+    assert!(page.more);
+    assert!(matches!(
+        page.events[1].kind,
+        EventKind::ChannelCreated { .. }
+    ));
+    // The head is the node's, not the page's.
+    assert_eq!(page.head, 4);
+
+    let page = events_page(ok(node.get("/api/events?limit=500").send().await.unwrap()).await);
+    assert_eq!(page.events.len(), 4);
+    assert!(!page.more);
+}
+
+#[tokio::test]
+async fn events_bad_queries_are_400() {
+    let node = spawn_node("pc", &[]).await;
+    for query in [
+        "after=nonsense",
+        "after=a:1,a:2",
+        "limit=0",
+        "limit=-1",
+        "wait=soon",
+        "since=x",
+    ] {
+        let resp = node
+            .get(&format!("/api/events?{query}"))
+            .send()
+            .await
+            .unwrap();
+        expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+    }
+}
+
+#[tokio::test]
+async fn long_poll_wakes_on_new_event() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    // Catch up first, as a peer would; the poll starts from there.
+    let caught_up = pull_all(&node).await;
+
+    let poll = start_poll(&node, &caught_up.have, caught_up.head, 10);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let posted = agent_post(&node, "beacon", "pc-configs", "hello", &[]).await;
+
+    let (waited, resp) = within(5, "the long poll", poll).await.unwrap();
+    assert!(
+        waited >= Duration::from_millis(250) && waited < Duration::from_secs(2),
+        "answered after {waited:?}"
+    );
+    let page = events_page(ok(resp).await);
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(event_post_id(&page.events[0]), post_id(&posted));
+    assert_eq!(page.head, caught_up.head + 1);
+}
+
+#[tokio::test]
+async fn long_poll_answers_at_once_when_the_page_holds_something_new() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    // `since` defaults to 0: everything stored is new to a caller that has
+    // never been answered by this server.
+    let started = Instant::now();
+    let resp = within(
+        5,
+        "an immediate answer",
+        node.get("/api/events?wait=10").send(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(events_page(ok(resp).await).events.len(), 2);
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn long_poll_with_a_head_from_another_database_answers_at_once() {
+    // This node's database was wiped and started over: the head a peer
+    // remembers is higher than anything here, and must not make it wait
+    // for that many arrivals before it hears of new ones.
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let started = Instant::now();
+    let resp = within(
+        5,
+        "an immediate answer",
+        node.get("/api/events?since=9999&wait=10").send(),
+    )
+    .await
+    .unwrap();
+    let page = events_page(ok(resp).await);
+    assert_eq!(page.events.len(), 2);
+    assert!(page.head < 9999);
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn long_poll_without_wait_answers_at_once_even_when_caught_up() {
+    let node = spawn_node("pc", &[]).await;
+    let page = pull_all(&node).await;
+    let started = Instant::now();
+    let resp = node
+        .get(&events_path(&page.have, page.head, 0))
+        .send()
+        .await
+        .unwrap();
+    assert!(events_page(ok(resp).await).events.is_empty());
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn long_poll_with_a_shared_gap_waits_until_something_is_new() {
+    // Two nodes that both lack the same event (seq 2 of one origin) keep
+    // re-sending each other what lies above it. A long poll must not treat
+    // that as news, or it would be answered at once, forever.
+    let node = spawn_node("pc", &[]).await;
+    let origin = "mac~gap00001";
+    let channel_event = |seq: u64| {
+        remote_event(
+            origin,
+            seq,
+            EventKind::ChannelCreated {
+                name: format!("gap-{seq}"),
+                topic: None,
+            },
+        )
+    };
+    for seq in [1, 3] {
+        assert!(node
+            .state()
+            .ingest(channel_event(seq))
+            .await
+            .unwrap()
+            .is_some());
+    }
+    // The caller is gap-free up to seq 1 of the origin, and has our own events.
+    let mut after = node
+        .state()
+        .with_store(|s| Ok(s.version_vector()))
+        .await
+        .unwrap();
+    after.insert(origin.to_string(), 1);
+
+    // First time this server answers it: seq 3 is new to it.
+    let (_, resp) = within(5, "the first poll", start_poll(&node, &after, 0, 5))
+        .await
+        .unwrap();
+    let first = events_page(ok(resp).await);
+    assert_eq!(first.events.len(), 1);
+    assert_eq!(first.events[0].seq, 3);
+
+    // Same request, now that it has seen `first.head`: seq 3 is sent again
+    // (the gap is still there) yet it is not news, so the poll waits out its time.
+    let (waited, resp) = within(
+        5,
+        "the second poll",
+        start_poll(&node, &after, first.head, 1),
+    )
+    .await
+    .unwrap();
+    assert!(
+        waited >= Duration::from_millis(900),
+        "answered after {waited:?}"
+    );
+    let second = events_page(ok(resp).await);
+    assert_eq!(second.events.len(), 1);
+    assert_eq!(second.events[0].seq, 3);
+    assert_eq!(second.head, first.head);
+
+    // A genuinely new event wakes it, and the page still repeats seq 3.
+    let poll = start_poll(&node, &after, first.head, 10);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    node.state()
+        .ingest(channel_event(4))
+        .await
+        .unwrap()
+        .unwrap();
+    let (waited, resp) = within(5, "the third poll", poll).await.unwrap();
+    assert!(waited < Duration::from_secs(2), "answered after {waited:?}");
+    let third = events_page(ok(resp).await);
+    let seqs: Vec<u64> = third.events.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, [3, 4]);
+    assert!(third.head > first.head);
+}
+
+// ---------------------------------------------------------- POST /api/events
+
+#[tokio::test]
+async fn push_endpoint_is_idempotent() {
+    let a = spawn_node("a", &[]).await;
+    let b = spawn_node("b", &[]).await;
+    new_channel(&a, "beacon").await;
+    agent_post(&a, "beacon", "a-agent", "from a", &[]).await;
+    let events = pull_all(&a).await.events;
+    assert_eq!(events.len(), 3);
+
+    // One event, twice.
+    let push = |evs: &[Event]| b.post("/api/events").json(&json!({ "events": evs })).send();
+    let first = ok(push(&events[..1]).await.unwrap()).await;
+    assert_eq!(first["v"], 1);
+    assert_eq!(first["applied"], 1);
+    assert_eq!(first["have"][&events[0].origin], 1);
+    let again = ok(push(&events[..1]).await.unwrap()).await;
+    assert_eq!(again["applied"], 0);
+
+    // The whole batch, with the first event in it again.
+    let rest = ok(push(&events).await.unwrap()).await;
+    assert_eq!(rest["applied"], 2);
+    assert_eq!(rest["have"][&events[0].origin], 3);
+    let again = ok(push(&events).await.unwrap()).await;
+    assert_eq!(again["applied"], 0);
+    assert_eq!(channel_bodies(&b, "beacon").await, ["from a"]);
+
+    // B relays what it was pushed.
+    let relayed = pull_all(&b).await;
+    let from_a = relayed
+        .events
+        .iter()
+        .filter(|e| e.origin == events[0].origin)
+        .count();
+    assert_eq!(from_a, 3);
+}
+
+#[tokio::test]
+async fn push_rejects_what_it_cannot_store() {
+    let node = spawn_node("pc", &[]).await;
+    let resp = node
+        .post("/api/events")
+        .json(&json!({ "events": "no" }))
+        .send()
+        .await
+        .unwrap();
+    expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+    let resp = node.post("/api/events").body("{").send().await.unwrap();
+    expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+
+    // A seq SQLite cannot hold is refused.
+    let mut huge = remote_event(
+        "mac~abcd1234",
+        1,
+        EventKind::ChannelDeleted { name: "x".into() },
+    );
+    huge.seq = u64::MAX;
+    let resp = node
+        .post("/api/events")
+        .json(&json!({ "events": [huge] }))
+        .send()
+        .await
+        .unwrap();
+    expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+
+    // An event that breaks the rules is stored (so sync stays gap-free) and
+    // counted as applied, but derives nothing and is not announced.
+    let mut rx = node.state().arrivals.subscribe();
+    let bad = remote_event(
+        "mac~abcd1234",
+        1,
+        EventKind::ChannelCreated {
+            name: "Not A Channel".into(),
+            topic: None,
+        },
+    );
+    let resp = node
+        .post("/api/events")
+        .json(&json!({ "events": [bad] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok(resp).await["applied"], 1);
+    assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    let resp = node.get("/api/channels").send().await.unwrap();
+    let channels: ChannelsJson = serde_json::from_value(ok(resp).await).unwrap();
+    assert_eq!(channels.channels.len(), 1);
+}
+
+#[tokio::test]
+async fn pushed_posts_reach_streams_and_waiters_within_a_second() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    join(&node, "pc-vllm", &["beacon"]).await;
+    let mut sse = SseReader::open(&node, "?handle=pc-vllm&relevant=1").await;
+    let waiter = start_wait(&node, "pc-vllm", 10);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let pushed = Instant::now();
+    let post = remote_post(
+        "mac~abcd1234",
+        1,
+        "beacon",
+        "mac-agent",
+        "pushed from the mac",
+    );
+    let resp = node
+        .post("/api/events")
+        .json(&json!({ "events": [post] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok(resp).await["applied"], 1);
+
+    let (_, resp) = within(5, "the waiter", waiter).await.unwrap();
+    let woke: PostsResponse = serde_json::from_value(ok(resp).await).unwrap();
+    assert_eq!(woke.posts.len(), 1);
+    assert_eq!(woke.posts[0].body, "pushed from the mac");
+    let event = sse.next().await;
+    assert_eq!(post_body(&event), "pushed from the mac");
+    assert!(
+        pushed.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        pushed.elapsed()
+    );
+}
+
+// ---------------------------------------------------------------- GET /api/wait
+
+#[tokio::test]
+async fn wait_returns_immediately_when_unread() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    join(&node, "pc-vllm", &["beacon"]).await;
+    agent_post(&node, "beacon", "pc-configs", "already here", &[]).await;
+
+    for _ in 0..2 {
+        let started = Instant::now();
+        let resp = within(5, "wait", start_wait(&node, "pc-vllm", 10))
+            .await
+            .unwrap()
+            .1;
+        let found: PostsResponse = serde_json::from_value(ok(resp).await).unwrap();
+        assert_eq!(found.v, 1);
+        assert_eq!(found.posts.len(), 1);
+        assert_eq!(found.posts[0].body, "already here");
+        assert_eq!(found.remaining, Some(0));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+    // Waiting never marked anything read: the second answer proves it, and
+    // so does the unread endpoint.
+    let resp = node.get("/api/unread/pc-vllm").send().await.unwrap();
+    let unread: PostsResponse = serde_json::from_value(ok(resp).await).unwrap();
+    assert_eq!(unread.posts.len(), 1);
+}
+
+#[tokio::test]
+async fn wait_blocks_then_wakes_on_mention() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let waiter = start_wait(&node, "pc-vllm", 10);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Neither of these is for pc-vllm.
+    agent_post(&node, "beacon", "pc-configs", "just chatting", &[]).await;
+    agent_post(&node, "beacon", "pc-configs", "@someone-else look", &[]).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    agent_post(
+        &node,
+        "beacon",
+        "pc-configs",
+        "hey @pc-vllm, over to you",
+        &[],
+    )
+    .await;
+
+    let (waited, resp) = within(5, "the waiter", waiter).await.unwrap();
+    assert!(waited >= Duration::from_millis(250), "{waited:?}");
+    assert!(waited < Duration::from_secs(2), "{waited:?}");
+    let found: PostsResponse = serde_json::from_value(ok(resp).await).unwrap();
+    let bodies: Vec<&str> = found.posts.iter().map(|p| p.body.as_str()).collect();
+    assert_eq!(bodies, ["hey @pc-vllm, over to you"]);
+}
+
+#[tokio::test]
+async fn wait_wakes_on_an_announcement_in_a_channel_not_joined() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let waiter = start_wait(&node, "pc-vllm", 10);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    human_post(&node, "beacon", "heads up").await;
+    let (waited, resp) = within(5, "the waiter", waiter).await.unwrap();
+    assert!(waited < Duration::from_secs(2), "{waited:?}");
+    let found: PostsResponse = serde_json::from_value(ok(resp).await).unwrap();
+    assert_eq!(found.posts.len(), 1);
+    assert!(found.posts[0].announcement);
+}
+
+#[tokio::test]
+async fn wait_ignores_own_and_unjoined() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    new_channel(&node, "vllm").await;
+    join(&node, "pc-vllm", &["vllm"]).await;
+    agent_post(&node, "beacon", "pc-configs", "elsewhere", &[]).await;
+    agent_post(&node, "vllm", "pc-vllm", "my own post", &[]).await;
+
+    let started = Instant::now();
+    let (_, resp) = within(5, "the timeout", start_wait(&node, "pc-vllm", 1))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(resp.text().await.unwrap().is_empty());
+    assert!(started.elapsed() >= Duration::from_millis(900));
+
+    // A post in the joined channel from someone else is what it waits for.
+    agent_post(&node, "vllm", "pc-configs", "for the joined channel", &[]).await;
+    let (_, resp) = within(5, "wait", start_wait(&node, "pc-vllm", 10))
+        .await
+        .unwrap();
+    let found: PostsResponse = serde_json::from_value(ok(resp).await).unwrap();
+    assert_eq!(found.posts.len(), 1);
+    assert_eq!(found.posts[0].body, "for the joined channel");
+}
+
+#[tokio::test]
+async fn wait_times_out_204() {
+    let node = spawn_node("pc", &[]).await;
+    let started = Instant::now();
+    let (_, resp) = within(5, "the timeout", start_wait(&node, "pc-vllm", 1))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(900) && waited < Duration::from_secs(3),
+        "{waited:?}"
+    );
+}
+
+#[tokio::test]
+async fn wait_wakes_for_a_late_arriving_old_post() {
+    // Written hours ago on a device that was offline, synced just now.
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    join(&node, "pc-vllm", &["beacon"]).await;
+    agent_post(&node, "beacon", "pc-configs", "recent", &[]).await;
+    // Read what is there, so the cursor is past it.
+    ok(node
+        .get("/api/unread/pc-vllm?advance=1")
+        .send()
+        .await
+        .unwrap())
+    .await;
+
+    let waiter = start_wait(&node, "pc-vllm", 10);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let old = remote_post("mac~abcd1234", 1, "beacon", "mac-agent", "written long ago");
+    assert!(old.ts < 10_000, "the event's ts is ancient");
+    node.state().ingest(old).await.unwrap().unwrap();
+
+    let (waited, resp) = within(5, "the waiter", waiter).await.unwrap();
+    assert!(waited < Duration::from_secs(2), "{waited:?}");
+    let found: PostsResponse = serde_json::from_value(ok(resp).await).unwrap();
+    assert_eq!(found.posts.len(), 1);
+    assert_eq!(found.posts[0].body, "written long ago");
+}
+
+#[tokio::test]
+async fn wait_needs_a_valid_handle_and_timeout() {
+    let node = spawn_node("pc", &[]).await;
+    for query in [
+        "",
+        "?timeout=1",
+        "?handle=",
+        "?handle=bad%20handle&timeout=1",
+        "?handle=pc-vllm&timeout=soon",
+        "?handle=pc-vllm&timeout=-1",
+        "?handle=pc-vllm&limit=0",
+    ] {
+        let resp = node.get(&format!("/api/wait{query}")).send().await.unwrap();
+        expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+    }
+}
+
+// --------------------------------------------------------------- GET /api/stream
+
+#[tokio::test]
+async fn sse_streams_each_kind_of_event() {
+    let node = spawn_node("pc", &[]).await;
+    let mut sse = SseReader::open(&node, "").await;
+
+    new_channel(&node, "builds").await;
+    let (name, data) = sse.raw(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(name, "channel");
+    let data: Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(
+        data,
+        json!({ "channel": { "name": "builds", "topic": null, "unread": null }, "deleted": false })
+    );
+
+    let created = agent_post(&node, "builds", "pc-a", "hello", &["ci"]).await;
+    let (name, data) = sse.raw(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(name, "post");
+    // The data is the post as the API shows it, arrival and all.
+    let data: Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(data, created["post"]);
+    assert_eq!(data["v"], 1);
+
+    let resp = node
+        .post("/api/who")
+        .json(&json!({ "handle": "pc-a", "kind": "agent", "client": "claude-code", "status": "busy" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok(resp).await["recorded"], true);
+    let (name, data) = sse.raw(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(name, "presence");
+    let data: Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(data["handle"], "pc-a");
+    assert_eq!(data["status"], "busy");
+    assert_eq!(data["active"], true);
+
+    let id = post_id(&created);
+    let resp = node
+        .delete(&format!("/api/posts/{id}"))
+        .send()
+        .await
+        .unwrap();
+    ok(resp).await;
+    let (name, data) = sse.raw(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(name, "post_deleted");
+    assert_eq!(
+        serde_json::from_str::<Value>(&data).unwrap(),
+        json!({ "id": id })
+    );
+
+    let resp = node.delete("/api/channels/builds").send().await.unwrap();
+    ok(resp).await;
+    assert_eq!(
+        sse.next().await,
+        StreamEvent::Channel {
+            channel: ChannelJson {
+                name: "builds".into(),
+                topic: None,
+                unread: None
+            },
+            deleted: true
+        }
+    );
+    sse.quiet_for(Duration::from_millis(200)).await;
+}
+
+#[tokio::test]
+async fn sse_relevant_filters() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    new_channel(&node, "vllm").await;
+    join(&node, "pc-vllm", &["vllm"]).await;
+    let mut sse = SseReader::open(&node, "?handle=pc-vllm&relevant=1").await;
+
+    // Other kinds of event are not filtered.
+    new_channel(&node, "builds").await;
+    assert!(matches!(sse.next().await, StreamEvent::Channel { .. }));
+
+    // An unjoined agent post, then the handle's own post: no `post` event.
+    agent_post(&node, "beacon", "pc-configs", "unjoined agent post", &[]).await;
+    agent_post(&node, "vllm", "pc-vllm", "my own post", &[]).await;
+    // A post in the joined channel, Dang's post (an announcement, in a channel
+    // that is not joined), and a mention are.
+    agent_post(&node, "vllm", "pc-configs", "joined channel", &[]).await;
+    human_post(&node, "beacon", "from Dang").await;
+    agent_post(&node, "beacon", "pc-configs", "ping @pc-vllm", &[]).await;
+    // Events arrive in order, so the first post event being the joined one
+    // shows the two before it were filtered out.
+    assert_eq!(post_body(&sse.next().await), "joined channel");
+    let announcement = sse.next().await;
+    assert_eq!(post_body(&announcement), "from Dang");
+    assert!(matches!(&announcement, StreamEvent::Post(p) if p.announcement));
+    assert_eq!(post_body(&sse.next().await), "ping @pc-vllm");
+    sse.quiet_for(Duration::from_millis(200)).await;
+
+    // Without `relevant`, the same handle sees every post.
+    let mut all = SseReader::open(&node, "?handle=pc-vllm").await;
+    agent_post(&node, "beacon", "pc-configs", "unjoined again", &[]).await;
+    agent_post(&node, "vllm", "pc-vllm", "my own again", &[]).await;
+    assert_eq!(post_body(&all.next().await), "unjoined again");
+    assert_eq!(post_body(&all.next().await), "my own again");
+}
+
+#[tokio::test]
+async fn sse_relevant_reads_joins_at_send_time() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let mut sse = SseReader::open(&node, "?handle=pc-vllm&relevant=1").await;
+
+    agent_post(&node, "beacon", "pc-configs", "before joining", &[]).await;
+    join(&node, "pc-vllm", &["beacon"]).await;
+    agent_post(&node, "beacon", "pc-configs", "after joining", &[]).await;
+    assert_eq!(post_body(&sse.next().await), "after joining");
+    join(&node, "pc-vllm", &[]).await;
+    agent_post(&node, "beacon", "pc-configs", "after leaving", &[]).await;
+    human_post(&node, "beacon", "marker").await;
+    assert_eq!(post_body(&sse.next().await), "marker");
+}
+
+#[tokio::test]
+async fn sse_needs_a_handle_for_relevant() {
+    let node = spawn_node("pc", &[]).await;
+    for query in [
+        "?relevant=1",
+        "?handle=bad%20handle",
+        "?handle=pc-vllm&relevant=maybe",
+    ] {
+        let resp = node
+            .get(&format!("/api/stream{query}"))
+            .send()
+            .await
+            .unwrap();
+        expect_error(resp, StatusCode::BAD_REQUEST, "usage").await;
+    }
+    // Both spellings of "off" are fine.
+    for query in [
+        "?relevant=0",
+        "?handle=pc-vllm&relevant=0",
+        "?relevant=false",
+    ] {
+        SseReader::open(&node, query).await;
+    }
+}
+
+#[tokio::test]
+async fn sse_skips_events_that_did_not_derive() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let mut sse = SseReader::open(&node, "").await;
+    let state = node.state();
+    let origin = "mac~abcd1234";
+
+    // A tombstone that arrives before its post: the post is born deleted.
+    let doomed = remote_post(origin, 1, "beacon", "mac-a", "doomed");
+    let tombstone = remote_event(
+        origin,
+        2,
+        EventKind::PostDeleted {
+            post_id: event_post_id(&doomed),
+            by: "mac-a".into(),
+        },
+    );
+    state.ingest(tombstone).await.unwrap().unwrap();
+    state.ingest(doomed.clone()).await.unwrap().unwrap();
+    // One that breaks the rules: stored, never announced.
+    let bad = remote_event(
+        origin,
+        3,
+        EventKind::ChannelCreated {
+            name: "Not A Channel".into(),
+            topic: None,
+        },
+    );
+    state.ingest(bad).await.unwrap().unwrap();
+    // A good post, and a second event claiming the same post id: only the
+    // first made a post.
+    let good = remote_post(origin, 4, "beacon", "mac-a", "visible");
+    let mut twin = remote_post(origin, 5, "beacon", "mac-b", "same id, later");
+    if let (EventKind::PostCreated(t), EventKind::PostCreated(g)) = (&mut twin.kind, &good.kind) {
+        t.post_id = g.post_id.clone();
+    }
+    state.ingest(good).await.unwrap().unwrap();
+    state.ingest(twin).await.unwrap().unwrap();
+    // A delete of a channel that an event newer than it keeps alive changes
+    // nothing visible, so says nothing.
+    let mut stale = remote_event(
+        origin,
+        6,
+        EventKind::ChannelDeleted {
+            name: "beacon".into(),
+        },
+    );
+    stale.ts = 1;
+    state.ingest(stale).await.unwrap().unwrap();
+    // Deletes that break the rules are stored and applied to nothing, so they
+    // say nothing either (a channel that "is gone" only because it never was,
+    // a tombstone that was never written).
+    let bad_channel = EventKind::ChannelDeleted {
+        name: "Not A Channel".into(),
+    };
+    let bad_tombstone = EventKind::PostDeleted {
+        post_id: "01JAAAAAAAAAAAAAAAAAAAAAAA".into(),
+        by: "not a handle".into(),
+    };
+    state
+        .ingest(remote_event(origin, 7, bad_channel))
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .ingest(remote_event(origin, 8, bad_tombstone))
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .ingest(remote_post(origin, 9, "beacon", "mac-a", "marker"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        sse.next().await,
+        StreamEvent::PostDeleted {
+            id: event_post_id(&doomed)
+        }
+    );
+    assert_eq!(post_body(&sse.next().await), "visible");
+    assert_eq!(post_body(&sse.next().await), "marker");
+    sse.quiet_for(Duration::from_millis(200)).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_recovers_from_the_store_after_lagging() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let mut sse = SseReader::open(&node, "").await;
+    let state = node.state().clone();
+
+    // Five posts reach the store without being announced (as if the
+    // announcements were lost)...
+    state
+        .with_store(|s| {
+            for i in 0..5 {
+                let post = NewPost {
+                    post_id: String::new(),
+                    channel: "beacon".into(),
+                    author: "pc-a".into(),
+                    author_kind: AuthorKind::Agent,
+                    client: None,
+                    node: "pc".into(),
+                    body: format!("quiet {i}"),
+                    tags: vec![],
+                    mentions: vec![],
+                    attachment: None,
+                };
+                s.append_local(EventKind::PostCreated(post), now_ms())?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    // ...while the channel that announces them overflows (its capacity is 1024)
+    // before the stream task gets to run: a lagged receiver.
+    let marker = state
+        .with_store(|s| s.events_since_arrival(0, 1))
+        .await
+        .unwrap()
+        .remove(0);
+    let mut probe = state.arrivals.subscribe();
+    for _ in 0..1_100 {
+        let _ = state.arrivals.send(marker.clone());
+    }
+    // (Check the scenario is real: a receiver that was not reading did lag.)
+    assert!(matches!(probe.try_recv(), Err(TryRecvError::Lagged(_))));
+
+    // The stream re-reads the store: all five, in order, once each.
+    for i in 0..5 {
+        assert_eq!(post_body(&sse.next().await), format!("quiet {i}"));
+    }
+    agent_post(&node, "beacon", "pc-b", "after", &[]).await;
+    assert_eq!(post_body(&sse.next().await), "after");
+    sse.quiet_for(Duration::from_millis(200)).await;
+}
+
+#[tokio::test]
+async fn sse_sends_a_keep_alive_comment_every_15_seconds() {
+    let node = spawn_node("pc", &[]).await;
+    let mut sse = SseReader::open(&node, "").await;
+    let started = Instant::now();
+    let frame = sse
+        .frame(Duration::from_secs(20))
+        .await
+        .expect("a keep-alive comment");
+    assert!(frame.starts_with(':'), "{frame:?}");
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_secs(14) && waited <= Duration::from_secs(18),
+        "{waited:?}"
+    );
+}
+
+// ------------------------------------------------------------------- shutdown
+
+#[tokio::test]
+async fn open_streams_and_waits_end_when_the_node_stops() {
+    let node = spawn_node("pc", &[]).await;
+    let page = pull_all(&node).await;
+    let mut sse = SseReader::open(&node, "?handle=pc-vllm&relevant=1").await;
+    let poll = start_poll(&node, &page.have, page.head, 25);
+    let waiter = start_wait(&node, "pc-vllm", 60);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The node's grace period is 5 s: stopping sooner means nothing held it up.
+    let stopped = Instant::now();
+    within(4, "the node to stop", node.stop()).await;
+    assert!(
+        stopped.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        stopped.elapsed()
+    );
+
+    let (_, resp) = within(2, "the poll", poll).await.unwrap();
+    assert!(events_page(ok(resp).await).events.is_empty());
+    let (_, resp) = within(2, "the wait", waiter).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(sse.frame(Duration::from_secs(2)).await.is_none());
 }
 
 // ------------------------------------------------------------------ config
