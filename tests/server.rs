@@ -2341,6 +2341,18 @@ async fn events_page_has_the_agreed_shape_and_names_the_node() {
         .unwrap();
     assert_eq!(resp.headers()["x-beacon-node"], "pc");
     ok(resp).await;
+    // So does a method the route does not take (the 401 for a missing secret
+    // is the one answer that cannot: the check comes first).
+    for method in [Method::PUT, Method::DELETE, Method::PATCH] {
+        let resp = node
+            .request(method.clone(), "/api/events")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 405, "{method}");
+        assert_eq!(resp.headers()["x-beacon-node"], "pc", "{method}");
+        expect_error(resp, StatusCode::METHOD_NOT_ALLOWED, "usage").await;
+    }
     // Other routes do not.
     let resp = node.get("/api/health").send().await.unwrap();
     assert!(resp.headers().get("x-beacon-node").is_none());
@@ -2448,6 +2460,100 @@ async fn long_poll_with_a_head_from_another_database_answers_at_once() {
     assert_eq!(page.events.len(), 2);
     assert!(page.head < 9999);
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+/// What a caller holding `have` holds once it has applied `events`, which
+/// come as each origin's lowest missing seqs and so extend it without a gap.
+fn applied(mut have: VersionVector, events: &[Event]) -> VersionVector {
+    for ev in events {
+        let seq = have.entry(ev.origin.clone()).or_insert(0);
+        assert_eq!(ev.seq, *seq + 1, "events extend the vector without a gap");
+        *seq = ev.seq;
+    }
+    have
+}
+
+#[tokio::test]
+async fn a_cut_page_is_followed_with_wait_zero_while_pages_advance() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    for i in 0..4 {
+        agent_post(&node, "beacon", "pc-configs", &format!("post {i}"), &[]).await;
+    }
+    // `general`, `beacon` and four posts: a backlog of six events.
+    let server_have = node
+        .state()
+        .with_store(|s| Ok(s.version_vector()))
+        .await
+        .unwrap();
+    let path = |have: &VersionVector, since: i64, wait: u64| {
+        format!("{}&limit=2", events_path(have, since, wait),)
+    };
+
+    // A page that applied something is followed at once with wait=0 ("more"),
+    // even if the caller hands back the head: wait=0 never waits.
+    let (mut have, mut head, mut sizes) = (VersionVector::new(), 0, Vec::new());
+    loop {
+        let started = Instant::now();
+        let resp = node.get(&path(&have, head, 0)).send().await.unwrap();
+        let page = events_page(ok(resp).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        sizes.push(page.events.len());
+        head = page.head;
+        if page.events.is_empty() {
+            assert!(!page.more);
+            break;
+        }
+        assert!(
+            page.more,
+            "a page of {} events is a cut page",
+            sizes[sizes.len() - 1]
+        );
+        have = applied(have, &page.events);
+        assert!(sizes.len() < 10, "paging did not converge: {sizes:?}");
+    }
+    assert_eq!(sizes, [2, 2, 2, 0]);
+    assert_eq!(have, server_have);
+
+    // `head` is the node's head, not the last arrival of the page, so after a
+    // cut page every event still owed has arrived already. A long poll with
+    // since=head then waits out its time although the caller is behind. That
+    // is why a cut page is followed with wait=0, and why `since` belongs to
+    // the long poll that follows a page that applied nothing new.
+    let first = events_page(
+        ok(node
+            .get(&path(&VersionVector::new(), 0, 0))
+            .send()
+            .await
+            .unwrap())
+        .await,
+    );
+    assert!(first.more);
+    assert_eq!(first.head, 6);
+    let behind = applied(VersionVector::new(), &first.events);
+    let started = Instant::now();
+    let resp = node
+        .get(&path(&behind, first.head, 1))
+        .send()
+        .await
+        .unwrap();
+    let stalled = events_page(ok(resp).await);
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    assert_eq!(
+        stalled.events.len(),
+        2,
+        "the owed events came when it gave up"
+    );
+
+    // And a caller that is caught up, whose last page applied nothing, waits.
+    let started = Instant::now();
+    let resp = node
+        .get(&path(&server_have, first.head, 1))
+        .send()
+        .await
+        .unwrap();
+    assert!(events_page(ok(resp).await).events.is_empty());
+    assert!(started.elapsed() >= Duration::from_millis(900));
 }
 
 #[tokio::test]
@@ -2900,9 +3006,25 @@ async fn sse_relevant_filters() {
     join(&node, "pc-vllm", &["vllm"]).await;
     let mut sse = SseReader::open(&node, "?handle=pc-vllm&relevant=1").await;
 
-    // Other kinds of event are not filtered.
+    // A relevant stream carries posts and nothing else: no new channel, no
+    // heartbeat, no deleted post, no deleted channel.
     new_channel(&node, "builds").await;
-    assert!(matches!(sse.next().await, StreamEvent::Channel { .. }));
+    let resp = node
+        .post("/api/who")
+        .json(&json!({ "handle": "pc-a", "kind": "agent", "client": "claude-code" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok(resp).await["recorded"], true);
+    let doomed = agent_post(&node, "builds", "pc-configs", "doomed", &[]).await;
+    let id = post_id(&doomed);
+    ok(node
+        .delete(&format!("/api/posts/{id}"))
+        .send()
+        .await
+        .unwrap())
+    .await;
+    ok(node.delete("/api/channels/builds").send().await.unwrap()).await;
 
     // An unjoined agent post, then the handle's own post: no `post` event.
     agent_post(&node, "beacon", "pc-configs", "unjoined agent post", &[]).await;
@@ -2912,8 +3034,8 @@ async fn sse_relevant_filters() {
     agent_post(&node, "vllm", "pc-configs", "joined channel", &[]).await;
     human_post(&node, "beacon", "from Dang").await;
     agent_post(&node, "beacon", "pc-configs", "ping @pc-vllm", &[]).await;
-    // Events arrive in order, so the first post event being the joined one
-    // shows the two before it were filtered out.
+    // Events arrive in order, so the first event being the joined post shows
+    // everything before it was filtered out.
     assert_eq!(post_body(&sse.next().await), "joined channel");
     let announcement = sse.next().await;
     assert_eq!(post_body(&announcement), "from Dang");
@@ -3111,20 +3233,61 @@ async fn sse_recovers_from_the_store_after_lagging() {
 }
 
 #[tokio::test]
-async fn sse_sends_a_keep_alive_comment_every_15_seconds() {
+async fn sse_ends_when_the_store_keeps_failing_so_clients_reconnect() {
     let node = spawn_node("pc", &[]).await;
     let mut sse = SseReader::open(&node, "").await;
-    let started = Instant::now();
-    let frame = sse
-        .frame(Duration::from_secs(20))
+    let marker = node
+        .state()
+        .with_store(|s| s.events_since_arrival(0, 1))
         .await
-        .expect("a keep-alive comment");
-    assert!(frame.starts_with(':'), "{frame:?}");
-    let waited = started.elapsed();
+        .unwrap()
+        .remove(0);
+
+    // Break the log under the node from a second connection, then ring the
+    // bell. Each look at the store fails; the stream tries again a second
+    // later, and gives up after ten failures in a row instead of staying
+    // open and silent for good.
+    let db = rusqlite::Connection::open(node.dir.path().join("beacon.db")).unwrap();
+    db.execute_batch("DROP TABLE events").unwrap();
+    let started = Instant::now();
+    let _ = node.state().arrivals.send(marker);
+
     assert!(
-        waited >= Duration::from_secs(14) && waited <= Duration::from_secs(18),
-        "{waited:?}"
+        sse.frame(Duration::from_secs(20)).await.is_none(),
+        "no frame comes from a stream that cannot read the store"
     );
+    let lasted = started.elapsed();
+    assert!(
+        lasted >= Duration::from_secs(8) && lasted < Duration::from_secs(15),
+        "ended after {lasted:?}, not by giving up after about ten seconds"
+    );
+}
+
+#[tokio::test]
+async fn sse_sends_a_keep_alive_comment_when_silent() {
+    // (The interval is 15 s unless a test shortens it; `config_defaults`
+    // pins the default.)
+    let node = spawn_node_with("pc", &[], |cfg| {
+        cfg.sse_keep_alive = Duration::from_millis(400);
+    })
+    .await;
+    let mut sse = SseReader::open(&node, "").await;
+    for _ in 0..2 {
+        let started = Instant::now();
+        let frame = sse
+            .frame(Duration::from_secs(5))
+            .await
+            .expect("a keep-alive comment");
+        assert!(frame.starts_with(':'), "{frame:?}");
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(300) && waited < Duration::from_secs(2),
+            "{waited:?}"
+        );
+    }
+    // Comments are not events, and events still come between them.
+    new_channel(&node, "builds").await;
+    assert!(matches!(sse.next().await, StreamEvent::Channel { .. }));
 }
 
 // ------------------------------------------------------------------- shutdown
@@ -3184,6 +3347,8 @@ fn config_defaults() {
     assert_eq!(cfg.max_attachment_mb, 50);
     assert_eq!(cfg.proxy, None);
     assert_eq!(cfg.data_dir, std::path::PathBuf::from("/data"));
+    // Streams send a keep-alive comment after 15 s of silence.
+    assert_eq!(cfg.sse_keep_alive, Duration::from_secs(15));
 }
 
 #[test]

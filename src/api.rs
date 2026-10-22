@@ -326,8 +326,13 @@ pub struct CursorsJson {
     pub cursors: BTreeMap<String, i64>,
 }
 
-/// `GET /api/events`: a page of the event log for a peer. See
-/// `server::stream` for how `head` and `more` are meant to be used.
+/// `GET /api/events`: a page of the event log for a peer.
+///
+/// How a puller uses it (R22): it follows a cut page (`more`) with `wait=0`
+/// for as long as the page it just got advanced its version vector (at least
+/// one event newly applied); otherwise (the page applied nothing new, or was
+/// empty) it long-polls with `wait` and `since=<that page's head>`. See
+/// [`EventsResponse::head`] for why `since` is not for the first case.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventsResponse {
     pub v: u32,
@@ -337,11 +342,19 @@ pub struct EventsResponse {
     pub events: Vec<Event>,
     /// This server's version vector.
     pub have: VersionVector,
-    /// This server's newest arrival number. A caller passes it back as `since`
-    /// on its next pull, so the server can tell a page that holds something
-    /// new from one that only repeats what the caller was already sent.
+    /// This server's newest arrival number *now*, not the last arrival in
+    /// this page. A long poll that passes it back as `since` is held for its
+    /// whole `wait` unless a selected event arrived after it, so it tells the
+    /// server "I have been sent everything up to here": true of a caller whose
+    /// last page applied nothing new, and not true of one that is still
+    /// working through a backlog (after a cut page every event still owed
+    /// already has `arrival <= head`, so `since=head` would stall it for the
+    /// full `wait` per page). Such a caller pulls on with `wait=0`.
     pub head: i64,
-    /// The selection hit its limit: ask again for the rest.
+    /// The selection hit its limit, so there may be more. Follow it with
+    /// `wait=0` while pages keep advancing the caller's version vector; when
+    /// a page applies nothing new, stop and long-poll with
+    /// `since=<that page's head>`.
     pub more: bool,
 }
 
@@ -392,16 +405,15 @@ impl StreamEvent {
         }
     }
 
-    /// The server-sent event's data: the JSON content, without the tag.
+    /// The server-sent event's data: the JSON content, without the tag. It is
+    /// serde's own `data` field, so it cannot drift from the derive.
     pub fn data(&self) -> serde_json::Value {
-        match self {
-            StreamEvent::Post(p) => serde_json::json!(p),
-            StreamEvent::PostDeleted { id } => serde_json::json!({ "id": id }),
-            StreamEvent::Channel { channel, deleted } => {
-                serde_json::json!({ "channel": channel, "deleted": deleted })
+        // These types always serialize; the unit tests below pin the shapes.
+        match serde_json::to_value(self) {
+            Ok(serde_json::Value::Object(mut whole)) => {
+                whole.remove("data").unwrap_or(serde_json::Value::Null)
             }
-            StreamEvent::Presence(p) => serde_json::json!(p),
-            StreamEvent::Peers(peers) => serde_json::json!(peers),
+            _ => serde_json::Value::Null,
         }
     }
 
@@ -410,5 +422,118 @@ impl StreamEvent {
     pub fn from_sse(name: &str, data: &str) -> Result<StreamEvent, serde_json::Error> {
         let data: serde_json::Value = serde_json::from_str(data)?;
         serde_json::from_value(serde_json::json!({ "type": name, "data": data }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn samples() -> Vec<StreamEvent> {
+        let post = PostJson {
+            v: V,
+            id: "01JDB7K4TR0000000001QRSTVW".into(),
+            short_id: "QRSTVW".into(),
+            channel: "beacon".into(),
+            ts: "2026-10-21T18:07:00.000Z".into(),
+            ts_ms: 1_792_606_020_000,
+            author: "pc-configs".into(),
+            author_kind: AuthorKind::Agent,
+            client: Some("claude-code".into()),
+            node: "pc".into(),
+            body: "hello, \"quoted\"\nsecond line".into(),
+            tags: vec!["ci".into()],
+            mentions: vec!["dang".into()],
+            announcement: false,
+            attachment: Some(AttachmentJson {
+                name: "log.txt".into(),
+                size: 12,
+                sha256: "0".repeat(64),
+                available: true,
+            }),
+            arrival: 7,
+        };
+        let presence = PresenceJson {
+            handle: "pc-configs".into(),
+            kind: AuthorKind::Agent,
+            client: "claude-code".into(),
+            node: "pc".into(),
+            status: Some("busy".into()),
+            last_seen: "2026-10-21T18:07:00.000Z".into(),
+            last_seen_ms: 1_792_606_020_000,
+            active: true,
+        };
+        let peer = PeerJson {
+            node: Some("mac".into()),
+            url: "http://mac:7700".into(),
+            reachable: false,
+            last_sync: None,
+            queued: 3,
+        };
+        vec![
+            StreamEvent::Post(post),
+            StreamEvent::PostDeleted {
+                id: "01JDB7K4TR0000000001QRSTVW".into(),
+            },
+            StreamEvent::Channel {
+                channel: ChannelJson {
+                    name: "beacon".into(),
+                    topic: None,
+                    unread: None,
+                },
+                deleted: true,
+            },
+            StreamEvent::Presence(presence),
+            StreamEvent::Peers(vec![peer]),
+            StreamEvent::Peers(Vec::new()),
+        ]
+    }
+
+    #[test]
+    fn stream_events_round_trip_through_their_server_sent_form() {
+        let events = samples();
+        let mut names: Vec<&str> = events.iter().map(StreamEvent::name).collect();
+        names.dedup();
+        assert_eq!(
+            names,
+            ["post", "post_deleted", "channel", "presence", "peers"]
+        );
+        for event in &events {
+            // The name is the serde tag and the data is the serde content:
+            // together they are exactly the serialized event.
+            let whole = serde_json::to_value(event).unwrap();
+            assert_eq!(whole["type"], event.name());
+            assert_eq!(whole["data"], event.data());
+            assert_eq!(whole.as_object().unwrap().len(), 2);
+            // And the server-sent form reads back as the same event.
+            let text = event.data().to_string();
+            assert!(!text.contains('\n'), "one line, or it would be split");
+            let back = StreamEvent::from_sse(event.name(), &text).unwrap();
+            assert_eq!(&back, event);
+        }
+    }
+
+    #[test]
+    fn stream_event_data_has_the_documented_shapes() {
+        let events = samples();
+        assert_eq!(events[0].data()["v"], 1);
+        assert_eq!(events[0].data()["body"], "hello, \"quoted\"\nsecond line");
+        assert_eq!(
+            events[1].data(),
+            serde_json::json!({ "id": "01JDB7K4TR0000000001QRSTVW" })
+        );
+        assert_eq!(
+            events[2].data(),
+            serde_json::json!({
+                "channel": { "name": "beacon", "topic": null, "unread": null },
+                "deleted": true
+            })
+        );
+        assert_eq!(events[3].data()["handle"], "pc-configs");
+        assert!(events[4].data().is_array());
+        // A name or data that does not fit is an error, not a guess.
+        assert!(StreamEvent::from_sse("post", "{}").is_err());
+        assert!(StreamEvent::from_sse("nonsense", "{}").is_err());
+        assert!(StreamEvent::from_sse("peers", "not json").is_err());
     }
 }

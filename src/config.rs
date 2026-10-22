@@ -3,6 +3,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::error::Error;
 use crate::model::validate_handle;
@@ -10,6 +11,8 @@ use crate::model::validate_handle;
 const DEFAULT_LISTEN: &str = "0.0.0.0:7700";
 const DEFAULT_HUMAN: &str = "Dang";
 const DEFAULT_MAX_ATTACHMENT_MB: u64 = 50;
+/// How long a stream may be silent before it sends a keep-alive comment.
+const DEFAULT_SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
 const DEFAULT_DATA: &str = "/data";
 
 /// Everything `beacon serve` needs to know.
@@ -34,6 +37,10 @@ pub struct Config {
     pub proxy: Option<String>,
     /// Where the database and attachment files live (`BEACON_DATA`).
     pub data_dir: PathBuf,
+    /// How long `GET /api/stream` may be silent before it sends a keep-alive
+    /// comment (15 s). Not a setting: tests shorten it.
+    #[doc(hidden)]
+    pub sse_keep_alive: Duration,
 }
 
 impl Config {
@@ -50,6 +57,7 @@ impl Config {
             max_attachment_mb: DEFAULT_MAX_ATTACHMENT_MB,
             proxy: None,
             data_dir: data_dir.into(),
+            sse_keep_alive: DEFAULT_SSE_KEEP_ALIVE,
         }
     }
 
@@ -141,6 +149,7 @@ impl fmt::Debug for Config {
             .field("max_attachment_mb", &self.max_attachment_mb)
             .field("proxy", &self.proxy)
             .field("data_dir", &self.data_dir)
+            .field("sse_keep_alive", &self.sse_keep_alive)
             .finish()
     }
 }
