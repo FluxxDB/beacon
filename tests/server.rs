@@ -3356,7 +3356,8 @@ fn config_reads_every_variable() {
     let cfg = Config::from_vars(vars(&[
         ("BEACON_NODE", "mac"),
         ("BEACON_SECRET", "s3cret"),
-        ("BEACON_URL", "http://dangs-macbook-pro:7700"),
+        // Stored in normal form.
+        ("BEACON_URL", "HTTP://Dangs-MacBook-Pro:7700/"),
         (
             "BEACON_PEERS",
             " http://soybean-wsl:7700 , http://b:7700/ ,, ",
@@ -3432,6 +3433,14 @@ fn config_validates_names_and_numbers_naming_the_variable() {
         ("BEACON_NODE", &"n".repeat(33)),
         ("BEACON_LISTEN", "not-an-address"),
         ("BEACON_LISTEN", "7700"),
+        // Peer URLs are plain http://host:port (the .env.example placeholder
+        // left in, TLS, a path, no scheme).
+        ("BEACON_URL", "http://<tailscale-name>:7700"),
+        ("BEACON_URL", "https://mac:7700"),
+        ("BEACON_URL", "http://mac:7700/beacon"),
+        ("BEACON_PEERS", "http://soybean-wsl:7700,mac:7700"),
+        ("BEACON_PEERS", "https://soybean-wsl:7700"),
+        ("BEACON_PROXY", "socks5h://127.0.0.1:not-a-port"),
         ("BEACON_MAX_ATTACHMENT_MB", "lots"),
         ("BEACON_MAX_ATTACHMENT_MB", "-1"),
         ("BEACON_MAX_ATTACHMENT_MB", "0"),

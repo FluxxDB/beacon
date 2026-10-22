@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use assert_cmd::Command;
 use beacon::api::{
-    AttachmentJson, ChannelJson, ChannelsJson, Delivery, NewPostRequest, PeerJson, PostCreated,
-    PostJson, PostsResponse, StatusJson, WhoRequest,
+    AttachmentJson, ChannelJson, ChannelsJson, Delivery, NewPostRequest, PeerJson, PeersJson,
+    PostCreated, PostJson, PostsResponse, StatusJson, WhoRequest,
 };
 use beacon::cli::human::{self, Clock};
 use beacon::client::Client;
@@ -1224,6 +1224,36 @@ async fn status_peers_and_health() {
     assert_eq!(beacon(&node, &["peers"]).ok().await.text(), "no peers yet");
     let json = beacon(&node, &["peers", "--json"]).ok().await.json();
     assert_eq!(json, json!({ "v": 1, "peers": [] }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn peers_lists_what_the_node_reports() {
+    // Nothing listens on port 1 (binding it needs root).
+    let away = "http://127.0.0.1:1/";
+    let node = spawn_node_with("pc", &[away], |cfg| {
+        cfg.sync_base_backoff = Duration::from_millis(100);
+    })
+    .await;
+    // Wait until sync has tried the peer once, so the answer is settled.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let peers = loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the peer was never tried"
+        );
+        let resp = node.get("/api/peers").send().await.unwrap();
+        let body: PeersJson = resp.json().await.unwrap();
+        if !body.peers.is_empty() && !body.peers[0].reachable {
+            break body;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let json = beacon(&node, &["peers", "--json"]).ok().await.json();
+    assert_eq!(json, serde_json::to_value(&peers).unwrap());
+    let text = beacon(&node, &["peers"]).ok().await;
+    let url = away.trim_end_matches('/');
+    // `general` is the one event the peer has never been sent.
+    assert_eq!(text.text(), format!("○ ?  {url}  unreachable · 1 queued"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

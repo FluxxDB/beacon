@@ -477,3 +477,113 @@ fn validate_event_enforces_free_text_limits() {
         );
     }
 }
+
+#[test]
+fn validate_event_checks_what_peers_name() {
+    let event = |origin: &str, kind: EventKind| Event {
+        origin: origin.into(),
+        seq: 1,
+        id: "01JDB7K4TR0000000000000000".into(),
+        ts: 5,
+        kind,
+    };
+    let post = |node: &str| {
+        EventKind::PostCreated(NewPost {
+            post_id: "01JDB7K4TR0000000000000000".into(),
+            channel: "builds".into(),
+            author: "mac-juicebox".into(),
+            author_kind: AuthorKind::Agent,
+            client: None,
+            node: node.into(),
+            body: "done".into(),
+            tags: vec![],
+            mentions: vec![],
+            attachment: None,
+        })
+    };
+    let seen = |node: &str| {
+        EventKind::AgentSeen(Presence {
+            handle: "mac-juicebox".into(),
+            kind: AuthorKind::Agent,
+            client: "codex".into(),
+            node: node.into(),
+            status: None,
+        })
+    };
+    let announced = |node: &str, url: &str| EventKind::PeerAnnounced {
+        node: node.into(),
+        url: url.into(),
+    };
+    let accepts = |ev: Event, what: &str| {
+        assert!(validate_event(&ev).is_ok(), "should accept {what}");
+    };
+    let refuses = |ev: Event, what: &str| match validate_event(&ev) {
+        Err(Error::Usage(_)) => {}
+        other => panic!("should refuse {what}, got {other:?}"),
+    };
+    let ok_origin = "mac~01jdb7k4";
+
+    // origin: `{handle}~{8 characters of lowercase Crockford base32}`, as a
+    // store makes it (the end of a ULID, lowercased).
+    for origin in ["mac~abcd1234", "pc-gpu.2~0123zzzz", "M_1~vwxyz789"] {
+        accepts(event(origin, post("mac")), origin);
+    }
+    for origin in [
+        "",
+        "mac",
+        "mac~",
+        "~abcd1234",
+        "mac~abcd123",
+        "mac~abcd12345",
+        "mac~ABCD1234",
+        "mac~abcd123i",
+        "mac~abcd123l",
+        "mac~abcd123o",
+        "mac~abcd123u",
+        "mac~abcd-123",
+        "m ac~abcd1234",
+        "-mac~abcd1234",
+        "mac~abcd1234~abcd1234",
+        &format!("{}~abcd1234", "m".repeat(33)),
+    ] {
+        refuses(event(origin, post("mac")), &format!("origin {origin:?}"));
+    }
+
+    // node names in payloads are handles.
+    accepts(event(ok_origin, post("pc-gpu")), "a post's node");
+    accepts(event(ok_origin, seen("pc-gpu")), "a presence node");
+    for node in ["", "pc gpu", "-pc", "pc\n", &"n".repeat(33), "pc~1"] {
+        refuses(event(ok_origin, post(node)), &format!("post node {node:?}"));
+        refuses(
+            event(ok_origin, seen(node)),
+            &format!("presence node {node:?}"),
+        );
+    }
+
+    // peer_announced: a handle and a URL sync can use.
+    accepts(
+        event(ok_origin, announced("mac", "http://dangs-macbook-pro:7700")),
+        "an announcement",
+    );
+    accepts(
+        event(ok_origin, announced("mac", "HTTP://Mac:7700/")),
+        "a URL in loose form",
+    );
+    refuses(
+        event(ok_origin, announced("my mac", "http://mac:7700")),
+        "a bad announced node",
+    );
+    for url in [
+        "",
+        "mac:7700",
+        "https://mac:7700",
+        "http://mac:7700/x",
+        "http://u:p@mac:7700",
+        "javascript:alert(1)",
+    ] {
+        refuses(
+            event(ok_origin, announced("mac", url)),
+            &format!("announced url {url:?}"),
+        );
+    }
+}

@@ -18,7 +18,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -220,11 +220,16 @@ fn events_wait(asked: Option<u64>) -> Duration {
 /// stores it, announces it if it is valid and wakes sync (so a post relays
 /// onward). One that cannot be stored at all (a seq SQLite cannot hold)
 /// fails the request; those before it stay applied, and sending the batch
-/// again is harmless.
+/// again is harmless. Sync is told the sender holds them, so they are not
+/// pushed straight back to it.
 async fn push_events(
     State(app): State<AppState>,
+    headers: HeaderMap,
     ApiJson(req): ApiJson<PushRequest>,
 ) -> ApiResult<PushResponse> {
+    if let Some(from) = super::sender(&headers) {
+        app.sync.received_from(&from, &req.events);
+    }
     let mut applied = 0;
     for event in req.events {
         if app.ingest(event).await?.is_some() {

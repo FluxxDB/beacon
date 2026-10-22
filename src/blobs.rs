@@ -193,9 +193,16 @@ impl Blobs {
     /// `sha` ([`Error::Usage`] otherwise, and nothing is stored). A blob that
     /// is already here is left alone without reading the stream.
     ///
-    /// The stream is not length-limited: a caller that knows how big the file
-    /// should be bounds the stream itself.
-    pub async fn put_verified<S, E>(&self, sha: &str, stream: S) -> Result<(), Error>
+    /// The stream is not read past `max_bytes` (sync passes the size the post
+    /// announced, or the node's attachment limit if that is smaller): a
+    /// stream that holds more is [`Error::Usage`] ("attachment is over N
+    /// bytes") and nothing is stored, whatever the bytes hash to.
+    pub async fn put_verified<S, E>(
+        &self,
+        sha: &str,
+        stream: S,
+        max_bytes: u64,
+    ) -> Result<(), Error>
     where
         S: Stream<Item = Result<Bytes, E>>,
         E: Into<Error>,
@@ -209,7 +216,7 @@ impl Blobs {
             return Ok(());
         }
         let stream = stream.map(|chunk| chunk.map_err(|e| PutError::Failed(e.into())));
-        let received = self.receive(stream, u64::MAX).await?;
+        let received = self.receive(stream, max_bytes).await?;
         if received.sha != sha {
             return Err(Error::Usage(format!(
                 "the bytes received for {sha} hash to {}",

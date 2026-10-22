@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::error::Error;
 use crate::model::validate_handle;
+use crate::sync::{normalize_peer_url, parse_proxy, BASE_BACKOFF, LONG_POLL_SECS};
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:7700";
 const DEFAULT_HUMAN: &str = "Dang";
@@ -21,6 +22,8 @@ pub struct Config {
     /// This device's name (`BEACON_NODE`): a handle-like name, unique per device.
     pub node: String,
     /// The URL peers reach this node at (`BEACON_URL`), announced to them.
+    /// [`Config::from_vars`] stores it in normal form (see
+    /// [`normalize_peer_url`]).
     pub url: Option<String>,
     /// Peer URLs to sync with (`BEACON_PEERS`, comma-separated), as written;
     /// sync normalizes and dedupes them.
@@ -33,7 +36,8 @@ pub struct Config {
     pub human: String,
     /// Largest attachment, in MiB (`BEACON_MAX_ATTACHMENT_MB`).
     pub max_attachment_mb: u64,
-    /// Proxy for outbound peer requests (`BEACON_PROXY`), e.g. `socks5h://127.0.0.1:1055`.
+    /// Proxy for outbound peer requests (`BEACON_PROXY`): SOCKS5, e.g.
+    /// `socks5h://127.0.0.1:1055` (see [`parse_proxy`]).
     pub proxy: Option<String>,
     /// Where the database and attachment files live (`BEACON_DATA`).
     pub data_dir: PathBuf,
@@ -41,6 +45,14 @@ pub struct Config {
     /// comment (15 s). Not a setting: tests shorten it.
     #[doc(hidden)]
     pub sse_keep_alive: Duration,
+    /// How long sync waits before trying a peer that stopped answering again
+    /// (5 s, doubling up to 2 min). Not a setting: tests shorten it.
+    #[doc(hidden)]
+    pub sync_base_backoff: Duration,
+    /// How long a peer holds this node's pull open when it has nothing new
+    /// (25 s). Not a setting: tests shorten it.
+    #[doc(hidden)]
+    pub long_poll_secs: u64,
 }
 
 impl Config {
@@ -58,6 +70,8 @@ impl Config {
             proxy: None,
             data_dir: data_dir.into(),
             sse_keep_alive: DEFAULT_SSE_KEEP_ALIVE,
+            sync_base_backoff: BASE_BACKOFF,
+            long_poll_secs: LONG_POLL_SECS,
         }
     }
 
@@ -115,8 +129,23 @@ impl Config {
                 }
             };
         }
-        cfg.url = var("BEACON_URL");
-        cfg.proxy = var("BEACON_PROXY");
+        let not_a_peer_url = |url: &str| {
+            format!("{url:?} is not a plain http:// URL (http://host:port, nothing after it)")
+        };
+        if let Some(url) = var("BEACON_URL") {
+            let normal = normalize_peer_url(&url)
+                .ok_or_else(|| invalid("BEACON_URL", &not_a_peer_url(&url)))?;
+            cfg.url = Some(normal);
+        }
+        if let Some(proxy) = var("BEACON_PROXY") {
+            if parse_proxy(&proxy).is_none() {
+                return Err(invalid(
+                    "BEACON_PROXY",
+                    &format_args!("{proxy:?} is not a socks5h://host:port (or socks5://) URL"),
+                ));
+            }
+            cfg.proxy = Some(proxy);
+        }
         cfg.peers = var("BEACON_PEERS")
             .map(|peers| {
                 peers
@@ -127,6 +156,9 @@ impl Config {
                     .collect()
             })
             .unwrap_or_default();
+        if let Some(bad) = cfg.peers.iter().find(|p| normalize_peer_url(p).is_none()) {
+            return Err(invalid("BEACON_PEERS", &not_a_peer_url(bad)));
+        }
         Ok(cfg)
     }
 
@@ -150,6 +182,8 @@ impl fmt::Debug for Config {
             .field("proxy", &self.proxy)
             .field("data_dir", &self.data_dir)
             .field("sse_keep_alive", &self.sse_keep_alive)
+            .field("sync_base_backoff", &self.sync_base_backoff)
+            .field("long_poll_secs", &self.long_poll_secs)
             .finish()
     }
 }

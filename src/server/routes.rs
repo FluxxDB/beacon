@@ -46,6 +46,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/status", get(status))
+        .route("/api/peers", get(list_peers))
         .route("/api/channels", get(list_channels).post(create_channel))
         .route("/api/channels/{name}", delete(delete_channel))
         .route(
@@ -155,6 +156,14 @@ async fn status(State(app): State<AppState>) -> ApiResult<StatusJson> {
         peers: app.sync.peers(),
         have,
     }))
+}
+
+/// `GET /api/peers`: the peers this node syncs with and how each is doing.
+async fn list_peers(State(app): State<AppState>) -> Json<PeersJson> {
+    Json(PeersJson {
+        v: V,
+        peers: app.sync.peers(),
+    })
 }
 
 // ---------------------------------------------------------------- channels

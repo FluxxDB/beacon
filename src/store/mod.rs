@@ -548,6 +548,18 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The attachments of posts that are not deleted, each hash once, with
+    /// the largest size any post claims for it: what sync makes sure this
+    /// node holds the bytes of.
+    pub fn attachments(&self) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT att_sha, MAX(att_size) FROM posts
+             WHERE att_sha IS NOT NULL AND deleted = 0 GROUP BY att_sha",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// A new ULID for ts `now_ms`, greater than every id this store made before.
     fn next_id(&mut self, now_ms: i64) -> Ulid {
         let at = UNIX_EPOCH + Duration::from_millis(u64::try_from(now_ms).unwrap_or(0));

@@ -1558,3 +1558,28 @@ fn post_row_from_applied_is_the_row_the_store_derives() {
         .unwrap();
     assert_eq!(PostRow::from_applied(&channel), None);
 }
+
+#[test]
+fn attachments_lists_each_file_of_a_live_post_once() {
+    let mut s = Store::open_in_memory("pc").unwrap();
+    let with = |sha: &str, size: u64| {
+        let mut p = new_post("pc", "general", "see attached");
+        p.attachment = Some(Attachment {
+            sha256: sha.into(),
+            name: "log.txt".into(),
+            size,
+        });
+        EventKind::PostCreated(p)
+    };
+    let (one, two, gone) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+    assert!(s.attachments().unwrap().is_empty());
+    post(&mut s, "pc", "general", "no file", 1);
+    local(&mut s, with(&one, 10), 2);
+    // The same file announced again, with a larger size: listed once, at it.
+    local(&mut s, with(&one, 12), 3);
+    local(&mut s, with(&two, 5), 4);
+    // A deleted post's file is not wanted.
+    let doomed = local(&mut s, with(&gone, 7), 5);
+    delete_post(&mut s, &doomed, 6);
+    assert_eq!(s.attachments().unwrap(), [(one, 12), (two, 5)]);
+}

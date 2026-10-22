@@ -4,11 +4,13 @@
 //! Handlers stay thin over [`Store`]. Every write goes through
 //! [`AppState::commit`] (a change made on this node) or [`AppState::ingest`]
 //! (an event from a peer), which store it, announce it on
-//! [`AppState::arrivals`] and wake the sync engine.
+//! [`AppState::arrivals`] and wake the sync engine ([`crate::sync`]), which
+//! runs beside the server from [`start`] until the node stops.
 
 pub mod routes;
 pub mod stream;
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -32,9 +34,9 @@ use crate::api::{ApiError, V};
 use crate::blobs::{Blobs, PutError};
 use crate::config::Config;
 use crate::error::Error;
-use crate::model::{validate_event, Event, EventKind};
+use crate::model::{validate_event, validate_handle, Event, EventKind};
 use crate::store::{Applied, Store};
-use crate::sync::SyncHandle;
+use crate::sync::{self, SyncHandle, NODE_HEADER};
 
 /// How many announced events [`AppState::arrivals`] buffers per receiver
 /// before a slow one lags.
@@ -71,6 +73,48 @@ pub struct AppState {
     /// Fires when the node is asked to stop; long-lived tasks and responses
     /// (streams, long polls, sync loops) must end when it does.
     pub shutdown: Shutdown,
+    /// Requests that peers' sync engines made to this node, by the node
+    /// that made them.
+    pub peer_requests: PeerRequests,
+}
+
+/// How many requests each node's sync engine has made to this one, keyed by
+/// the name it sends in `X-Beacon-Node` (tests use it to check that a node
+/// never syncs with itself).
+#[derive(Debug, Clone, Default)]
+pub struct PeerRequests(Arc<Mutex<BTreeMap<String, u64>>>);
+
+impl PeerRequests {
+    /// Requests from node `node` so far.
+    pub fn from(&self, node: &str) -> u64 {
+        self.lock().get(node).copied().unwrap_or(0)
+    }
+
+    fn record(&self, node: &str) {
+        *self.lock().entry(node.to_string()).or_insert(0) += 1;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, u64>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Runs `f` on `store`, under its lock, on a thread where blocking is fine.
+/// Keep `f` short; it holds up every other request.
+pub async fn run_on_store<T, F>(store: &Arc<Mutex<Store>>, f: F) -> Result<T, Error>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Store) -> Result<T, Error> + Send + 'static,
+{
+    let store = Arc::clone(store);
+    tokio::task::spawn_blocking(move || {
+        // A panic in another request leaves the database consistent (every
+        // write is a transaction), so a poisoned lock is still usable.
+        let mut guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        f(&mut guard)
+    })
+    .await
+    .map_err(|e| Error::Internal(anyhow!("store task failed: {e}")))?
 }
 
 impl AppState {
@@ -81,15 +125,7 @@ impl AppState {
         T: Send + 'static,
         F: FnOnce(&mut Store) -> Result<T, Error> + Send + 'static,
     {
-        let store = Arc::clone(&self.store);
-        tokio::task::spawn_blocking(move || {
-            // A panic in another request leaves the database consistent (every
-            // write is a transaction), so a poisoned lock is still usable.
-            let mut guard = store.lock().unwrap_or_else(PoisonError::into_inner);
-            f(&mut guard)
-        })
-        .await
-        .map_err(|e| Error::Internal(anyhow!("store task failed: {e}")))?
+        run_on_store(&self.store, f).await
     }
 
     /// Records a change made on this node: stores it as the next event of our
@@ -109,6 +145,7 @@ impl AppState {
         F: FnOnce(&Store, i64) -> Result<bool, Error> + Send + 'static,
     {
         let arrivals = self.arrivals.clone();
+        let sync = self.sync.clone();
         let applied = self
             .with_store(move |store| {
                 // Read under the lock: a request that waited for it must not
@@ -119,6 +156,7 @@ impl AppState {
                 }
                 // `append_local` validates, so a local event always derives.
                 let applied = store.append_local(kind, now)?;
+                sync.record_version_vector(store.version_vector());
                 // Sent under the lock so receivers see arrival order.
                 let _ = arrivals.send(applied.clone());
                 Ok(Some(applied))
@@ -136,10 +174,12 @@ impl AppState {
     /// the store keeps an invalid one without deriving anything from it.
     pub async fn ingest(&self, ev: Event) -> Result<Option<Applied>, Error> {
         let arrivals = self.arrivals.clone();
+        let sync = self.sync.clone();
         let applied = self
             .with_store(move |store| {
                 let applied = store.apply(&ev)?;
                 if let Some(applied) = &applied {
+                    sync.record_version_vector(store.version_vector());
                     if validate_event(&applied.event).is_ok() {
                         let _ = arrivals.send(applied.clone());
                     }
@@ -189,8 +229,8 @@ impl NodeHandle {
     }
 
     /// Stops the node and waits until its port and database are released:
-    /// requests in flight finish (up to a few seconds), then the listener
-    /// and the store are dropped.
+    /// requests in flight finish (up to a few seconds), sync stops, then the
+    /// listener and the store are dropped.
     pub async fn shutdown(mut self) {
         let _ = self.stop.send(true);
         if tokio::time::timeout(SHUTDOWN_GRACE, &mut self.server)
@@ -201,22 +241,43 @@ impl NodeHandle {
             self.server.abort();
             let _ = (&mut self.server).await;
         }
+        self.state.sync.stopped().await;
     }
 }
 
-/// Opens the store under `cfg.data_dir`, binds `cfg.listen` and serves the API.
+fn io_failure(what: String) -> impl FnOnce(std::io::Error) -> Error {
+    move |e| Error::Internal(anyhow!("{what}: {e}"))
+}
+
+/// Opens the store under `cfg.data_dir`, binds `cfg.listen`, serves the API
+/// and starts sync.
 pub async fn start(cfg: Config) -> Result<NodeHandle, Error> {
-    let internal = |what: String| move |e: std::io::Error| Error::Internal(anyhow!("{what}: {e}"));
-    let files = cfg.data_dir.join("files");
-    std::fs::create_dir_all(&files)
-        .map_err(internal(format!("cannot create {}", files.display())))?;
-    let store = Store::open(&cfg.data_dir.join("beacon.db"), &cfg.node)?;
     let listener = TcpListener::bind(cfg.listen)
         .await
-        .map_err(internal(format!("cannot listen on {}", cfg.listen)))?;
+        .map_err(io_failure(format!("cannot listen on {}", cfg.listen)))?;
+    serve(cfg, listener).await
+}
+
+/// [`start`] on a socket that is already bound (`cfg.listen` is not used),
+/// so whoever bound it knows the address before the node runs.
+pub async fn start_on(cfg: Config, listener: std::net::TcpListener) -> Result<NodeHandle, Error> {
+    listener
+        .set_nonblocking(true)
+        .map_err(io_failure("cannot use the listening socket".to_string()))?;
+    let listener = TcpListener::from_std(listener)
+        .map_err(io_failure("cannot use the listening socket".to_string()))?;
+    serve(cfg, listener).await
+}
+
+async fn serve(cfg: Config, listener: TcpListener) -> Result<NodeHandle, Error> {
+    let files = cfg.data_dir.join("files");
+    std::fs::create_dir_all(&files)
+        .map_err(io_failure(format!("cannot create {}", files.display())))?;
+    let store = Store::open(&cfg.data_dir.join("beacon.db"), &cfg.node)?;
+    let store = Arc::new(Mutex::new(store));
     let addr = listener
         .local_addr()
-        .map_err(internal("cannot read the listen address".to_string()))?;
+        .map_err(io_failure("cannot read the listen address".to_string()))?;
 
     // Nothing is uploading yet, so any temp file is from a run that died.
     let blobs = Blobs::new(files);
@@ -224,13 +285,15 @@ pub async fn start(cfg: Config) -> Result<NodeHandle, Error> {
 
     let (stop, stop_rx) = watch::channel(false);
     let (arrivals, _) = broadcast::channel(ARRIVALS_CAPACITY);
+    let cfg = Arc::new(cfg);
     let state = AppState {
-        store: Arc::new(Mutex::new(store)),
+        sync: SyncHandle::new(Arc::clone(&cfg), Arc::clone(&store))?,
+        store,
         blobs,
-        cfg: Arc::new(cfg),
+        cfg,
         arrivals,
-        sync: SyncHandle::new(),
         shutdown: Shutdown(stop_rx),
+        peer_requests: PeerRequests::default(),
     };
 
     let app = router(state.clone());
@@ -245,6 +308,7 @@ pub async fn start(cfg: Config) -> Result<NodeHandle, Error> {
             tracing::error!("server stopped: {e}");
         }
     });
+    sync::spawn(state.clone());
     Ok(NodeHandle {
         addr,
         state,
@@ -300,6 +364,8 @@ fn bearer_token(header: &str) -> Option<&str> {
 }
 
 /// Rejects every request that does not carry the secret, whatever its path.
+/// One from a peer's sync engine (it names its node in `X-Beacon-Node`) is
+/// counted, and tells sync that peer is up.
 async fn require_secret(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let given = req
         .headers()
@@ -307,9 +373,21 @@ async fn require_secret(State(state): State<AppState>, req: Request, next: Next)
         .and_then(|v| v.to_str().ok())
         .and_then(bearer_token);
     match given {
-        Some(token) if secret_matches(token, &state.cfg.secret) => next.run(req).await,
+        Some(token) if secret_matches(token, &state.cfg.secret) => {
+            if let Some(from) = sender(req.headers()) {
+                state.peer_requests.record(&from);
+                state.sync.heard_from(&from);
+            }
+            next.run(req).await
+        }
         _ => ApiFailure::from(Error::Auth).into_response(),
     }
+}
+
+/// The node a peer's sync request comes from, if it names a valid one.
+pub(crate) fn sender(headers: &axum::http::HeaderMap) -> Option<String> {
+    let node = headers.get(NODE_HEADER)?.to_str().ok()?;
+    validate_handle(node).ok()
 }
 
 // ------------------------------------------------------ errors and extractors

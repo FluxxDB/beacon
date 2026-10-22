@@ -225,14 +225,10 @@ impl Client {
             .await
     }
 
-    /// The peers and how sync with each is going. They are part of the
-    /// status, which is where this reads them from.
+    /// `GET /api/peers`: the peers and how sync with each is going.
     pub async fn peers(&self) -> Result<PeersJson, Error> {
-        let status = self.status().await?;
-        Ok(PeersJson {
-            v: V,
-            peers: status.peers,
-        })
+        self.json(self.request(Method::GET, &["api", "peers"]))
+            .await
     }
 
     // --------------------------------------------------------- channels

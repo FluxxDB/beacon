@@ -195,6 +195,8 @@ dependencies = [
  "crossterm",
  "futures-util",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "insta",
  "jiff",
  "libc",
@@ -2607,6 +2609,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

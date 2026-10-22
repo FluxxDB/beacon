@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::blobs::is_sha256;
 use crate::error::Error;
+use crate::sync::normalize_peer_url;
 
 /// One immutable change to the board, keyed by `(origin, seq)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +94,10 @@ pub const STATUS_MAX: usize = 200;
 pub const TOPIC_MAX: usize = 200;
 /// Most tags on one post.
 pub const TAGS_MAX: usize = 8;
+/// Longest announced peer URL, in bytes.
+pub const PEER_URL_MAX: usize = 512;
+/// Length of the database id at the end of an origin.
+const DB_ID_LEN: usize = 8;
 
 fn is_handle_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
@@ -287,12 +292,18 @@ pub fn format_vv(vv: &VersionVector) -> String {
 }
 
 /// Checks an event against the rules local input is held to: `seq` from 1 to
-/// `i64::MAX`; channel names already normalized; handles, tags and lowercase
-/// mentions valid; at most [`TAGS_MAX`] tags; a body of at most [`BODY_MAX`]
-/// bytes; an attachment name of 1 to [`ATTACHMENT_NAME_MAX`] bytes, a size
-/// SQLite can store and a hash that is 64 lowercase hex digits; and free text
-/// within its limit ([`CLIENT_MAX`], [`STATUS_MAX`], [`TOPIC_MAX`] bytes) with
-/// no control characters (a post body may hold `\n` and `\t`).
+/// `i64::MAX`; an origin shaped like the ones stores make (see
+/// [`check_origin`]); channel names already normalized; handles (authors,
+/// node names, tags, lowercase mentions) valid; at most [`TAGS_MAX`] tags; a
+/// body of at most [`BODY_MAX`] bytes; an attachment name of 1 to
+/// [`ATTACHMENT_NAME_MAX`] bytes, a size SQLite can store and a hash that is 64
+/// lowercase hex digits; an announced peer URL that sync can use (see
+/// [`normalize_peer_url`]); and free text within its limit ([`CLIENT_MAX`],
+/// [`STATUS_MAX`], [`TOPIC_MAX`], [`PEER_URL_MAX`] bytes) with no control
+/// characters (a post body may hold `\n` and `\t`).
+///
+/// Peers send events made elsewhere, so every name in one is checked here,
+/// not only the ones local input could get wrong.
 pub fn validate_event(ev: &Event) -> Result<(), Error> {
     if ev.seq == 0 || i64::try_from(ev.seq).is_err() {
         return Err(Error::Usage(format!(
@@ -301,6 +312,7 @@ pub fn validate_event(ev: &Event) -> Result<(), Error> {
             i64::MAX
         )));
     }
+    check_origin(&ev.origin)?;
     match &ev.kind {
         EventKind::ChannelCreated { name, topic } => {
             check_channel(name)?;
@@ -311,11 +323,39 @@ pub fn validate_event(ev: &Event) -> Result<(), Error> {
         EventKind::PostDeleted { by, .. } => validate_handle(by).map(drop),
         EventKind::AgentSeen(p) => {
             validate_handle(&p.handle)?;
+            validate_handle(&p.node)?;
             validate_client(&p.client)?;
             p.status.as_deref().map_or(Ok(()), validate_status)
         }
-        EventKind::PeerAnnounced { .. } => Ok(()),
+        EventKind::PeerAnnounced { node, url } => {
+            validate_handle(node)?;
+            check_text("peer URL", url, PEER_URL_MAX, &[])?;
+            match normalize_peer_url(url) {
+                Some(_) => Ok(()),
+                None => Err(Error::Usage(format!(
+                    "announced URL {url:?} is not a plain http:// URL"
+                ))),
+            }
+        }
     }
+}
+
+/// An origin is `{node}~{db_id}`: a handle, then the 8 characters a store
+/// takes from the end of a ULID, lowercased (Crockford base32: digits and
+/// lowercase letters except `i`, `l`, `o` and `u`).
+fn check_origin(origin: &str) -> Result<(), Error> {
+    let bad = || {
+        Error::Usage(format!(
+            "event origin {origin:?} is not {{node}}~{{{DB_ID_LEN}-character database id}}"
+        ))
+    };
+    let (node, db_id) = origin.split_once('~').ok_or_else(bad)?;
+    validate_handle(node).map_err(|_| bad())?;
+    let crockford = |b: u8| matches!(b, b'0'..=b'9' | b'a'..=b'h' | b'j' | b'k' | b'm' | b'n' | b'p'..=b't' | b'v'..=b'z');
+    if db_id.len() != DB_ID_LEN || !db_id.bytes().all(crockford) {
+        return Err(bad());
+    }
+    Ok(())
 }
 
 /// A channel name in an event must already be in normal form.
@@ -332,6 +372,7 @@ fn check_channel(name: &str) -> Result<(), Error> {
 fn check_post(post: &NewPost) -> Result<(), Error> {
     check_channel(&post.channel)?;
     validate_handle(&post.author)?;
+    validate_handle(&post.node)?;
     if let Some(client) = &post.client {
         validate_client(client)?;
     }

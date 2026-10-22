@@ -5,7 +5,8 @@
 //! To build a different kind of node (several peers, a small attachment limit)
 //! use [`spawn_node_with`] to tweak the [`Config`]; to take a node down and
 //! bring it back on the same data directory and port, use [`TestNode::stop`]
-//! and [`StoppedNode::restart`].
+//! and [`StoppedNode::restart`]. Nodes that must know each other's URLs
+//! before they start (peers, `BEACON_URL`) take a port with [`reserve`] first.
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
@@ -51,6 +52,43 @@ pub fn test_config(name: &str, peers: &[&str], dir: &Path) -> Config {
     cfg
 }
 
+/// A loopback port already bound for a node that has not started yet, so its
+/// URL can go into configs (its own `BEACON_URL`, other nodes' peers) before
+/// it runs. The node is served on this very socket: no other test can take
+/// the port in between.
+pub struct Reserved {
+    /// `http://127.0.0.1:<port>`.
+    pub url: String,
+    listener: std::net::TcpListener,
+}
+
+/// Binds a free loopback port for a node started later with [`Reserved::start`].
+pub fn reserve() -> Reserved {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    Reserved { url, listener }
+}
+
+impl Reserved {
+    /// Starts node `name` on the reserved port, with the given peer URLs and
+    /// a chance to change the config first.
+    pub async fn start(
+        self,
+        name: &str,
+        peers: &[&str],
+        tweak: impl FnOnce(&mut Config),
+    ) -> TestNode {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config(name, peers, dir.path());
+        cfg.listen = self.listener.local_addr().unwrap();
+        tweak(&mut cfg);
+        let handle = beacon::server::start_on(cfg.clone(), self.listener)
+            .await
+            .expect("start node");
+        TestNode::from_handle(cfg, dir, handle)
+    }
+}
+
 /// Starts node `name` with the given peer URLs.
 pub async fn spawn_node(name: &str, peers: &[&str]) -> TestNode {
     spawn_node_with(name, peers, |_| {}).await
@@ -74,6 +112,10 @@ impl TestNode {
         let handle = beacon::server::start(cfg.clone())
             .await
             .expect("start node");
+        TestNode::from_handle(cfg, dir, handle)
+    }
+
+    fn from_handle(cfg: Config, dir: TempDir, handle: NodeHandle) -> TestNode {
         TestNode {
             name: cfg.node.clone(),
             url: format!("http://{}", handle.addr),

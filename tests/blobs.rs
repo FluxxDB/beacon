@@ -237,17 +237,53 @@ async fn put_verified_accepts_the_bytes_it_was_promised() {
     let data = b"the build log from the mac".to_vec();
     let sha = sha256_hex(&data);
     assert!(!blobs.has(&sha));
-    blobs.put_verified(&sha, chunked(&data, 5)).await.unwrap();
+    blobs
+        .put_verified(&sha, chunked(&data, 5), data.len() as u64)
+        .await
+        .unwrap();
     assert!(blobs.has(&sha));
     assert_eq!(std::fs::read(blobs.path(&sha)).unwrap(), data);
     assert_eq!(names(dir.path()), std::slice::from_ref(&sha));
 
     // Asking again is a no-op, and does not need the stream.
     blobs
-        .put_verified(&sha, stream::empty::<Result<Bytes, Error>>())
+        .put_verified(&sha, stream::empty::<Result<Bytes, Error>>(), 0)
         .await
         .unwrap();
     assert_eq!(std::fs::read(blobs.path(&sha)).unwrap(), data);
+}
+
+#[tokio::test]
+async fn put_verified_reads_no_more_than_it_was_told() {
+    let (dir, blobs) = store();
+    let data = b"exactly twenty bytes".to_vec();
+    let sha = sha256_hex(&data);
+    // A peer that sends more than the size it announced is cut off at it,
+    // and nothing is kept, even though the bytes would have matched.
+    let err = blobs
+        .put_verified(&sha, chunked(&data, 3), 19)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Usage(_)), "{err:?}");
+    assert!(err.to_string().contains("over 19 bytes"), "{err}");
+    assert!(!blobs.has(&sha));
+    assert!(names(dir.path()).is_empty());
+
+    // The stream is not read past the bound: a source that would go on
+    // forever is cut off too.
+    let endless = stream::iter(std::iter::repeat_with(|| {
+        Ok::<_, Error>(Bytes::from_static(b"0123456789"))
+    }));
+    let err = blobs.put_verified(&sha, endless, 1000).await.unwrap_err();
+    assert!(matches!(err, Error::Usage(_)), "{err:?}");
+    assert!(names(dir.path()).is_empty());
+
+    // Exactly the bound is fine.
+    blobs
+        .put_verified(&sha, chunked(&data, 3), 20)
+        .await
+        .unwrap();
+    assert!(blobs.has(&sha));
 }
 
 #[tokio::test]
@@ -255,7 +291,7 @@ async fn put_verified_rejects_bytes_that_do_not_match() {
     let (dir, blobs) = store();
     let promised = sha256_hex(b"what the peer announced");
     let err = blobs
-        .put_verified(&promised, chunked(b"something else entirely", 4))
+        .put_verified(&promised, chunked(b"something else entirely", 4), 1000)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Usage(_)), "{err:?}");
@@ -269,7 +305,7 @@ async fn put_verified_rejects_bytes_that_do_not_match() {
         Err(Error::Unreachable("reset".into())),
     ];
     let err = blobs
-        .put_verified(&promised, stream::iter(parts))
+        .put_verified(&promised, stream::iter(parts), 1000)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Unreachable(_)), "{err:?}");
@@ -303,7 +339,7 @@ async fn names_that_are_not_a_sha_never_reach_the_disk() {
         assert!(!path.exists(), "{name:?} -> {path:?}");
         assert!(blobs.open(name).await.unwrap().is_none(), "{name:?}");
         let err = blobs
-            .put_verified(name, chunked(b"x", 1))
+            .put_verified(name, chunked(b"x", 1), 1)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Usage(_)), "{name:?}: {err:?}");
@@ -375,14 +411,17 @@ async fn a_peers_attachment_is_unavailable_until_its_bytes_arrive() {
     // Bytes that do not match are refused and the post stays unavailable.
     let blobs = &node.state().blobs;
     assert!(blobs
-        .put_verified(&sha, chunked(b"tampered", 3))
+        .put_verified(&sha, chunked(b"tampered", 3), 100)
         .await
         .is_err());
     assert!(!available(&node).await);
     assert!(names(&node.dir.path().join("files")).is_empty());
 
     // The right ones make it available, and downloadable.
-    blobs.put_verified(&sha, chunked(&data, 3)).await.unwrap();
+    blobs
+        .put_verified(&sha, chunked(&data, 3), data.len() as u64)
+        .await
+        .unwrap();
     assert!(available(&node).await);
     let resp = node.get(&format!("/api/files/{sha}")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
