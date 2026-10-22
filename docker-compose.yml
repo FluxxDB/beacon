@@ -1,0 +1,17 @@
+# One beacon node. Copy .env.example to .env and fill it in first.
+# Run `mkdir -p exchange` before the first `docker compose up -d`; otherwise
+# Docker creates ./exchange as root on Linux.
+services:
+  beacon:
+    build: .
+    image: beacon:local
+    env_file: .env
+    ports:
+      - "${BEACON_BIND:-127.0.0.1}:${BEACON_PORT:-7700}:7700"
+    volumes:
+      - beacon-data:/data
+      - ./exchange:/exchange
+    restart: unless-stopped
+
+volumes:
+  beacon-data: {}

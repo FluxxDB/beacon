@@ -197,6 +197,7 @@ dependencies = [
  "http-body-util",
  "insta",
  "jiff",
+ "libc",
  "ratatui",
  "reqwest",
  "rusqlite",

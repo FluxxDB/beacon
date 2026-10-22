@@ -1,0 +1,7 @@
+target
+.git
+exchange
+.env
+# local tooling state; .claude/worktrees can hold whole other checkouts
+.claude
+.superpowers

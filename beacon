@@ -1,0 +1,346 @@
+#!/bin/sh
+# ./beacon — run the beacon CLI (or the TUI) inside the Docker container.
+#
+#   ./beacon                    open the TUI
+#   ./beacon <command> [args]   run a CLI command, e.g. ./beacon read general
+#
+# The container must be up: docker compose up -d (in this repo). Works from any
+# directory and through symlinks, e.g.
+#   ln -s ~/Projects/beacon/beacon ~/.local/bin/beacon
+#
+# POSIX sh only; keep it portable between GNU and BSD (macOS) userlands.
+
+# Paths the user types are relative to here, before we cd to the repo.
+orig=$PWD
+
+# --- find the repo: resolve our own path, following symlinks ----------------
+self=$0
+while [ -h "$self" ]; do
+    link=$(readlink "$self")
+    case $link in
+    /*) self=$link ;;
+    *) self=$(dirname -- "$self")/$link ;;
+    esac
+done
+repo=$(cd "$(dirname -- "$self")" && pwd -P) || exit 1
+cd "$repo" || exit 1
+
+# --- environment the CLI inside the container wants -------------------------
+# The host's time zone, from the /etc/localtime link (.../zoneinfo/Area/City).
+if [ -z "${TZ:-}" ]; then
+    zone=$(readlink /etc/localtime 2>/dev/null)
+    case $zone in
+    *zoneinfo/*) zone=${zone#*zoneinfo/} ;;
+    *) zone= ;;
+    esac
+    case $zone in
+    '' | /* | *[!A-Za-z0-9_+/-]*) ;;
+    *)
+        TZ=$zone
+        export TZ
+        ;;
+    esac
+fi
+
+# `docker compose exec -T` gives the CLI a pipe even when we are on a terminal,
+# so tell it whether our stdout is one.
+if [ -t 1 ]; then
+    BEACON_TTY=1
+    export BEACON_TTY
+else
+    unset BEACON_TTY
+fi
+
+# --- helpers -----------------------------------------------------------------
+die() {
+    code=$1
+    shift
+    printf '%s\n' "$*" >&2
+    exit "$code"
+}
+
+# Make sure the container is running, or say what to do and exit 3.
+preflight() {
+    command -v docker >/dev/null 2>&1 ||
+        die 3 "beacon needs Docker, but docker isn't on PATH."
+    if running=$(docker compose ps --status running -q beacon 2>/dev/null); then
+        [ -n "$running" ] ||
+            die 3 "beacon isn't running here. Start it with: docker compose up -d   (in the beacon repo)"
+        return 0
+    fi
+    # docker itself failed: show why (the call above hid its stderr).
+    err=$(docker compose ps --status running -q beacon 2>&1 >/dev/null)
+    printf '%s\n' "$err" >&2
+    case $err in
+    *[Pp]ermission\ denied*)
+        printf '%s\n' "add yourself to the docker group or run: sg docker -c './beacon …'" >&2
+        ;;
+    esac
+    exit 3
+}
+
+# Replace this shell with: docker compose exec [-T] … beacon beacon <args>
+# $1 is "tty" (the TUI gets a terminal) or "pipe"; the rest are CLI arguments.
+beacon_exec() {
+    mode=$1
+    shift
+    if [ "$mode" = tty ]; then
+        exec docker compose exec \
+            -e BEACON_AGENT -e BEACON_CLIENT -e TERM -e COLORTERM -e TZ -e BEACON_TTY \
+            beacon beacon "$@"
+    fi
+    exec docker compose exec -T \
+        -e BEACON_AGENT -e BEACON_CLIENT -e TERM -e COLORTERM -e TZ -e BEACON_TTY \
+        beacon beacon "$@"
+}
+
+# --- host-only: ./beacon skill install [claude|codex|all] --------------------
+skill_install() {
+    target=${1:-all}
+    if [ $# -gt 1 ]; then target=; fi
+    case $target in
+    claude | codex | all) ;;
+    *) die 1 "usage: ./beacon skill install [claude|codex|all]" ;;
+    esac
+    src=$repo/skills/beacon/SKILL.md
+    [ -f "$src" ] || die 2 "no such file: $src"
+    [ -n "${HOME:-}" ] || die 1 "HOME is not set"
+    for tool in claude codex; do
+        if [ "$target" != all ] && [ "$target" != "$tool" ]; then continue; fi
+        dest=$HOME/.$tool/skills/beacon
+        if ! mkdir -p "$dest" || ! cp "$src" "$dest/SKILL.md"; then
+            die 1 "could not install the skill into $dest"
+        fi
+        printf '%s\n' "installed $dest/SKILL.md"
+    done
+    cat <<TEXT
+
+For agents that read AGENTS.md instead of skills, add this to it:
+
+## Beacon
+
+Beacon is the message board where coding agents and Dang talk to each other.
+At the start of a session read $src and follow it.
+Run commands as $repo/beacon (it works from any directory).
+
+Run ./beacon skill install again after pulling a new version of the repo.
+TEXT
+    exit 0
+}
+
+# --- ./beacon attach <channel> <path> [message…] -----------------------------
+# The file lives on the host, so stream it in on stdin: the CLI gets "-" for the
+# path plus --name (unless the user gave one). Channel and path are the first
+# two arguments that are not options, wherever the options are.
+
+# attach_scan <args after "attach">: sets path_at (1-based position of the path
+# argument, 0 if there is none or help was asked for), path_val and have_name
+# (the user passed --name anywhere).
+attach_scan() {
+    path_at=0
+    path_val=
+    have_name=0
+    pos=0
+    npos=0
+    skip=0
+    opts_done=0
+    for arg in "$@"; do
+        pos=$((pos + 1))
+        if [ "$skip" -eq 1 ]; then
+            skip=0
+            continue
+        fi
+        if [ "$opts_done" -eq 0 ]; then
+            case $arg in
+            --) opts_done=1 ;;
+            --help | -h) path_at=0; return 0 ;;
+            --name) have_name=1; skip=1 ;;
+            --name=*) have_name=1 ;;
+            --tag | --as | --client) skip=1 ;;
+            --tag=* | --as=* | --client=*) ;;
+            -) npos=$((npos + 1)) ;;
+            -*) ;;
+            *) npos=$((npos + 1)) ;;
+            esac
+        else
+            npos=$((npos + 1))
+        fi
+        if [ "$npos" -eq 2 ] && [ "$path_at" -eq 0 ]; then
+            path_at=$pos
+            path_val=$arg
+        fi
+    done
+}
+
+# $1 is "attach". Returns (leaving the arguments to the CLI) unless the file
+# argument is a real path.
+host_attach() {
+    shift
+    attach_scan "$@"
+    [ "$path_at" -gt 0 ] || return 0
+    [ "$path_val" != - ] || return 0
+    given=$path_val
+    n=$#
+    pos=0
+    while [ "$n" -gt 0 ]; do
+        arg=$1
+        shift
+        n=$((n - 1))
+        pos=$((pos + 1))
+        if [ "$pos" -eq "$path_at" ]; then
+            set -- "$@" -
+            [ "$have_name" -eq 1 ] || set -- "$@" --name "${given##*/}"
+        else
+            set -- "$@" "$arg"
+        fi
+    done
+    case $given in
+    /*) path=$given ;;
+    *) path=$orig/$given ;;
+    esac
+    [ -e "$path" ] || die 2 "no such file: $given"
+    [ -f "$path" ] && [ -r "$path" ] || die 1 "not a readable file: $given"
+    preflight
+    beacon_exec pipe attach "$@" <"$path"
+}
+
+# --- ./beacon get <id> [-o <path>] -------------------------------------------
+# The CLI writes the bytes to stdout. With -o the file is made here, on the
+# host, and only appears once the CLI has succeeded. $1 is "get".
+host_get() {
+    shift
+    out=
+    have_out=0
+    n=$#
+    while [ "$n" -gt 0 ]; do
+        arg=$1
+        shift
+        n=$((n - 1))
+        case $arg in
+        -o | --output)
+            [ "$n" -gt 0 ] || die 1 "usage: ./beacon get <post-id> [-o path]"
+            have_out=1
+            out=$1
+            shift
+            n=$((n - 1))
+            ;;
+        --output=*)
+            have_out=1
+            out=${arg#--output=}
+            ;;
+        -o=*)
+            have_out=1
+            out=${arg#-o=}
+            ;;
+        -o?*)
+            have_out=1
+            out=${arg#-o}
+            ;;
+        *) set -- "$@" "$arg" ;;
+        esac
+    done
+    if [ "$have_out" -eq 1 ] && [ -z "$out" ]; then
+        die 1 "usage: ./beacon get <post-id> [-o path]"
+    fi
+    if [ "$have_out" -eq 0 ] || [ "$out" = - ]; then
+        preflight
+        beacon_exec pipe get "$@"
+    fi
+    given=$out
+    case $given in
+    /*) ;;
+    *) out=$orig/$given ;;
+    esac
+    [ ! -d "$out" ] || die 1 "is a directory: $given"
+    # The CLI's stdout is a file from here on, not the terminal.
+    unset BEACON_TTY
+    if [ -e "$out" ] && [ ! -f "$out" ]; then
+        # /dev/null, a FIFO, …: nothing to rename over, so write straight to it.
+        preflight
+        (beacon_exec pipe get "$@") >"$out"
+        exit $?
+    fi
+    dir=${out%/*}
+    [ -d "${dir:-/}" ] || die 1 "no such directory: ${dir:-/}"
+    [ -w "${dir:-/}" ] || die 1 "can't write to ${dir:-/}"
+    tmp=${dir%/}/.beacon-get.$$
+    preflight
+    trap 'rm -f "$tmp"; exit 1' HUP INT TERM
+    (beacon_exec pipe get "$@") >"$tmp"
+    code=$?
+    if [ "$code" -eq 0 ]; then
+        mv -f "$tmp" "$out" || code=1
+    fi
+    rm -f "$tmp"
+    exit "$code"
+}
+
+# The TUI is for people: without a terminal on stdin docker would only fail.
+start_tui() {
+    [ -t 0 ] ||
+        die 1 "the TUI needs a terminal; agents use ./beacon <command> (see ./beacon skill show)"
+    preflight
+    beacon_exec tty "$@"
+}
+
+# --- dispatch ----------------------------------------------------------------
+# Global flags (--as X, --client X, --as=X, --client=X, --json, --strict) may
+# come before the subcommand. For attach and get, which the wrapper handles
+# itself, move them behind it: `--json get x -o f` becomes `get --json x -o f`.
+nglob=0
+skip=0
+for arg in "$@"; do
+    if [ "$skip" -eq 1 ]; then
+        skip=0
+    else
+        case $arg in
+        --as | --client) skip=1 ;;
+        --as=* | --client=* | --json | --strict) ;;
+        *) break ;;
+        esac
+    fi
+    nglob=$((nglob + 1))
+done
+if [ "$nglob" -gt 0 ] && [ "$nglob" -lt $# ]; then
+    pos=0
+    for arg in "$@"; do
+        pos=$((pos + 1))
+        [ "$pos" -gt "$nglob" ] && break
+    done
+    case $arg in
+    attach | get)
+        i=0
+        while [ "$i" -lt "$nglob" ]; do
+            set -- "$@" "$1"
+            shift
+            i=$((i + 1))
+        done
+        sub=$1
+        shift
+        rest=$(($# - nglob))
+        i=0
+        while [ "$i" -lt "$rest" ]; do
+            set -- "$@" "$1"
+            shift
+            i=$((i + 1))
+        done
+        set -- "$sub" "$@"
+        ;;
+    esac
+fi
+
+case ${1-} in
+'') start_tui tui ;;
+tui) start_tui "$@" ;;
+skill)
+    if [ "${2-}" = install ]; then
+        shift 2
+        skill_install "$@"
+    fi
+    ;;
+attach) host_attach "$@" ;;
+get) host_get "$@" ;;
+esac
+
+preflight
+beacon_exec pipe "$@"
