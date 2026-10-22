@@ -15,13 +15,19 @@ pub mod human;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use clap::{Args, Parser, Subcommand};
+use futures_util::StreamExt;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncWriteExt};
 
-use crate::api::{NewPostRequest, PostJson, WhoRequest};
-use crate::client::Client;
+use crate::api::{JoinAck, NewPostRequest, PostJson, StreamEvent, WhoRequest, V};
+use crate::client::{self, Client};
 use crate::config::Config;
 use crate::error::Error;
 use crate::model::{normalize_channel, validate_handle, AuthorKind};
@@ -99,6 +105,42 @@ pub enum Command {
     Read(ReadArgs),
     /// Delete a post (a tombstone: it never comes back)
     Delete(DeleteArgs),
+    /// Post a file
+    Attach(AttachArgs),
+    /// Save a post's attachment
+    Get(GetArgs),
+    /// See who is on the board, or say what you are working on
+    Who(WhoArgs),
+    /// Get woken (wait, watch) for every post in a channel
+    Join {
+        /// Channel to join (a leading # is fine)
+        channel: String,
+    },
+    /// Stop being woken for a channel's posts (mentions and announcements still wake you)
+    Leave {
+        /// Channel to leave (a leading # is fine)
+        channel: String,
+    },
+    /// Block until a mention, an announcement or a joined channel's post arrives
+    Wait(WaitArgs),
+    /// Print a line for each such post, as it arrives, until stopped
+    Watch,
+    /// The skill that teaches an agent to use beacon
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillAction {
+    /// Print the skill (SKILL.md)
+    Show,
+    /// Copy the skill to ~/.claude and ~/.codex (on the host: ./beacon skill install)
+    Install {
+        /// claude, codex or all
+        target: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -178,6 +220,73 @@ pub struct DeleteArgs {
     pub force: bool,
 }
 
+#[derive(Debug, Args)]
+#[command(
+    after_help = "`-` reads the file from stdin and then needs --name. The file is sent as it \
+is read, not held in memory. A message that starts with a dash needs `--` before it."
+)]
+pub struct AttachArgs {
+    /// Channel to post in (a leading # is fine)
+    pub channel: String,
+
+    /// The file to attach, or `-` to read it from stdin
+    pub path: String,
+
+    /// A message to post with the file
+    #[arg(allow_hyphen_values = true)]
+    pub message: Option<String>,
+
+    /// What the attachment is called (needed with `-`; otherwise the file's name)
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Label the post (repeatable): claim, done, blocked, question, handoff, fyi...
+    #[arg(long = "tag", value_name = "TAG")]
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Without -o the file goes to stdout, byte for byte: beacon get ID > report.txt. \
+Exit 2 if the post has no attachment or this node does not have the file yet."
+)]
+pub struct GetArgs {
+    /// The post's id: the 8-character id from `read`, or any unique suffix of 6 or more
+    pub id: String,
+
+    /// Save to this file, or into this directory under the attachment's name; `-` is stdout
+    #[arg(
+        short = 'o',
+        long = "output",
+        value_name = "PATH",
+        allow_hyphen_values = true
+    )]
+    pub output: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct WhoArgs {
+    /// Say you are here, and what you are working on (needs a handle)
+    #[arg(long, value_name = "STATUS", num_args = 0..=1, default_missing_value = "")]
+    pub here: Option<String>,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Exit 0 with the posts printed, 6 if nothing came within the timeout. \
+Posts are not marked read: run `read --unread` next."
+)]
+pub struct WaitArgs {
+    /// Seconds to wait at most
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = 600,
+        value_parser = clap::value_parser!(u64).range(0..=31_536_000)
+    )]
+    pub timeout: u64,
+}
+
 // ------------------------------------------------------------------ running
 
 /// Runs the command line `args` (the program name first) and returns the
@@ -217,11 +326,19 @@ fn is_broken_pipe(e: &anyhow::Error) -> bool {
 }
 
 /// Prints `e` to stderr as `beacon: <message>`, plus a hint where there is one.
+/// The hint is for a node nothing answers at; a node that did answer and then
+/// went quiet is running, and one that timed out `wait` has said so already.
 fn report(e: &Error) {
     let mut stderr = std::io::stderr().lock();
-    let _ = writeln!(stderr, "beacon: {e:#}");
-    if matches!(e, Error::Unreachable(_)) {
-        let _ = writeln!(stderr, "{UNREACHABLE_HINT}");
+    match e {
+        Error::Timeout => {}
+        Error::Unreachable(_) => {
+            let _ = writeln!(stderr, "beacon: {e:#}");
+            let _ = writeln!(stderr, "{UNREACHABLE_HINT}");
+        }
+        _ => {
+            let _ = writeln!(stderr, "beacon: {e:#}");
+        }
     }
 }
 
@@ -240,7 +357,10 @@ async fn execute(cli: Cli) -> Result<(), Error> {
     let ctx = || Ctx::new(handle, &client, json, strict);
     match command {
         Command::Serve => serve().await,
-        Command::Health => health(&ctx()?).await,
+        // The Docker healthcheck runs this with the container's environment:
+        // it needs the node's address and secret, and no handle.
+        Command::Health => health(&Ctx::anonymous(json)?).await,
+        Command::Skill { action } => skill(action),
         Command::Status => status(&ctx()?).await,
         Command::Peers => peers(&ctx()?).await,
         Command::Channels => channels(&ctx()?).await,
@@ -251,6 +371,13 @@ async fn execute(cli: Cli) -> Result<(), Error> {
         Command::Post(args) => post(&ctx()?, args).await,
         Command::Read(args) => read(&ctx()?, args).await,
         Command::Delete(args) => delete(&ctx()?, args).await,
+        Command::Attach(args) => attach(&ctx()?, args).await,
+        Command::Get(args) => get(&ctx()?, args).await,
+        Command::Who(args) => who(&ctx()?, args).await,
+        Command::Join { channel } => join(&ctx()?, &channel, Membership::Join).await,
+        Command::Leave { channel } => join(&ctx()?, &channel, Membership::Leave).await,
+        Command::Wait(args) => wait(&ctx()?, args).await,
+        Command::Watch => watch(&ctx()?).await,
     }
 }
 
@@ -291,6 +418,19 @@ impl Ctx {
         })
     }
 
+    /// A context that talks to the node and nothing else: no handle, so no
+    /// opinion about `BEACON_AGENT`.
+    fn anonymous(json: bool) -> Result<Ctx, Error> {
+        Ok(Ctx {
+            client: Client::from_env()?,
+            handle: None,
+            program: "other".to_string(),
+            json,
+            strict: false,
+            clock: Clock::system(),
+        })
+    }
+
     /// The caller's handle, for the commands that cannot work without one.
     fn handle(&self) -> Result<&str, Error> {
         self.handle
@@ -302,17 +442,27 @@ impl Ctx {
     /// is active from somewhere else; then tells the node the handle is here.
     /// Nothing happens without a handle.
     async fn announce(&self) -> Result<(), Error> {
+        self.announce_with(None).await
+    }
+
+    /// [`Ctx::announce`], also saying what the handle is working on.
+    async fn announce_with(&self, status: Option<&str>) -> Result<(), Error> {
         let Some(handle) = &self.handle else {
             return Ok(());
         };
         if self.strict {
             self.check_unclaimed(handle).await?;
         }
+        self.beat(handle, status).await
+    }
+
+    /// Tells the node `handle` is here.
+    async fn beat(&self, handle: &str, status: Option<&str>) -> Result<(), Error> {
         let beat = WhoRequest {
-            handle: handle.clone(),
+            handle: handle.to_string(),
             kind: AuthorKind::Agent,
             client: self.program.clone(),
-            status: None,
+            status: status.map(String::from),
         };
         self.client.heartbeat(&beat).await?;
         Ok(())
@@ -358,6 +508,15 @@ fn print_line(text: &str) -> Result<(), Error> {
     stdout
         .write_all(text.as_bytes())
         .and_then(|()| stdout.write_all(b"\n"))
+        .and_then(|()| stdout.flush())
+        .map_err(|e| Error::Internal(e.into()))
+}
+
+/// Writes `text` to stdout exactly as it is.
+fn print_text(text: &str) -> Result<(), Error> {
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(text.as_bytes())
         .and_then(|()| stdout.flush())
         .map_err(|e| Error::Internal(e.into()))
 }
@@ -469,8 +628,23 @@ async fn post(ctx: &Ctx, args: PostArgs) -> Result<(), Error> {
         client: Some(ctx.program.clone()),
         create: args.create,
     };
-    let created = ctx.client.post(&channel, &request).await?;
+    let created = ctx
+        .client
+        .post(&channel, &request)
+        .await
+        .map_err(|e| check_before_reposting(e, &channel))?;
     ctx.show(&created, || human::posted_text(&created))
+}
+
+/// A post that died on the way may have been stored: say how to find out
+/// before posting it again.
+fn check_before_reposting(e: Error, channel: &str) -> Error {
+    match e {
+        Error::Interrupted(message) => Error::Interrupted(format!(
+            "{message}; run `./beacon read {channel}` before posting again"
+        )),
+        e => e,
+    }
 }
 
 /// Who `--human` posts as: `BEACON_HUMAN`, else Dang.
@@ -582,4 +756,497 @@ async fn delete(ctx: &Ctx, args: DeleteArgs) -> Result<(), Error> {
             human::clean_inline(&post.channel)
         )
     })
+}
+
+// -------------------------------------------------------------- attach and get
+
+/// Where an attachment's bytes come from: stdin or a file.
+type Source = Pin<Box<dyn AsyncRead + Send + Sync>>;
+
+async fn attach(ctx: &Ctx, args: AttachArgs) -> Result<(), Error> {
+    let handle = ctx.handle()?.to_string();
+    let channel = normalize_channel(&args.channel)?;
+    let (file, name, len) = open_attachment(&args.path, args.name.as_deref()).await?;
+    let body = unix_newlines(args.message.as_deref().unwrap_or(""));
+    ctx.announce().await?;
+    let request = NewPostRequest {
+        body,
+        tags: args.tags,
+        author: handle,
+        author_kind: AuthorKind::Agent,
+        client: Some(ctx.program.clone()),
+        create: false,
+    };
+    let created = ctx
+        .client
+        .upload(&channel, &request, &name, file, len)
+        .await
+        .map_err(|e| check_before_reposting(e, &channel))?;
+    ctx.show(&created, || human::posted_text(&created))
+}
+
+/// The file `attach` was pointed at (`-` for stdin), what to call it and, for
+/// a regular file, how long it is.
+async fn open_attachment(
+    path: &str,
+    name: Option<&str>,
+) -> Result<(Source, String, Option<u64>), Error> {
+    if name.is_some_and(|n| n.trim().is_empty()) {
+        return Err(Error::Usage("--name cannot be empty".to_string()));
+    }
+    if path == "-" {
+        let name = name.ok_or_else(|| {
+            Error::Usage(
+                "a file read from stdin needs --name NAME to say what it is called".to_string(),
+            )
+        })?;
+        return Ok((Box::pin(tokio::io::stdin()), name.to_string(), None));
+    }
+    let unreadable = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::NotFound => Error::NotFound(format!("no such file: {path}")),
+        _ => Error::Usage(format!("cannot read {path}: {e}")),
+    };
+    let file = tokio::fs::File::open(path).await.map_err(unreadable)?;
+    let meta = file.metadata().await.map_err(unreadable)?;
+    if meta.is_dir() {
+        return Err(Error::Usage(format!(
+            "{path} is a directory; attach takes a file"
+        )));
+    }
+    let name = match name {
+        Some(name) => name.to_string(),
+        None => Path::new(path)
+            .file_name()
+            .map(|n| human::safe_file_name(&n.to_string_lossy()))
+            .ok_or_else(|| {
+                Error::Usage(format!("{path} has no file name; give one with --name"))
+            })?,
+    };
+    let len = meta.is_file().then(|| meta.len());
+    Ok((Box::pin(file), name, len))
+}
+
+/// What `get -o` answers.
+#[derive(Serialize)]
+struct Saved {
+    v: u32,
+    ok: bool,
+    path: String,
+    name: String,
+    size: u64,
+    sha256: String,
+}
+
+fn not_synced() -> Error {
+    Error::NotFound(
+        "attachment not synced yet; try again when a peer that has it is online".to_string(),
+    )
+}
+
+fn io_error(what: &str, e: std::io::Error) -> Error {
+    Error::Internal(anyhow::Error::new(e).context(what.to_string()))
+}
+
+async fn get(ctx: &Ctx, args: GetArgs) -> Result<(), Error> {
+    ctx.announce().await?;
+    let post = ctx.client.post_by_id(&args.id).await?;
+    let Some(attachment) = post.attachment else {
+        return Err(Error::NotFound(format!(
+            "post {} has no attachment",
+            human::clean_inline(&post.short_id)
+        )));
+    };
+    if !attachment.available {
+        return Err(not_synced());
+    }
+    // Where it goes is settled before the first byte is asked for.
+    let target = match args.output.as_deref() {
+        None | Some("-") => None,
+        Some(path) => Some(destination(path, &attachment.name).await?),
+    };
+    let mut download = match ctx.client.file(&attachment.sha256).await {
+        Err(Error::NotFound(_)) => return Err(not_synced()),
+        other => other?,
+    };
+
+    let (size, sha256) = match &target {
+        None => {
+            let mut out = tokio::io::BufWriter::new(tokio::io::stdout());
+            let got = receive(&mut download, &mut out).await?;
+            out.flush()
+                .await
+                .map_err(|e| io_error("cannot write to stdout", e))?;
+            got
+        }
+        Some(path) => save(&mut download, path).await?,
+    };
+    // The post names the file by its hash; the bytes either are that file or
+    // they are not. (To stdout, what was wrong has been written already.)
+    if size != attachment.size || sha256 != attachment.sha256 {
+        if let Some(path) = &target {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+        return Err(Error::Internal(anyhow!(
+            "the download is not the file the post names ({size} bytes, sha256 {sha256}); \
+             try again"
+        )));
+    }
+    let Some(path) = target else {
+        return Ok(());
+    };
+    let saved = Saved {
+        v: V,
+        ok: true,
+        path: path.display().to_string(),
+        name: human::safe_file_name(&attachment.name),
+        size,
+        sha256,
+    };
+    ctx.show(&saved, || {
+        format!(
+            "saved {} ({}) to {}",
+            human::clean_inline(&saved.name),
+            human::format_size(size),
+            human::clean_inline(&saved.path)
+        )
+    })
+}
+
+/// Where `get -o path` puts a file called `name`: at `path`, or inside it if
+/// it is a directory. The directory it ends up in has to exist.
+async fn destination(path: &str, name: &str) -> Result<PathBuf, Error> {
+    let given = PathBuf::from(path);
+    let is_dir = tokio::fs::metadata(&given).await.is_ok_and(|m| m.is_dir());
+    let dest = if is_dir || path.ends_with('/') {
+        given.join(human::safe_file_name(name))
+    } else {
+        given
+    };
+    let parent = match dest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    if !tokio::fs::metadata(&parent).await.is_ok_and(|m| m.is_dir()) {
+        return Err(Error::Usage(format!(
+            "no such directory: {}",
+            parent.display()
+        )));
+    }
+    Ok(dest)
+}
+
+/// Writes `download` to `path` so that the file is there whole or not at all:
+/// into a hidden file next to it, renamed once it is complete. (Something that
+/// is not a regular file, like `/dev/null`, is written to directly.)
+async fn save(download: &mut client::Download, path: &Path) -> Result<(u64, String), Error> {
+    let direct = tokio::fs::metadata(path).await.is_ok_and(|m| !m.is_file());
+    let temp = match path.parent() {
+        Some(dir) if !direct => dir.join(format!(".beacon-get.{}", std::process::id())),
+        _ => path.to_path_buf(),
+    };
+    let cannot = |e| io_error(&format!("cannot write {}", temp.display()), e);
+    let mut file = tokio::fs::File::create(&temp).await.map_err(cannot)?;
+    let written = async {
+        let got = receive(download, &mut file).await?;
+        file.flush().await.map_err(cannot)?;
+        Ok::<_, Error>(got)
+    }
+    .await;
+    drop(file);
+    match written {
+        Ok(got) if direct => Ok(got),
+        Ok(got) => {
+            tokio::fs::rename(&temp, path).await.map_err(|e| {
+                io_error(
+                    &format!("cannot move the download to {}", path.display()),
+                    e,
+                )
+            })?;
+            Ok(got)
+        }
+        Err(e) => {
+            if !direct {
+                let _ = tokio::fs::remove_file(&temp).await;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Copies what is downloaded to `out`; returns how many bytes it was and their
+/// SHA-256 (lowercase hex).
+async fn receive(
+    download: &mut client::Download,
+    out: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<(u64, String), Error> {
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    while let Some(chunk) = download.chunk().await? {
+        hasher.update(&chunk);
+        size += chunk.len() as u64;
+        out.write_all(&chunk)
+            .await
+            .map_err(|e| io_error("cannot write the download", e))?;
+    }
+    let sha256 = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok((size, sha256))
+}
+
+// ------------------------------------------------------- who, join and leave
+
+async fn who(ctx: &Ctx, args: WhoArgs) -> Result<(), Error> {
+    match &args.here {
+        Some(status) => {
+            ctx.handle()?;
+            let status = status.trim();
+            ctx.announce_with((!status.is_empty()).then_some(status))
+                .await?;
+        }
+        None => ctx.announce().await?,
+    }
+    let who = ctx.client.who().await?;
+    ctx.show(&who, || human::who_text(&who.agents, ctx.clock.now_ms))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Membership {
+    Join,
+    Leave,
+}
+
+/// `join` and `leave`: changes the channels `handle` is woken for.
+async fn join(ctx: &Ctx, channel: &str, change: Membership) -> Result<(), Error> {
+    let handle = ctx.handle()?.to_string();
+    let channel = normalize_channel(channel)?;
+    ctx.announce().await?;
+    let mut joined = ctx.client.joins(&handle).await?.channels;
+    let was_joined = joined.contains(&channel);
+    // A channel has to exist to be joined; one that was deleted can still be left.
+    let exists = ctx
+        .client
+        .channels(None)
+        .await?
+        .channels
+        .iter()
+        .any(|c| c.name == channel);
+    if !exists && !(change == Membership::Leave && was_joined) {
+        return Err(Error::NotFound(match change {
+            Membership::Join => {
+                format!("no channel #{channel}; create it with ./beacon channel new {channel}")
+            }
+            Membership::Leave => format!("no channel #{channel}"),
+        }));
+    }
+    if was_joined != (change == Membership::Join) {
+        let mut wanted = joined.clone();
+        match change {
+            Membership::Join => wanted.push(channel.clone()),
+            Membership::Leave => wanted.retain(|c| c != &channel),
+        }
+        joined = ctx.client.set_joins(&handle, &wanted).await?.channels;
+    }
+    let ack = JoinAck {
+        v: V,
+        ok: true,
+        channel: channel.clone(),
+        joined,
+    };
+    ctx.show(&ack, || match change {
+        Membership::Join => human::joined_text(&channel),
+        Membership::Leave => human::left_text(&channel),
+    })
+}
+
+// ---------------------------------------------------------------- wait, watch
+
+/// How long the first pause before reconnecting is; each one after is twice
+/// as long, up to a limit.
+const RECONNECT_FIRST: Duration = Duration::from_secs(1);
+const WATCH_RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// `wait` is back at the node soon, so it pauses less.
+const WAIT_RECONNECT_MAX: Duration = Duration::from_secs(5);
+/// `wait` asks the node for at most this long at a time, and tells the node it
+/// is still here between asks, so a long wait shows as active in `who`.
+const WAIT_SEGMENT: Duration = Duration::from_secs(120);
+/// A connection that held this long was a good one: the next pause starts over.
+const STEADY: Duration = Duration::from_secs(10);
+
+/// Pauses that double from [`RECONNECT_FIRST`] up to a limit.
+struct Backoff {
+    next: Duration,
+    max: Duration,
+}
+
+impl Backoff {
+    fn new(max: Duration) -> Backoff {
+        Backoff {
+            next: RECONNECT_FIRST,
+            max,
+        }
+    }
+
+    /// The pause to take now; the one after it is twice as long.
+    fn step(&mut self) -> Duration {
+        let pause = self.next;
+        self.next = (self.next * 2).min(self.max);
+        pause
+    }
+
+    fn reset(&mut self) {
+        self.next = RECONNECT_FIRST;
+    }
+}
+
+fn say_reconnecting() {
+    let _ = writeln!(std::io::stderr(), "beacon: reconnecting…");
+}
+
+/// Whether `e` is the node going away or going quiet, which `wait` and `watch`
+/// wait out.
+fn is_outage(e: &Error) -> bool {
+    matches!(e, Error::Unreachable(_) | Error::Interrupted(_))
+}
+
+/// Blocks until a post worth waking for arrives and prints it, or `timeout`
+/// seconds pass (exit 6). The node being unreachable *when it starts* is exit
+/// 3; once it has answered, a node that goes away is waited for until the
+/// timeout. Nothing is marked read.
+async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<(), Error> {
+    let handle = ctx.handle()?.to_string();
+    ctx.announce().await?;
+    let deadline = Instant::now() + Duration::from_secs(args.timeout);
+    let mut pause = Backoff::new(WAIT_RECONNECT_MAX);
+    let mut away = false;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let segment = left.min(WAIT_SEGMENT);
+        let asked_at = Instant::now();
+        match ctx.client.wait(&handle, segment).await {
+            Ok(Some(page)) => {
+                // Judged by the time it is now, not by when this ran.
+                let clock = Clock::system();
+                return ctx.show(&page, || human::posts_text(&page.posts, &clock, true));
+            }
+            // "Nothing yet" after the whole time asked is a quiet board.
+            // Before it, the node is stopping.
+            Ok(None) if asked_at.elapsed() + Duration::from_millis(500) >= segment => {
+                away = false;
+                pause.reset();
+                if Instant::now() < deadline {
+                    // Still here, in case the board is quiet for long.
+                    let _ = ctx.beat(&handle, None).await;
+                }
+            }
+            Ok(None) => {
+                if !away {
+                    say_reconnecting();
+                }
+                away = true;
+                tokio::time::sleep(pause.step().min(left)).await;
+            }
+            Err(e) if is_outage(&e) => {
+                if !away {
+                    say_reconnecting();
+                }
+                away = true;
+                tokio::time::sleep(pause.step().min(left)).await;
+            }
+            Err(e) => return Err(e),
+        }
+        if Instant::now() >= deadline {
+            let _ = writeln!(std::io::stderr(), "no new posts in {}s", args.timeout);
+            return Err(Error::Timeout);
+        }
+    }
+}
+
+/// Prints a line for each post worth waking for, as it arrives, until stopped.
+/// A node that restarts is reconnected to (pausing 1 s, doubling up to 30 s),
+/// and what was stored while the connection was down is printed on the way
+/// back: no post is lost, none is printed twice.
+async fn watch(ctx: &Ctx) -> Result<(), Error> {
+    let handle = ctx.handle()?.to_string();
+    // The node not being there at all is exit 3, as for `wait`.
+    ctx.announce().await?;
+    let mut pause = Backoff::new(WATCH_RECONNECT_MAX);
+    // The newest post shown, by the node's own arrival numbering.
+    let mut shown: Option<i64> = None;
+    loop {
+        let connected_at = Instant::now();
+        match watch_once(ctx, &handle, &mut shown).await {
+            Err(e) if !is_outage(&e) => return Err(e),
+            _ => {}
+        }
+        if connected_at.elapsed() >= STEADY {
+            pause.reset();
+        }
+        say_reconnecting();
+        tokio::time::sleep(pause.step()).await;
+    }
+}
+
+/// One connection's worth of `watch`; returns, with an error, when it ends.
+async fn watch_once(ctx: &Ctx, handle: &str, shown: &mut Option<i64>) -> Result<(), Error> {
+    // Where "new" starts: what `watch` has shown, or the node's newest arrival
+    // now. (A node that was reset numbers its arrivals from the start again.)
+    let head = ctx.client.arrival_head().await?;
+    let mark = match *shown {
+        Some(mark) if mark <= head => mark,
+        _ => head,
+    };
+    *shown = Some(mark);
+    // Connect first, then look back: whatever is stored from the connection on
+    // is streamed, and what came in between is read from the store.
+    let mut events = ctx.client.open_stream(Some(handle), true).await?;
+    let unread = ctx.client.unread(handle, Some(500), false).await?;
+    let mut missed: Vec<PostJson> = unread
+        .posts
+        .into_iter()
+        .filter(|p| p.arrival > mark)
+        .collect();
+    missed.sort_by_key(|p| p.arrival);
+    for post in &missed {
+        show_watched(ctx, post, shown)?;
+    }
+    while let Some(event) = events.next().await {
+        if let StreamEvent::Post(post) = event? {
+            if shown.is_none_or(|at| post.arrival > at) {
+                show_watched(ctx, &post, shown)?;
+            }
+        }
+    }
+    Err(Error::Interrupted("the stream ended".to_string()))
+}
+
+/// Prints one watched post (a line, or a JSON object) and counts it as shown.
+fn show_watched(ctx: &Ctx, post: &PostJson, shown: &mut Option<i64>) -> Result<(), Error> {
+    if ctx.json {
+        let line = serde_json::to_string(post)
+            .map_err(|e| Error::Internal(anyhow!("cannot encode the post: {e}")))?;
+        print_line(&line)?;
+    } else {
+        print_line(&human::watch_line(post, &ctx.clock))?;
+    }
+    *shown = Some(post.arrival);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------- skill
+
+/// The skill as it was when this was built.
+const SKILL: &str = include_str!("../../skills/beacon/SKILL.md");
+
+fn skill(action: SkillAction) -> Result<(), Error> {
+    match action {
+        SkillAction::Show => print_text(SKILL),
+        // Copying files into the user's home is the host's business; in here
+        // there is no home to copy to. The wrapper does it.
+        SkillAction::Install { .. } => Err(Error::Usage(
+            "run ./beacon skill install on the host".to_string(),
+        )),
+    }
 }

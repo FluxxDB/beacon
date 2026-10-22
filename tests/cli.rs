@@ -8,10 +8,10 @@ use std::time::Duration;
 use assert_cmd::Command;
 use beacon::api::{
     AttachmentJson, ChannelJson, ChannelsJson, Delivery, NewPostRequest, PeerJson, PostCreated,
-    PostJson, PostsResponse, StatusJson, WhoRequest,
+    PostJson, PostsResponse, PresenceJson, StatusJson, StreamEvent, WhoRequest,
 };
 use beacon::cli::human::{self, Clock};
-use beacon::client::Client;
+use beacon::client::{Client, SseMessage, SseParser};
 use beacon::error::Error;
 use beacon::model::{parse_mentions, Attachment, AuthorKind, Event, EventKind, NewPost};
 use beacon::timefmt::iso8601;
@@ -27,6 +27,8 @@ struct Out {
     code: i32,
     stdout: String,
     stderr: String,
+    /// stdout as bytes, for commands that print files.
+    raw: Vec<u8>,
 }
 
 impl Out {
@@ -82,38 +84,84 @@ impl Run {
         self
     }
 
+    fn stdin_bytes(mut self, bytes: Vec<u8>) -> Run {
+        self.stdin = bytes;
+        self
+    }
+
+    /// The command line: the environment every run gets, then this run's own.
+    fn command(&self) -> std::process::Command {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_beacon"));
+        for var in [
+            "BEACON_AGENT",
+            "BEACON_CLIENT",
+            "BEACON_HUMAN",
+            "BEACON_NODE",
+            "RUST_LOG",
+        ] {
+            cmd.env_remove(var);
+        }
+        cmd.env("BEACON_SERVER", &self.server)
+            .env("BEACON_SECRET", &self.secret)
+            .env("TZ", "America/New_York")
+            .args(&self.args);
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
+        cmd
+    }
+
     /// Runs the binary and waits for it. The node keeps serving meanwhile, so
     /// the blocking wait happens off the async workers.
     async fn run(self) -> Out {
         tokio::task::spawn_blocking(move || {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_beacon"));
-            for var in [
-                "BEACON_AGENT",
-                "BEACON_CLIENT",
-                "BEACON_HUMAN",
-                "BEACON_NODE",
-                "RUST_LOG",
-            ] {
-                cmd.env_remove(var);
-            }
-            cmd.env("BEACON_SERVER", &self.server)
-                .env("BEACON_SECRET", &self.secret)
-                .env("TZ", "America/New_York")
-                .args(&self.args)
-                .write_stdin(self.stdin)
-                .timeout(Duration::from_secs(30));
-            for (key, value) in &self.env {
-                cmd.env(key, value);
-            }
+            let mut cmd = Command::from_std(self.command());
+            cmd.write_stdin(self.stdin).timeout(Duration::from_secs(30));
             let output = cmd.output().expect("run beacon");
             Out {
                 code: output.status.code().expect("exit code"),
-                stdout: String::from_utf8(output.stdout).expect("utf-8 stdout"),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                 stderr: String::from_utf8(output.stderr).expect("utf-8 stderr"),
+                raw: output.stdout,
             }
         })
         .await
         .unwrap()
+    }
+
+    /// Starts the binary and leaves it running: for `wait` and `watch`, whose
+    /// output arrives while the test posts. Dropping the child kills it.
+    fn spawn(self) -> Child {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        let mut cmd = tokio::process::Command::from(self.command());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().expect("start beacon");
+        let stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+        let stderr = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mut pipe = child.stderr.take().unwrap();
+        let sink = stderr.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok(n) = pipe.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                sink.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+        Child {
+            child,
+            stdout,
+            stderr,
+            args: self.args,
+        }
     }
 
     /// Runs it and insists on exit 0.
@@ -122,6 +170,63 @@ impl Run {
         let out = self.run().await;
         assert_eq!(out.code, 0, "beacon {args:?}: {out:?}");
         out
+    }
+}
+
+/// A run of the binary that is still going (see [`Run::spawn`]). Every wait on
+/// it has a limit, so a hang fails the test instead of blocking it.
+struct Child {
+    child: tokio::process::Child,
+    stdout: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    stderr: std::sync::Arc<std::sync::Mutex<String>>,
+    args: Vec<String>,
+}
+
+impl Child {
+    /// The next line of stdout, within `limit`.
+    async fn line_within(&mut self, limit: Duration) -> String {
+        match tokio::time::timeout(limit, self.stdout.next_line()).await {
+            Ok(Ok(Some(line))) => line,
+            other => panic!(
+                "beacon {:?}: no line of stdout within {limit:?} ({other:?}); stderr: {:?}",
+                self.args,
+                self.stderr()
+            ),
+        }
+    }
+
+    async fn line(&mut self) -> String {
+        self.line_within(Duration::from_secs(10)).await
+    }
+
+    /// Everything the child wrote to stderr so far.
+    fn stderr(&self) -> String {
+        self.stderr.lock().unwrap().clone()
+    }
+
+    /// Waits for the child to end on its own, within `limit`; returns its exit
+    /// code and what is left on stdout.
+    async fn finish_within(&mut self, limit: Duration) -> (i32, String) {
+        let status = match tokio::time::timeout(limit, self.child.wait()).await {
+            Ok(status) => status.expect("wait for beacon"),
+            Err(_) => panic!(
+                "beacon {:?} did not exit within {limit:?}; stderr: {:?}",
+                self.args,
+                self.stderr()
+            ),
+        };
+        let mut rest = String::new();
+        while let Ok(Some(line)) = self.stdout.next_line().await {
+            rest.push_str(&line);
+            rest.push('\n');
+        }
+        // Let the stderr reader catch up with the closed pipe.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (status.code().expect("exit code"), rest)
+    }
+
+    async fn kill(mut self) {
+        let _ = self.child.kill().await;
     }
 }
 
@@ -1571,9 +1676,10 @@ async fn a_post_that_dies_in_flight_is_not_retried() {
     };
     let err = client.post("beacon", &req).await.unwrap_err();
     assert!(
-        matches!(&err, Error::Unreachable(m) if m.contains("may have been")),
+        matches!(&err, Error::Interrupted(m) if m.contains("may have been stored")),
         "{err}"
     );
+    assert_eq!(err.exit_code(), 3);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(seen.load(Ordering::SeqCst), 1);
 }
@@ -1720,13 +1826,33 @@ fn an_attachment_line_names_the_command_that_fetches_it() {
         ("my report.txt", "'my report.txt'"),
         ("it's.txt", r"'it'\''s.txt'"),
         ("$HOME.txt", "'$HOME.txt'"),
-        ("a-b_c.1/x", "a-b_c.1/x"),
+        ("a-b_c.1", "a-b_c.1"),
     ] {
         p.attachment.as_mut().unwrap().name = name.into();
         let lines = human::post_lines(&p, &c);
         let want =
             format!("          attachment: {name} (12 KB)  →  ./beacon get Q8ZK7C2M -o {quoted}");
         assert_eq!(lines[2], want);
+    }
+    // Peers choose the name. What is shown, and suggested for -o, is only its
+    // last path component, and a name that starts with a dash cannot be read
+    // as an option.
+    for (name, shown, command) in [
+        ("../../etc/passwd", "passwd", "passwd"),
+        (r"C:\Users\me\report.txt", "report.txt", "report.txt"),
+        ("a/b\\c.txt", "c.txt", "c.txt"),
+        ("..", "attachment", "attachment"),
+        (".", "attachment", "attachment"),
+        ("dir/", "attachment", "attachment"),
+        ("-rf.txt", "-rf.txt", "./-rf.txt"),
+        ("sub/-x y.txt", "-x y.txt", "./'-x y.txt'"),
+        ("evil\u{1b}[2J.txt", "evil_[2J.txt", "'evil_[2J.txt'"),
+    ] {
+        p.attachment.as_mut().unwrap().name = name.into();
+        let lines = human::post_lines(&p, &c);
+        let want =
+            format!("          attachment: {shown} (12 KB)  →  ./beacon get Q8ZK7C2M -o {command}");
+        assert_eq!(lines[2], want, "{name:?}");
     }
     // An attachment without text has no body line.
     p.body = String::new();
@@ -2078,4 +2204,1729 @@ fn peers_and_status_lines() {
     );
     let many = human::status_text(&status(peers.to_vec()), now);
     assert!(many.starts_with("pc · beacon 0.1.0 · 5 peers\n"), "{many}");
+}
+
+// ------------------------------------------ attach, get, who, join, wait, watch
+//
+// The commands that move files, show who is here and wake an idle agent. The
+// ones that block (`wait`, `watch`) run as children of the test: every read
+// from them has a limit, and a child that outlives its test is killed.
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Bytes that are not text: every byte value, line breaks included.
+fn binary_blob(len: usize) -> Vec<u8> {
+    (0..=255u8).cycle().take(len).collect()
+}
+
+/// How many tasks are listening for arrivals on `node` (streams, waits, sync).
+fn listeners(node: &TestNode) -> usize {
+    node.state().arrivals.receiver_count()
+}
+
+/// Waits (up to 5 s) until a stream or a wait has started listening on `node`,
+/// that is, until there are more listeners than `before`.
+async fn until_listening(node: &TestNode, before: usize) {
+    for _ in 0..100 {
+        if listeners(node) > before {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("nothing started listening for arrivals within 5 s");
+}
+
+async fn join_channel(node: &TestNode, handle: &str, channel: &str) {
+    beacon(node, &["join", channel, "--as", handle]).ok().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_and_get_roundtrip() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let bytes = binary_blob(300_000);
+
+    let out = beacon(
+        &node,
+        &[
+            "attach",
+            "beacon",
+            "-",
+            "--name",
+            "data.bin",
+            "--tag",
+            "done",
+            "--as",
+            "pc-configs",
+            "--json",
+            "-rf is not a flag",
+        ],
+    )
+    .stdin_bytes(bytes.clone())
+    .ok()
+    .await;
+    let created = out.json();
+    assert_eq!(created["v"], 1);
+    let post = &created["post"];
+    assert_eq!(post["body"], "-rf is not a flag");
+    assert_eq!(post["tags"], json!(["done"]));
+    assert_eq!(post["author"], "pc-configs");
+    assert_eq!(post["attachment"]["name"], "data.bin");
+    assert_eq!(post["attachment"]["size"], 300_000);
+    assert_eq!(post["attachment"]["sha256"], sha256_hex(&bytes));
+    assert_eq!(post["attachment"]["available"], true);
+    let id = post["short_id"].as_str().unwrap().to_string();
+
+    // Without -o the bytes go to stdout, untouched.
+    let got = beacon(&node, &["get", &id]).ok().await;
+    assert_eq!(got.raw, bytes);
+    assert_eq!(got.stderr, "");
+    // The full id works too, and so does `-o -`.
+    let full = post["id"].as_str().unwrap();
+    assert_eq!(beacon(&node, &["get", full]).ok().await.raw, bytes);
+    assert_eq!(
+        beacon(&node, &["get", &id, "-o", "-"]).ok().await.raw,
+        bytes
+    );
+
+    // `read` names the command that fetches it.
+    let read = beacon(&node, &["read", "beacon"]).ok().await;
+    assert!(
+        read.stdout.contains(&format!(
+            "attachment: data.bin (293 KB)  →  ./beacon get {id} -o data.bin"
+        )),
+        "{}",
+        read.stdout
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_says_what_it_posted() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test-report.txt");
+    std::fs::write(&path, vec![b'x'; 12_288]).unwrap();
+
+    // A path works as well as stdin; the name is the file's own.
+    let out = beacon(
+        &node,
+        &[
+            "attach",
+            "#beacon",
+            path.to_str().unwrap(),
+            "--as",
+            "pc-configs",
+        ],
+    )
+    .ok()
+    .await;
+    let text = out.text();
+    assert!(
+        text.starts_with("posted ")
+            && text.ends_with(" to #beacon · attached test-report.txt (12 KB) · no peers yet"),
+        "{text}"
+    );
+    assert_eq!(out.stderr, "");
+    let posts = api_posts(&node, "beacon").await;
+    assert_eq!(posts[0]["body"], "");
+    assert_eq!(posts[0]["attachment"]["name"], "test-report.txt");
+    assert_eq!(posts[0]["attachment"]["size"], 12_288);
+
+    // --name wins over the file's name; an empty file is a file.
+    let empty = dir.path().join("empty");
+    std::fs::write(&empty, b"").unwrap();
+    beacon(
+        &node,
+        &[
+            "attach",
+            "beacon",
+            empty.to_str().unwrap(),
+            "--name",
+            "nothing here.txt",
+            "--as",
+            "pc-configs",
+        ],
+    )
+    .ok()
+    .await;
+    let posts = api_posts(&node, "beacon").await;
+    assert_eq!(posts[1]["attachment"]["name"], "nothing here.txt");
+    assert_eq!(posts[1]["attachment"]["size"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_names_with_quotes_and_unicode_survive() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    for name in ["résumé (final).pdf", "say \"cheese\".txt", "日本語.log"] {
+        let out = beacon(
+            &node,
+            &[
+                "attach",
+                "beacon",
+                "-",
+                "--name",
+                name,
+                "--as",
+                "pc-configs",
+                "--json",
+            ],
+        )
+        .stdin("x")
+        .ok()
+        .await;
+        assert_eq!(out.json()["post"]["attachment"]["name"], name);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_usage_errors() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let missing = dir.path().join("missing.txt");
+
+    // `-` reads stdin, which has no name of its own.
+    let out = beacon(&node, &["attach", "beacon", "-", "--as", "pc-configs"])
+        .stdin("data")
+        .run()
+        .await;
+    assert_eq!(out.code, 1, "{out:?}");
+    assert!(out.stderr.contains("--name"), "{}", out.stderr);
+    // No such file is exit 2; a directory is not a file.
+    let out = beacon(
+        &node,
+        &[
+            "attach",
+            "beacon",
+            missing.to_str().unwrap(),
+            "--as",
+            "pc-configs",
+        ],
+    )
+    .run()
+    .await;
+    assert_eq!(out.code, 2, "{out:?}");
+    assert!(out.stderr.contains("missing.txt"), "{}", out.stderr);
+    let out = beacon(
+        &node,
+        &[
+            "attach",
+            "beacon",
+            sub.to_str().unwrap(),
+            "--as",
+            "pc-configs",
+        ],
+    )
+    .run()
+    .await;
+    assert_eq!(out.code, 1, "{out:?}");
+    // A handle is needed, and the channel has to exist.
+    let out = beacon(&node, &["attach", "beacon", "-", "--name", "a.txt"])
+        .stdin("data")
+        .run()
+        .await;
+    assert_eq!(out.code, 1, "{out:?}");
+    assert_eq!(
+        out.stderr.trim_end(),
+        "beacon: set BEACON_AGENT or pass --as HANDLE"
+    );
+    let out = beacon(
+        &node,
+        &[
+            "attach",
+            "nosuch",
+            "-",
+            "--name",
+            "a.txt",
+            "--as",
+            "pc-configs",
+        ],
+    )
+    .stdin("data")
+    .run()
+    .await;
+    assert_eq!(out.code, 2, "{out:?}");
+    assert!(out.stdout.is_empty());
+    // Nothing was stored by any of that.
+    assert!(api_posts(&node, "beacon").await.is_empty());
+}
+
+/// An upload the node refuses before it has read it all (here: too big) is
+/// reported in the node's words, not as a broken connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_over_the_limit_is_refused_in_the_nodes_words() {
+    let node = spawn_node_with("pc", &[], |cfg| cfg.max_attachment_mb = 1).await;
+    new_channel(&node, "beacon").await;
+    let out = beacon(
+        &node,
+        &[
+            "attach",
+            "beacon",
+            "-",
+            "--name",
+            "big.bin",
+            "--as",
+            "pc-configs",
+        ],
+    )
+    .stdin_bytes(binary_blob(4 * 1024 * 1024))
+    .run()
+    .await;
+    assert_eq!(out.code, 1, "{out:?}");
+    assert!(out.stderr.starts_with("beacon: "), "{}", out.stderr);
+    assert!(out.stderr.contains("1 MB"), "{}", out.stderr);
+    assert!(!out.stderr.contains("docker compose"), "{}", out.stderr);
+    assert!(api_posts(&node, "beacon").await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_unavailable_exits_2() {
+    let node = spawn_node("pc", &[]).await;
+    seed(
+        &node,
+        vec![
+            channel_event(1, "beacon", None),
+            // The post is here, the file is still on the Mac.
+            Remote {
+                attachment: Some(("test-report.txt", 12_288)),
+                ..remote_post(2, "Q8ZK7C2M", "beacon", "report attached")
+            }
+            .event(),
+            remote_post(3, "7C2MF4T3", "beacon", "no file").event(),
+        ],
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("report.txt");
+
+    for args in [
+        &["get", "Q8ZK7C2M"][..],
+        &["get", "Q8ZK7C2M", "-o", target.to_str().unwrap()],
+    ] {
+        let out = beacon(&node, args).run().await;
+        assert_eq!(out.code, 2, "{args:?}: {out:?}");
+        assert!(out.raw.is_empty());
+        assert_eq!(
+            out.stderr.trim_end(),
+            "beacon: attachment not synced yet; try again when a peer that has it is online"
+        );
+    }
+    assert!(
+        !target.exists(),
+        "no file is made for bytes that are not here"
+    );
+
+    // A post without an attachment, and a post that does not exist.
+    let out = beacon(&node, &["get", "7C2MF4T3"]).run().await;
+    assert_eq!(out.code, 2, "{out:?}");
+    assert!(out.stderr.contains("has no attachment"), "{}", out.stderr);
+    assert!(out.raw.is_empty());
+    let out = beacon(&node, &["get", "ZZZZZZZZ"]).run().await;
+    assert_eq!(out.code, 2, "{out:?}");
+}
+
+/// The node says the file is here but the blob is gone (or a peer's post
+/// names a file only some other node holds): the same answer, exit 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_with_the_file_gone_exits_2() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let created = beacon(
+        &node,
+        &[
+            "attach",
+            "beacon",
+            "-",
+            "--name",
+            "a.txt",
+            "--as",
+            "pc-configs",
+            "--json",
+        ],
+    )
+    .stdin("hello")
+    .ok()
+    .await
+    .json();
+    let sha = created["post"]["attachment"]["sha256"].as_str().unwrap();
+    std::fs::remove_file(node.dir.path().join("files").join(sha)).unwrap();
+    let id = created["post"]["short_id"].as_str().unwrap();
+    let out = beacon(&node, &["get", id]).run().await;
+    assert_eq!(out.code, 2, "{out:?}");
+    assert!(out.stderr.contains("not synced yet"), "{}", out.stderr);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_to_a_file_names_it_safely() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let bytes = binary_blob(70_000);
+    let created = beacon(
+        &node,
+        &[
+            "attach",
+            "beacon",
+            "-",
+            "--name",
+            "data.bin",
+            "--as",
+            "pc-configs",
+            "--json",
+        ],
+    )
+    .stdin_bytes(bytes.clone())
+    .ok()
+    .await
+    .json();
+    let sha = created["post"]["attachment"]["sha256"].as_str().unwrap();
+    let id = created["post"]["short_id"].as_str().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    // To a path: exactly there, and the answer says what was saved.
+    let target = dir.path().join("copy.bin");
+    let out = beacon(&node, &["get", id, "-o", target.to_str().unwrap()])
+        .ok()
+        .await;
+    assert_eq!(std::fs::read(&target).unwrap(), bytes);
+    assert_eq!(
+        out.text(),
+        format!("saved data.bin (68 KB) to {}", target.display())
+    );
+    // --json says the same in JSON.
+    let again = beacon(
+        &node,
+        &["get", id, "-o", target.to_str().unwrap(), "--json"],
+    )
+    .ok()
+    .await
+    .json();
+    assert_eq!(again["v"], 1);
+    assert_eq!(again["ok"], true);
+    assert_eq!(again["name"], "data.bin");
+    assert_eq!(again["size"], 70_000);
+    assert_eq!(again["path"], target.to_str().unwrap());
+    // Nothing is left over from the download.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(leftovers, ["copy.bin"]);
+
+    // To a directory: under the attachment's own name.
+    let into = dir.path().join("into");
+    std::fs::create_dir(&into).unwrap();
+    beacon(&node, &["get", id, "-o", into.to_str().unwrap()])
+        .ok()
+        .await;
+    assert_eq!(std::fs::read(into.join("data.bin")).unwrap(), bytes);
+
+    // A peer's post can name the file anything. Whatever it says, the file
+    // lands inside the directory.
+    for (seq, name, lands_as) in [
+        (10, "../../etc/passwd", "passwd"),
+        (11, r"..\..\evil.sh", "evil.sh"),
+        (12, "a/b\\c.txt", "c.txt"),
+        (13, "..", "attachment"),
+        (14, "dir/", "attachment"),
+    ] {
+        let mut event = remote_post(seq, &format!("PEER{seq:04}"), "beacon", "from afar").event();
+        if let EventKind::PostCreated(post) = &mut event.kind {
+            post.attachment = Some(Attachment {
+                sha256: sha.to_string(),
+                name: name.to_string(),
+                size: 70_000,
+            });
+        }
+        seed(&node, vec![event]).await;
+        let into = dir.path().join(format!("peer{seq}"));
+        std::fs::create_dir(&into).unwrap();
+        beacon(
+            &node,
+            &[
+                "get",
+                &format!("PEER{seq:04}"),
+                "-o",
+                into.to_str().unwrap(),
+            ],
+        )
+        .ok()
+        .await;
+        let names: Vec<_> = std::fs::read_dir(&into)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, [lands_as], "{name:?}");
+    }
+    assert!(!dir.path().join("passwd").exists());
+    assert!(!dir.path().join("evil.sh").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn who_lists_heartbeat_with_status() {
+    let node = spawn_node("pc", &[]).await;
+    let out = beacon(
+        &node,
+        &[
+            "who",
+            "--here",
+            "scaffolding beacon crate",
+            "--as",
+            "pc-configs",
+            "--client",
+            "claude-code",
+        ],
+    )
+    .ok()
+    .await;
+    // The brief's template: {dot} {handle:<16} {client} · {node:<6} {age:>4}   {status}
+    let want = format!(
+        "● {:<16} {} · {:<6} {:>4}   {}",
+        "pc-configs", "claude-code", "pc", "now", "scaffolding beacon crate"
+    );
+    assert_eq!(out.text(), want);
+
+    // Anyone can look, with no handle; a different client lines up.
+    beacon(
+        &node,
+        &[
+            "who",
+            "--here",
+            "arm64 build",
+            "--as",
+            "mac-juicebox",
+            "--client",
+            "codex",
+        ],
+    )
+    .ok()
+    .await;
+    let out = beacon(&node, &["who"]).ok().await;
+    assert_eq!(out.stderr, "");
+    let lines: Vec<&str> = out.text().lines().collect();
+    assert_eq!(lines.len(), 2, "{}", out.stdout);
+    let status_column = |line: &str, status: &str| {
+        let at = line
+            .find(status)
+            .unwrap_or_else(|| panic!("{line}: {status}"));
+        human::display_width(&line[..at])
+    };
+    let rows = [
+        lines.iter().find(|l| l.contains("pc-configs")).unwrap(),
+        lines.iter().find(|l| l.contains("mac-juicebox")).unwrap(),
+    ];
+    assert_eq!(
+        status_column(rows[0], "scaffolding"),
+        status_column(rows[1], "arm64 build"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        rows[1].starts_with(&format!("● {:<16} codex · pc ", "mac-juicebox")),
+        "{}",
+        rows[1]
+    );
+
+    // A later heartbeat without a status leaves the status alone.
+    beacon(
+        &node,
+        &["channels", "--as", "pc-configs", "--client", "claude-code"],
+    )
+    .ok()
+    .await;
+    let again = beacon(&node, &["who"]).ok().await;
+    assert!(
+        again.stdout.contains("scaffolding beacon crate"),
+        "{}",
+        again.stdout
+    );
+
+    // JSON is the node's own answer.
+    let json = beacon(&node, &["who", "--json"]).ok().await.json();
+    assert_eq!(json["v"], 1);
+    let agents = json["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 2);
+    let me = agents.iter().find(|a| a["handle"] == "pc-configs").unwrap();
+    assert_eq!(me["status"], "scaffolding beacon crate");
+    assert_eq!(me["client"], "claude-code");
+    assert_eq!(me["node"], "pc");
+    assert_eq!(me["kind"], "agent");
+    assert_eq!(me["active"], true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn who_here_needs_a_handle_and_a_valid_status() {
+    let node = spawn_node("pc", &[]).await;
+    let out = beacon(&node, &["who", "--here", "working"]).run().await;
+    assert_eq!(out.code, 1, "{out:?}");
+    assert_eq!(
+        out.stderr.trim_end(),
+        "beacon: set BEACON_AGENT or pass --as HANDLE"
+    );
+    // A status the node refuses is a usage error, not a crash.
+    let long = "x".repeat(300);
+    let out = beacon(&node, &["who", "--here", &long, "--as", "pc-configs"])
+        .run()
+        .await;
+    assert_eq!(out.code, 1, "{out:?}");
+    // No agents yet: a line that says so.
+    let out = beacon(&node, &["who"]).ok().await;
+    assert_eq!(out.text(), "nobody has been seen lately");
+    // --here without text is just "I am here".
+    let out = beacon(&node, &["who", "--here", "--as", "pc-configs"])
+        .ok()
+        .await;
+    assert!(out.text().starts_with("● pc-configs "), "{}", out.stdout);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn join_and_leave() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    new_channel(&node, "vllm").await;
+
+    let out = beacon(&node, &["join", "#beacon", "--as", "pc-vllm"])
+        .ok()
+        .await;
+    assert_eq!(
+        out.text(),
+        "joined #beacon · wait and watch will wake you for posts here"
+    );
+    // Again: nothing changes, nothing is wrong.
+    beacon(&node, &["join", "beacon", "--as", "pc-vllm"])
+        .ok()
+        .await;
+    let out = beacon(&node, &["join", "vllm", "--as", "pc-vllm", "--json"])
+        .ok()
+        .await;
+    assert_eq!(
+        out.json(),
+        json!({ "v": 1, "ok": true, "channel": "vllm", "joined": ["beacon", "vllm"] })
+    );
+    // Joins are per handle.
+    let other = beacon(&node, &["join", "beacon", "--as", "pc-configs", "--json"])
+        .ok()
+        .await
+        .json();
+    assert_eq!(other["joined"], json!(["beacon"]));
+
+    let out = beacon(&node, &["leave", "#beacon", "--as", "pc-vllm"])
+        .ok()
+        .await;
+    assert_eq!(
+        out.text(),
+        "left #beacon · mentions and announcements still wake you"
+    );
+    let out = beacon(&node, &["leave", "beacon", "--as", "pc-vllm", "--json"])
+        .ok()
+        .await;
+    assert_eq!(
+        out.json(),
+        json!({ "v": 1, "ok": true, "channel": "beacon", "joined": ["vllm"] })
+    );
+
+    // The channel has to exist, whichever way; the handle has to be known.
+    for verb in ["join", "leave"] {
+        let out = beacon(&node, &[verb, "nosuch", "--as", "pc-vllm"])
+            .run()
+            .await;
+        assert_eq!(out.code, 2, "{verb}: {out:?}");
+        assert!(out.stderr.contains("no channel #nosuch"), "{}", out.stderr);
+        let out = beacon(&node, &[verb, "beacon"]).run().await;
+        assert_eq!(out.code, 1, "{verb}: {out:?}");
+        let out = beacon(&node, &[verb, "../x", "--as", "pc-vllm"])
+            .run()
+            .await;
+        assert_eq!(out.code, 1, "{verb}: {out:?}");
+    }
+
+    // A channel that was deleted can still be left.
+    beacon(&node, &["channel", "delete", "vllm"]).ok().await;
+    let out = beacon(&node, &["leave", "vllm", "--as", "pc-vllm", "--json"])
+        .ok()
+        .await;
+    assert_eq!(out.json()["joined"], json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn join_then_wait_wakes() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    join_channel(&node, "pc-vllm", "beacon").await;
+
+    let before = listeners(&node);
+    let mut wait = beacon(&node, &["wait", "--timeout", "10", "--as", "pc-vllm"]).spawn();
+    until_listening(&node, before).await;
+    post_as(
+        &node,
+        "pc-configs",
+        "beacon",
+        "pushed main, arm64 is all yours",
+    )
+    .await;
+
+    let (code, stdout) = wait.finish_within(Duration::from_secs(2)).await;
+    assert_eq!(code, 0, "stderr: {}", wait.stderr());
+    assert!(
+        stdout.contains("pc-configs  agent · other · pc"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("pushed main, arm64 is all yours"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("# beacon"),
+        "the channel is named: {stdout}"
+    );
+    assert_eq!(wait.stderr(), "");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_timeout_exits_6() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    join_channel(&node, "pc-vllm", "beacon").await;
+    let started = std::time::Instant::now();
+    let out = beacon(&node, &["wait", "--timeout", "1", "--as", "pc-vllm"])
+        .run()
+        .await;
+    assert_eq!(out.code, 6, "{out:?}");
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr.trim_end(), "no new posts in 1s");
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(900) && took < Duration::from_secs(5),
+        "{took:?}"
+    );
+    // --json prints nothing either.
+    let out = beacon(
+        &node,
+        &["wait", "--timeout", "0", "--json", "--as", "pc-vllm"],
+    )
+    .run()
+    .await;
+    assert_eq!((out.code, out.stdout.as_str()), (6, ""));
+}
+
+/// `wait` looks before it waits, so a post that came in since the last read is
+/// never missed; and it only looks: the post is still unread afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_returns_at_once_and_never_advances_cursors() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    join_channel(&node, "pc-vllm", "beacon").await;
+    post_as(&node, "pc-configs", "beacon", "already here").await;
+
+    for _ in 0..2 {
+        let started = std::time::Instant::now();
+        let out = beacon(&node, &["wait", "--timeout", "30", "--as", "pc-vllm"])
+            .ok()
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(out.stdout.contains("already here"), "{}", out.stdout);
+    }
+    let unread = beacon(&node, &["read", "--unread", "--as", "pc-vllm"])
+        .ok()
+        .await;
+    assert!(unread.stdout.contains("already here"), "{}", unread.stdout);
+    // Now it is read: waiting finds nothing.
+    let out = beacon(&node, &["wait", "--timeout", "1", "--as", "pc-vllm"])
+        .run()
+        .await;
+    assert_eq!(out.code, 6, "{out:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_wakes_for_mentions_and_announcements_not_for_chatter() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    new_channel(&node, "vllm").await;
+    // pc-vllm has not joined anything; its own posts never wake it.
+    post_as(&node, "pc-configs", "beacon", "just chatter").await;
+    post_as(&node, "pc-vllm", "vllm", "talking to myself @pc-vllm").await;
+    let out = beacon(&node, &["wait", "--timeout", "1", "--as", "pc-vllm"])
+        .run()
+        .await;
+    assert_eq!(out.code, 6, "{out:?}");
+
+    let before = listeners(&node);
+    let mut wait = beacon(&node, &["wait", "--timeout", "10", "--as", "pc-vllm"]).spawn();
+    until_listening(&node, before).await;
+    post_as(
+        &node,
+        "pc-configs",
+        "vllm",
+        "@pc-vllm can you look at this?",
+    )
+    .await;
+    let (code, stdout) = wait.finish_within(Duration::from_secs(2)).await;
+    assert_eq!(code, 0);
+    assert!(stdout.contains("can you look at this?"), "{stdout}");
+    assert!(!stdout.contains("just chatter"), "{stdout}");
+
+    // Dang's post wakes it whatever the channel; that one is read first.
+    beacon(&node, &["read", "--unread", "--as", "pc-vllm"])
+        .ok()
+        .await;
+    let before = listeners(&node);
+    let mut wait = beacon(&node, &["wait", "--timeout", "10", "--as", "pc-vllm"]).spawn();
+    until_listening(&node, before).await;
+    beacon(&node, &["post", "beacon", "freeze main", "--human"])
+        .ok()
+        .await;
+    let (code, stdout) = wait.finish_within(Duration::from_secs(2)).await;
+    assert_eq!(code, 0);
+    assert!(stdout.contains("freeze main"), "{stdout}");
+    assert!(stdout.contains("announcement"), "{stdout}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_json_is_the_unread_page() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    join_channel(&node, "pc-vllm", "beacon").await;
+    post_as(&node, "pc-configs", "beacon", "one").await;
+    post_as(&node, "pc-configs", "beacon", "two").await;
+    let out = beacon(&node, &["wait", "--json", "--as", "pc-vllm"])
+        .ok()
+        .await;
+    assert_eq!(out.stdout.matches('\n').count(), 1, "one line of JSON");
+    let body = out.json();
+    assert_eq!(body["v"], 1);
+    let bodies: Vec<&str> = body["posts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(bodies, ["one", "two"]);
+    assert_eq!(body["remaining"], 0);
+    assert_eq!(body["posts"][0]["v"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_and_watch_need_a_handle_and_a_node() {
+    let node = spawn_node("pc", &[]).await;
+    for args in [
+        &["wait"][..],
+        &["watch"],
+        &["join", "general"],
+        &["leave", "general"],
+    ] {
+        let out = beacon(&node, args).run().await;
+        assert_eq!(out.code, 1, "{args:?}: {out:?}");
+        assert_eq!(
+            out.stderr.trim_end(),
+            "beacon: set BEACON_AGENT or pass --as HANDLE",
+            "{args:?}"
+        );
+    }
+    // With the node down, they say so at once (exit 3, with the hint).
+    let url = format!("http://127.0.0.1:{}", closed_port());
+    for args in [
+        &["wait", "--timeout", "30", "--as", "pc-vllm"][..],
+        &["watch", "--as", "pc-vllm"],
+        &["join", "general", "--as", "pc-vllm"],
+        &["who"],
+    ] {
+        let started = std::time::Instant::now();
+        let out = beacon(&node, args).server(&url).run().await;
+        assert_eq!(out.code, 3, "{args:?}: {out:?}");
+        assert_eq!(out.stdout, "");
+        assert!(
+            out.stderr.contains("docker compose up -d"),
+            "{}",
+            out.stderr
+        );
+        assert!(started.elapsed() < Duration::from_secs(5), "{args:?}");
+    }
+    // A bad secret is exit 4 here as everywhere.
+    let out = beacon(&node, &["wait", "--as", "pc-vllm"])
+        .secret("wrong")
+        .run()
+        .await;
+    assert_eq!(out.code, 4, "{out:?}");
+}
+
+/// A node that goes away and comes back while `wait` is blocked does not end
+/// the wait early or lose the wake-up.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_reconnects_when_the_node_restarts() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    join_channel(&node, "pc-vllm", "beacon").await;
+
+    let before = listeners(&node);
+    let mut wait = beacon(&node, &["wait", "--timeout", "30", "--as", "pc-vllm"]).spawn();
+    until_listening(&node, before).await;
+    let node = node.stop().await.restart().await;
+    post_as(&node, "pc-configs", "beacon", "back again").await;
+
+    let (code, stdout) = wait.finish_within(Duration::from_secs(10)).await;
+    assert_eq!(code, 0, "stderr: {}", wait.stderr());
+    assert!(stdout.contains("back again"), "{stdout}");
+}
+
+/// ...and if it stays away, the wait still ends at its own timeout with 6.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_gives_up_at_its_timeout_when_the_node_stays_away() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    join_channel(&node, "pc-vllm", "beacon").await;
+
+    let before = listeners(&node);
+    let mut wait = beacon(&node, &["wait", "--timeout", "3", "--as", "pc-vllm"]).spawn();
+    until_listening(&node, before).await;
+    let _gone = node.stop().await;
+    let (code, stdout) = wait.finish_within(Duration::from_secs(8)).await;
+    assert_eq!((code, stdout.as_str()), (6, ""));
+    let stderr = wait.stderr();
+    assert!(stderr.contains("beacon: reconnecting…"), "{stderr}");
+    assert!(
+        stderr.trim_end().ends_with("no new posts in 3s"),
+        "{stderr}"
+    );
+}
+
+/// The part of a `watch` line before the channel is a time: `6:07 pm`.
+fn assert_clock_time(time: &str) {
+    let (clock, suffix) = time.split_once(' ').unwrap_or_else(|| panic!("{time:?}"));
+    let (hour, minute) = clock.split_once(':').unwrap_or_else(|| panic!("{time:?}"));
+    assert!(matches!(suffix, "am" | "pm"), "{time:?}");
+    assert!((1..=12).contains(&hour.parse::<u32>().unwrap()), "{time:?}");
+    assert!(!hour.starts_with('0'), "{time:?}");
+    assert!(
+        minute.len() == 2 && minute.parse::<u32>().unwrap() < 60,
+        "{time:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_prints_lines() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    new_channel(&node, "vllm").await;
+    join_channel(&node, "pc-vllm", "beacon").await;
+
+    let before = listeners(&node);
+    let mut watch = beacon(&node, &["watch", "--as", "pc-vllm"]).spawn();
+    until_listening(&node, before).await;
+    post_as(&node, "pc-configs", "beacon", "first line\nsecond line").await;
+    // Not joined, no mention, not Dang: not for pc-vllm.
+    post_as(&node, "pc-configs", "vllm", "chatter elsewhere").await;
+    // Its own posts never wake it.
+    post_as(&node, "pc-vllm", "beacon", "my own post").await;
+    post_as(&node, "mac-juicebox", "vllm", "@pc-vllm over here").await;
+
+    let line = watch.line().await;
+    let (time, rest) = line.split_once(" #").expect(&line);
+    assert_clock_time(time);
+    assert_eq!(rest, "beacon pc-configs: first line");
+    let line = watch.line().await;
+    let (time, rest) = line.split_once(" #").expect(&line);
+    assert_clock_time(time);
+    assert_eq!(rest, "vllm mac-juicebox: @pc-vllm over here");
+    watch.kill().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_json_is_one_post_per_line() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let before = listeners(&node);
+    let mut watch = beacon(&node, &["watch", "--json", "--as", "pc-vllm"]).spawn();
+    until_listening(&node, before).await;
+    // Dang's posts wake every watcher.
+    beacon(&node, &["post", "beacon", "line one\nline two", "--human"])
+        .ok()
+        .await;
+    let line = watch.line().await;
+    let post: Value = serde_json::from_str(&line).expect(&line);
+    assert_eq!(post["v"], 1);
+    assert_eq!(post["body"], "line one\nline two");
+    assert_eq!(post["author"], "Dang");
+    assert_eq!(post["announcement"], true);
+    assert_eq!(post["channel"], "beacon");
+    assert!(post["id"].as_str().unwrap().len() == 26);
+    watch.kill().await;
+}
+
+/// When the node restarts, `watch` says so, reconnects, and prints the posts
+/// that came in while it was not listening, once each and in order.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_reconnects_and_catches_up() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    join_channel(&node, "pc-vllm", "beacon").await;
+
+    let before = listeners(&node);
+    let mut watch = beacon(&node, &["watch", "--as", "pc-vllm"]).spawn();
+    until_listening(&node, before).await;
+    post_as(&node, "pc-configs", "beacon", "before").await;
+    assert!(watch.line().await.ends_with("beacon pc-configs: before"));
+
+    let node = node.stop().await.restart().await;
+    // Written while the watcher is between connections.
+    post_as(&node, "pc-configs", "beacon", "during").await;
+    let line = watch.line_within(Duration::from_secs(15)).await;
+    assert!(line.ends_with("beacon pc-configs: during"), "{line}");
+    assert!(
+        watch.stderr().contains("beacon: reconnecting…"),
+        "{}",
+        watch.stderr()
+    );
+
+    // Live again.
+    post_as(&node, "pc-configs", "beacon", "after").await;
+    assert!(watch.line().await.ends_with("beacon pc-configs: after"));
+    // And nothing was printed twice.
+    let more = tokio::time::timeout(Duration::from_millis(700), watch.stdout.next_line()).await;
+    assert!(more.is_err(), "unexpected extra line: {more:?}");
+    watch.kill().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_starts_with_what_is_new_not_what_is_old() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    join_channel(&node, "pc-vllm", "beacon").await;
+    post_as(&node, "pc-configs", "beacon", "old news").await;
+
+    let before = listeners(&node);
+    let mut watch = beacon(&node, &["watch", "--as", "pc-vllm"]).spawn();
+    until_listening(&node, before).await;
+    post_as(&node, "pc-configs", "beacon", "new news").await;
+    assert!(watch.line().await.ends_with("beacon pc-configs: new news"));
+    watch.kill().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn skill_show_prints_the_embedded_skill() {
+    let node = spawn_node("pc", &[]).await;
+    let out = beacon(&node, &["skill", "show"]).ok().await;
+    assert_eq!(out.stdout, include_str!("../skills/beacon/SKILL.md"));
+    assert!(
+        out.stdout.starts_with("---\nname: beacon\n"),
+        "{}",
+        out.stdout
+    );
+    // It needs no node and no handle.
+    let url = format!("http://127.0.0.1:{}", closed_port());
+    let out = beacon(&node, &["skill", "show"]).server(&url).ok().await;
+    assert!(!out.stdout.is_empty());
+
+    // Installing is the host's job (the wrapper's), not the container's.
+    for args in [&["skill", "install"][..], &["skill", "install", "claude"]] {
+        let out = beacon(&node, args).run().await;
+        assert_eq!(out.code, 1, "{args:?}: {out:?}");
+        assert_eq!(out.stdout, "");
+        assert_eq!(
+            out.stderr.trim_end(),
+            "beacon: run ./beacon skill install on the host"
+        );
+    }
+    let out = beacon(&node, &["skill"]).run().await;
+    assert_eq!(out.code, 1, "{out:?}");
+}
+
+// ------------------------------------------- failures: what is said, and when
+
+/// The `docker compose up -d` hint is for a node that is not there. A node
+/// that was reached and then dropped the request is a different problem.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_request_is_not_a_missing_node() {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            // Read the request, then hang up without answering.
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            drop(socket);
+        }
+    });
+    let node = spawn_node("pc", &[]).await;
+
+    // A post that may have been stored says so, and what to do about it.
+    let out = beacon(&node, &["post", "beacon", "hi", "--human"])
+        .server(&url)
+        .run()
+        .await;
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(out.stderr.starts_with("beacon: "), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("may have been stored"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr
+            .contains("run `./beacon read beacon` before posting again"),
+        "{}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains("docker compose"), "{}", out.stderr);
+    // So does an upload.
+    let out = beacon(
+        &node,
+        &[
+            "attach",
+            "beacon",
+            "-",
+            "--name",
+            "a.txt",
+            "--as",
+            "pc-configs",
+        ],
+    )
+    .server(&url)
+    .stdin("data")
+    .run()
+    .await;
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(!out.stderr.contains("docker compose"), "{}", out.stderr);
+    // Anything else that dies on the way is just that: exit 3, no hint.
+    let out = beacon(&node, &["channels"]).server(&url).run().await;
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(!out.stderr.contains("docker compose"), "{}", out.stderr);
+}
+
+/// The Docker healthcheck runs `beacon health` with whatever environment the
+/// container has; it needs the node's address and secret, nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn health_does_not_care_about_the_agent_variables() {
+    let node = spawn_node("pc", &[]).await;
+    let out = beacon(&node, &["health"])
+        .env("BEACON_AGENT", "not a handle!")
+        .env("BEACON_CLIENT", "")
+        .ok()
+        .await;
+    assert_eq!(out.text(), "ok · pc");
+    let out = beacon(&node, &["health", "--json", "--as", "bad handle"])
+        .ok()
+        .await;
+    assert_eq!(out.json(), json!({ "v": 1, "node": "pc", "ok": true }));
+    // Other commands still insist on a real handle.
+    let out = beacon(&node, &["channels"])
+        .env("BEACON_AGENT", "not a handle!")
+        .run()
+        .await;
+    assert_eq!(out.code, 1, "{out:?}");
+}
+
+// -------------------------------- the client: files, waiting, the live stream
+
+#[test]
+fn server_sent_events_are_read_however_the_bytes_are_cut() {
+    let wire = "\
+: keep-alive\n\
+\n\
+event: post\n\
+data: {\"a\":1}\n\
+\n\
+event:presence\r\n\
+data: first\r\n\
+data: second\r\n\
+\r\n\
+id: 7\n\
+retry: 100\n\
+event: ignored-for-want-of-data\n\
+\n\
+data\n\
+\n\
+event: peers\n\
+data: [\"ü\",\"日本\"]\n\
+\n\
+: and a comment before the end\n";
+    let want = [
+        ("post", "{\"a\":1}"),
+        ("presence", "first\nsecond"),
+        // An empty data line is data (an empty string), with no event name.
+        ("message", ""),
+        ("peers", "[\"ü\",\"日本\"]"),
+    ];
+    // All at once, a byte at a time, and in every two-piece split (which cuts
+    // lines, CRLFs and multi-byte characters in half).
+    let mut splits: Vec<Vec<&[u8]>> = vec![vec![wire.as_bytes()]];
+    splits.push(wire.as_bytes().chunks(1).collect());
+    for at in 1..wire.len() {
+        splits.push(vec![&wire.as_bytes()[..at], &wire.as_bytes()[at..]]);
+    }
+    for pieces in splits {
+        let mut parser = SseParser::default();
+        let mut got = Vec::new();
+        for piece in &pieces {
+            got.extend(parser.push(piece).unwrap());
+        }
+        let got: Vec<(&str, &str)> = got
+            .iter()
+            .map(|m| (m.event.as_str(), m.data.as_str()))
+            .collect();
+        assert_eq!(got, want, "pieces: {pieces:?}");
+    }
+    // The parser decodes what the node's own events look like.
+    let post = StreamEvent::Post(post("Q8ZK7C2M", "2025-03-14T22:31:00Z", "hi"));
+    let frame = format!("event: {}\ndata: {}\n\n", post.name(), post.data());
+    let messages = SseParser::default().push(frame.as_bytes()).unwrap();
+    assert_eq!(messages.len(), 1);
+    let SseMessage { event, data } = &messages[0];
+    assert_eq!(StreamEvent::from_sse(event, data).unwrap(), post);
+}
+
+#[test]
+fn a_runaway_line_is_refused() {
+    let mut parser = SseParser::default();
+    let chunk = vec![b'x'; 1024 * 1024];
+    let mut result = Ok(Vec::new());
+    for _ in 0..9 {
+        result = parser.push(&chunk);
+        if result.is_err() {
+            break;
+        }
+    }
+    let err = result.unwrap_err();
+    assert!(matches!(err, Error::Internal(_)), "{err}");
+}
+
+/// Reads the next event of a stream, within 5 s.
+async fn next_event<S>(events: &mut S) -> Result<StreamEvent, Error>
+where
+    S: futures_util::Stream<Item = Result<StreamEvent, Error>> + Unpin,
+{
+    use futures_util::StreamExt;
+    tokio::time::timeout(Duration::from_secs(5), events.next())
+        .await
+        .expect("an event within 5 s")
+        .expect("the stream is still open")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_live_stream_delivers_what_is_stored_after_it_opens() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let client = client(&node);
+    post_as(&node, "pc-configs", "beacon", "before the stream").await;
+
+    // `Ok` means connected: whatever is stored from here on arrives.
+    let mut all = client.open_stream(None, false).await.unwrap();
+    post_as(&node, "pc-configs", "beacon", "one").await;
+    // Presence and channel events come too (the TUI shows them); posts first
+    // here because the order is the order they were stored in.
+    let mut seen_post = None;
+    for _ in 0..4 {
+        if let StreamEvent::Post(p) = next_event(&mut all).await.unwrap() {
+            seen_post = Some(p);
+            break;
+        }
+    }
+    let seen_post = seen_post.expect("the post");
+    assert_eq!(seen_post.body, "one");
+    assert_eq!(seen_post.channel, "beacon");
+    assert!(seen_post.arrival > 0);
+
+    // A feed for one handle with `relevant` only carries what matters to it.
+    let mut mine = client.open_stream(Some("pc-vllm"), true).await.unwrap();
+    post_as(&node, "pc-configs", "beacon", "chatter").await;
+    post_as(&node, "pc-configs", "beacon", "@pc-vllm ping").await;
+    loop {
+        if let StreamEvent::Post(p) = next_event(&mut mine).await.unwrap() {
+            assert_eq!(p.body, "@pc-vllm ping");
+            break;
+        }
+    }
+
+    // The same, as a stream that opens itself.
+    let mut lazy = client.stream(Some("pc-vllm"), true);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    post_as(&node, "mac-juicebox", "beacon", "@pc-vllm again").await;
+    loop {
+        if let StreamEvent::Post(p) = next_event(&mut lazy).await.unwrap() {
+            assert_eq!(p.body, "@pc-vllm again");
+            break;
+        }
+    }
+
+    // A stream does not outlive its node: it ends with an error, then nothing.
+    drop(client);
+    let _gone = node.stop().await;
+    use futures_util::StreamExt;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), all.next())
+            .await
+            .expect("the stream ends when the node stops")
+        {
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => {
+                assert!(matches!(e, Error::Interrupted(_)), "{e}");
+                assert_eq!(e.exit_code(), 3);
+                break;
+            }
+            None => panic!("a stream ends with an error first"),
+        }
+    }
+    assert!(all.next().await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn opening_a_stream_says_why_it_cannot() {
+    use futures_util::StreamExt;
+    let node = spawn_node("pc", &[]).await;
+    let wrong = Client::new(&node.url, Some("wrong")).unwrap();
+    assert!(matches!(
+        wrong.open_stream(None, false).await,
+        Err(Error::Auth)
+    ));
+    // `relevant` without a handle is the node's usage error.
+    let err = client(&node).open_stream(None, true).await.err().unwrap();
+    assert!(
+        matches!(&err, Error::Usage(m) if m.contains("handle")),
+        "{err}"
+    );
+    // Nothing listening: the lazy form's only item is the error.
+    let nowhere = format!("http://127.0.0.1:{}", closed_port());
+    let nobody = Client::new(&nowhere, Some(SECRET)).unwrap();
+    let err = nobody.open_stream(None, false).await.err().unwrap();
+    assert!(matches!(err, Error::Unreachable(_)), "{err}");
+    let mut lazy = nobody.stream(None, false);
+    assert!(matches!(
+        lazy.next().await,
+        Some(Err(Error::Unreachable(_)))
+    ));
+    assert!(lazy.next().await.is_none());
+}
+
+/// A node that closes the stream, or just breaks it, ends the feed with an
+/// error the caller can reconnect on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_the_node_closes_ends_with_an_interrupted_error() {
+    use futures_util::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let head =
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+            let _ = socket
+                .write_all(
+                    format!("{head}: hello\n\nevent: peers\ndata: []\n\nevent: peers\ndata: [")
+                        .as_bytes(),
+                )
+                .await;
+            // ...and hang up in the middle of an event.
+        }
+    });
+    let client = Client::new(&url, Some(SECRET)).unwrap();
+    let mut events = client.open_stream(None, false).await.unwrap();
+    assert_eq!(
+        next_event(&mut events).await.unwrap(),
+        StreamEvent::Peers(vec![])
+    );
+    let err = next_event(&mut events).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Interrupted(m) if m.contains("closed the stream")),
+        "{err}"
+    );
+    assert!(events.next().await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn client_wait_looks_first_and_gives_up_quietly() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let client = client(&node);
+    client
+        .set_joins("pc-vllm", &["beacon".to_string()])
+        .await
+        .unwrap();
+
+    // Nothing yet: `None`, after about as long as it was told to wait. Part
+    // of a second is rounded up.
+    let started = std::time::Instant::now();
+    assert_eq!(
+        client
+            .wait("pc-vllm", Duration::from_millis(1))
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    assert_eq!(client.wait("pc-vllm", Duration::ZERO).await.unwrap(), None);
+
+    // Something there: at once, and the same again (the cursor does not move).
+    post_as(&node, "pc-configs", "beacon", "waiting for you").await;
+    for _ in 0..2 {
+        let started = std::time::Instant::now();
+        let page = client
+            .wait("pc-vllm", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .expect("the post");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(page.v, 1);
+        assert_eq!(page.posts[0].body, "waiting for you");
+        assert_eq!(page.remaining, Some(0));
+    }
+
+    // Errors are the usual ones.
+    let err = client.wait("no spaces", Duration::ZERO).await.unwrap_err();
+    assert!(matches!(err, Error::Usage(_)), "{err}");
+    let wrong = Client::new(&node.url, Some("wrong")).unwrap();
+    assert!(matches!(
+        wrong.wait("pc-vllm", Duration::ZERO).await,
+        Err(Error::Auth)
+    ));
+
+    // The node's newest arrival number moves with what is stored.
+    let head = client.arrival_head().await.unwrap();
+    post_as(&node, "pc-configs", "beacon", "one more").await;
+    assert!(client.arrival_head().await.unwrap() > head);
+}
+
+/// A node that is reached and then does not answer is not a missing node.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_node_is_interrupted_not_unreachable() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let keep = held.clone();
+    tokio::spawn(async move {
+        // Accept, say nothing, and keep the sockets open.
+        while let Ok((socket, _)) = listener.accept().await {
+            keep.lock().unwrap().push(socket);
+        }
+    });
+    let client = Client::new(&url, Some(SECRET))
+        .unwrap()
+        .with_request_timeout(Duration::from_millis(300));
+    let err = client.health().await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Interrupted(m) if m.contains("did not answer within 0.3s")),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 3);
+    // A post that times out may have been stored, and says so.
+    let req = NewPostRequest {
+        body: "hi".into(),
+        tags: vec![],
+        author: "pc-configs".into(),
+        author_kind: AuthorKind::Agent,
+        client: None,
+        create: false,
+    };
+    let err = client.post("beacon", &req).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Interrupted(m) if m.contains("may have been stored")),
+        "{err}"
+    );
+    // So do the open of a stream and the start of a download.
+    let err = client.open_stream(None, false).await.err().unwrap();
+    assert!(matches!(err, Error::Interrupted(_)), "{err}");
+    let err = client.file(&"ab".repeat(32)).await.err().unwrap();
+    assert!(matches!(err, Error::Interrupted(_)), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn client_uploads_a_file_and_downloads_it_again() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let client = client(&node);
+    let bytes = binary_blob(200_000);
+    let req = NewPostRequest {
+        body: "the log".into(),
+        tags: vec!["done".into()],
+        author: "pc-configs".into(),
+        author_kind: AuthorKind::Agent,
+        client: Some("claude-code".into()),
+        create: false,
+    };
+    // With the length known and without it; the node orders the parts itself
+    // (it refuses a file that comes before its post), so success is the proof
+    // that `meta` goes first.
+    for len in [Some(bytes.len() as u64), None] {
+        let created = client
+            .upload(
+                "beacon",
+                &req,
+                "run.log",
+                std::io::Cursor::new(bytes.clone()),
+                len,
+            )
+            .await
+            .unwrap();
+        let attachment = created.post.attachment.as_ref().unwrap();
+        assert_eq!(attachment.name, "run.log");
+        assert_eq!(attachment.size, bytes.len() as u64);
+        assert_eq!(attachment.sha256, sha256_hex(&bytes));
+
+        let mut download = client.file(&attachment.sha256).await.unwrap();
+        assert_eq!(download.len, Some(bytes.len() as u64));
+        let mut got = Vec::new();
+        while let Some(chunk) = download.chunk().await.unwrap() {
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(got, bytes);
+    }
+    // A file the node does not have is NotFound; one that is no hash is usage.
+    let err = client.file(&"ab".repeat(32)).await.err().unwrap();
+    assert!(matches!(err, Error::NotFound(_)), "{err}");
+    let err = client.file("not-a-hash").await.err().unwrap();
+    assert!(matches!(err, Error::Usage(_)), "{err}");
+    // An upload to a channel that is not there is refused as such.
+    let err = client
+        .upload(
+            "nosuch",
+            &req,
+            "a.txt",
+            std::io::Cursor::new(vec![1u8]),
+            Some(1),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)), "{err}");
+}
+
+// ----------------------------------------------- the new formatters
+
+fn presence(
+    handle: &str,
+    client: &str,
+    node: &str,
+    ago_ms: i64,
+    status: Option<&str>,
+) -> PresenceJson {
+    let at = ms("2025-03-16T16:00:00Z") - ago_ms;
+    PresenceJson {
+        handle: handle.into(),
+        kind: if client == "tui" {
+            AuthorKind::Human
+        } else {
+            AuthorKind::Agent
+        },
+        client: client.into(),
+        node: node.into(),
+        status: status.map(String::from),
+        last_seen: iso8601(at),
+        last_seen_ms: at,
+        active: ago_ms <= 5 * 60 * 1000,
+    }
+}
+
+#[test]
+fn who_lines_follow_the_template_and_line_up() {
+    let now = clock().now_ms;
+    assert_eq!(human::who_text(&[], now), "nobody has been seen lately");
+    let one = [presence(
+        "pc-configs",
+        "claude-code",
+        "pc",
+        0,
+        Some("scaffolding beacon crate"),
+    )];
+    assert_eq!(
+        human::who_text(&one, now),
+        format!(
+            "● {:<16} {} · {:<6} {:>4}   {}",
+            "pc-configs", "claude-code", "pc", "now", "scaffolding beacon crate"
+        )
+    );
+    // The mockup's board: columns line up, idle is a ring, no status no tail.
+    let board = [
+        presence(
+            "pc-configs",
+            "claude-code",
+            "pc",
+            20_000,
+            Some("scaffolding beacon crate"),
+        ),
+        presence(
+            "mac-juicebox",
+            "codex",
+            "mac",
+            60_000,
+            Some("arm64 build + e2e"),
+        ),
+        presence(
+            "pc-vllm",
+            "claude-code",
+            "pc",
+            14 * 60_000,
+            Some("waiting on VRAM"),
+        ),
+        presence("Dang", "tui", "pc", 0, None),
+    ];
+    // {dot} {handle:<16} {client · node, padded to the widest} {age:>4}   {status}
+    let row = |dot: &str, handle: &str, who: &str, age: &str, status: &str| {
+        format!("{dot} {handle:<16} {who:<20} {age:>4}   {status}")
+            .trim_end()
+            .to_string()
+    };
+    let want = [
+        row(
+            "●",
+            "pc-configs",
+            "claude-code · pc",
+            "now",
+            "scaffolding beacon crate",
+        ),
+        row(
+            "●",
+            "mac-juicebox",
+            "codex · mac",
+            "1m",
+            "arm64 build + e2e",
+        ),
+        row("○", "pc-vllm", "claude-code · pc", "14m", "waiting on VRAM"),
+        row("●", "Dang", "tui · pc", "now", ""),
+    ]
+    .join("\n");
+    assert_eq!(human::who_text(&board, now), want);
+    // A long handle widens its column for everyone, by display width.
+    let wide = [
+        presence("日本語のエージェント名前です", "codex", "mac", 0, None),
+        presence("pc", "codex", "mac", 3 * 3_600_000, Some("idle")),
+    ];
+    let text = human::who_text(&wide, now);
+    let lines: Vec<&str> = text.lines().collect();
+    let column = |line: &str| human::display_width(&line[..line.find("codex").unwrap()]);
+    assert_eq!(column(lines[0]), column(lines[1]), "{text}");
+    assert!(
+        lines[1].starts_with('○') && lines[1].contains("   3h   idle"),
+        "{text}"
+    );
+    // What other machines call themselves cannot move the cursor.
+    let sneaky = [presence("a\u{1b}[2Jb", "co\u{7}dex", "pc", 0, Some("x\ny"))];
+    let text = human::who_text(&sneaky, now);
+    assert!(
+        !text.contains('\u{1b}') && !text.contains('\u{7}'),
+        "{text:?}"
+    );
+    assert_eq!(text.lines().count(), 1, "{text:?}");
+}
+
+#[test]
+fn watch_lines_are_one_short_line_each() {
+    let c = clock();
+    let p = post(
+        "Q8ZK7C2M",
+        "2025-03-14T22:31:00Z",
+        "arm64 builds in 2m14s\nsecond line",
+    );
+    assert_eq!(
+        human::watch_line(&p, &c),
+        "6:31 pm #beacon mac-juicebox: arm64 builds in 2m14s"
+    );
+    // Leading blank lines and indentation do not make the line empty; tabs
+    // are spaces; control characters are defused.
+    let p = post(
+        "Q8ZK7C2M",
+        "2025-03-14T22:31:00Z",
+        "\n\n  \tindented\u{1b}[2J \nnext",
+    );
+    assert_eq!(
+        human::watch_line(&p, &c),
+        "6:31 pm #beacon mac-juicebox: indented\u{fffd}[2J"
+    );
+    // Cut at 200 characters, the 200th being the ellipsis; never mid-grapheme.
+    let long = post("Q8ZK7C2M", "2025-03-14T22:31:00Z", &"word ".repeat(100));
+    let line = human::watch_line(&long, &c);
+    let text = line.strip_prefix("6:31 pm #beacon mac-juicebox: ").unwrap();
+    assert_eq!(text.chars().count(), 200, "{text}");
+    assert!(text.ends_with("word…"), "{text}");
+    let exactly = post("Q8ZK7C2M", "2025-03-14T22:31:00Z", &"x".repeat(200));
+    assert!(human::watch_line(&exactly, &c).ends_with(&"x".repeat(200)));
+    let over = post("Q8ZK7C2M", "2025-03-14T22:31:00Z", &"x".repeat(201));
+    assert!(human::watch_line(&over, &c).ends_with(&format!("{}…", "x".repeat(199))));
+    // Families, flags and combining marks count once and are not split.
+    let emoji = "👨‍👩‍👧‍👦".repeat(250);
+    let line = human::watch_line(&post("Q8ZK7C2M", "2025-03-14T22:31:00Z", &emoji), &c);
+    let text = line.strip_prefix("6:31 pm #beacon mac-juicebox: ").unwrap();
+    assert_eq!(text, format!("{}…", "👨‍👩‍👧‍👦".repeat(199)));
+    // A post that is only a file shows the file; Dang's shows his channel.
+    let mut file = post("Q8ZK7C2M", "2025-03-14T22:31:00Z", "");
+    file.attachment = Some(AttachmentJson {
+        name: "../report.txt".into(),
+        size: 12_288,
+        sha256: "ab".repeat(32),
+        available: true,
+    });
+    assert_eq!(
+        human::watch_line(&file, &c),
+        "6:31 pm #beacon mac-juicebox: attachment: report.txt (12 KB)"
+    );
+    let d = in_channel(
+        dang("R9XW5VHB", "2025-03-15T14:02:00Z", "Tag it."),
+        "general",
+    );
+    assert_eq!(human::watch_line(&d, &c), "10:02 am #general Dang: Tag it.");
+}
+
+#[test]
+fn posted_lines_name_an_attachment() {
+    let mut created = PostCreated {
+        v: 1,
+        post: post("Q8ZK7C2M", "2025-03-14T22:31:00Z", ""),
+        delivery: vec![Delivery {
+            node: "mac".into(),
+            delivered: true,
+        }],
+    };
+    created.post.attachment = Some(AttachmentJson {
+        name: "dir/test-report.txt".into(),
+        size: 12_288,
+        sha256: "ab".repeat(32),
+        available: true,
+    });
+    assert_eq!(
+        human::posted_text(&created),
+        "posted Q8ZK7C2M to #beacon · attached test-report.txt (12 KB) · delivered to mac"
+    );
+}
+
+#[test]
+fn file_names_from_peers_are_reduced_to_a_name() {
+    for (given, safe) in [
+        ("report.txt", "report.txt"),
+        ("../../etc/passwd", "passwd"),
+        (r"..\..\boot.ini", "boot.ini"),
+        ("a/b\\c", "c"),
+        ("/abs/olute", "olute"),
+        ("trailing/", "attachment"),
+        ("trailing\\", "attachment"),
+        ("", "attachment"),
+        (".", "attachment"),
+        ("..", "attachment"),
+        ("dir/..", "attachment"),
+        ("  spaced.txt  ", "spaced.txt"),
+        ("...", "..."),
+        ("bell\u{7}.txt", "bell_.txt"),
+        ("日本語.log", "日本語.log"),
+    ] {
+        assert_eq!(human::safe_file_name(given), safe, "{given:?}");
+    }
+}
+
+#[test]
+fn join_and_leave_lines() {
+    assert_eq!(
+        human::joined_text("beacon"),
+        "joined #beacon · wait and watch will wake you for posts here"
+    );
+    assert_eq!(
+        human::left_text("beacon"),
+        "left #beacon · mentions and announcements still wake you"
+    );
 }

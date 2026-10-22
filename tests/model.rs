@@ -98,8 +98,9 @@ fn exit_codes_cover_every_variant() {
         Error::Conflict("c".into()).exit_code(),
         Error::Timeout.exit_code(),
         Error::Internal(anyhow::anyhow!("boom")).exit_code(),
+        Error::Interrupted("i".into()).exit_code(),
     ];
-    assert_eq!(codes, [1, 2, 5, 3, 4, 5, 6, 1]);
+    assert_eq!(codes, [1, 2, 5, 3, 4, 5, 6, 1, 3]);
     assert_eq!(
         Error::Ambiguous(vec!["aaaaaaaa".into(), "bbbbbbbb".into()]).to_string(),
         "ambiguous id, matches: aaaaaaaa, bbbbbbbb"

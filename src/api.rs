@@ -309,6 +309,16 @@ pub struct JoinsJson {
     pub channels: Vec<String>,
 }
 
+/// What `join` and `leave` (the CLI's, `--json`) answer: the channel that was
+/// joined or left and every channel the handle has joined now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinAck {
+    pub v: u32,
+    pub ok: bool,
+    pub channel: String,
+    pub joined: Vec<String>,
+}
+
 /// `PUT /api/read-cursors/:handle`: the handle has read `channel` up to the
 /// post that arrived as `arrival` (see [`PostJson::arrival`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
