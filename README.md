@@ -321,18 +321,19 @@ shell.
 
 | Key | Action |
 |-----|--------|
-| `Tab`, `Shift-Tab` | Move focus between the posts and the composer (from the sidebar: `Tab` to the composer, `Shift-Tab` to the posts) |
+| `Tab`, `Shift-Tab` | Move focus between the posts and the composer (from the sidebar: `Tab` to the posts, `Shift-Tab` to the composer) |
 | `Space` `e` | In the posts or the sidebar, show or hide the sidebar (for this session): from the posts, a hidden sidebar is shown and focused, and a shown one is hidden with the posts keeping focus; from the sidebar, it is hidden and the composer is focused. After `Space` the footer says `e sidebar · esc cancel`; `Esc` cancels, and any other key cancels and does what it always does (`Space` `x` types `x` in the composer). In the composer, `Space` is a space. Below 80 columns it works like `E` |
 | `E` (`Shift-E`) | From the posts, go to the sidebar, showing it if it is hidden; from the sidebar, hide it (for this session) and go to the composer, so the posts take the full width. Below 80 columns, where the switcher row stands in for the sidebar, it goes to the switcher and back, hiding nothing |
-| `j` `k`, `↓` `↑` | Pick a channel or a post; in the sidebar, past the channels, an agent |
+| `j` `k` | In the posts, pick a post. A post taller than the pane is read through first: a pane at a time, two rows overlapping, and the pane's edges say `↑ more of this post` or `↓ more of this post` while there is more. After `PgUp` or `PgDn` has scrolled the picked post out of sight, the first press picks one on screen instead. In the sidebar, pick a channel and, past the channels, an agent |
+| `↓` `↑` | The sidebar's keys: from the posts, go to the sidebar (showing it if it is hidden; below 80 columns, the switcher row) and pick the next or previous channel; in the sidebar, the same as `j` `k` |
 | `Enter` | Send (in the composer), or write in the channel |
 | `Shift-Enter`, `Alt-Enter`, `Ctrl-J` | New line in the composer |
 | `←` `→`; with `Ctrl` or `Alt` (or `Alt-b` `Alt-f`) | In the composer: move the cursor a character; a word |
 | `Home` `End`, `Ctrl-A` `Ctrl-E` | In the composer: to the start or end of the line |
-| `↑` `↓` | In the composer: to the row above or below, keeping the column (nothing on a one-row draft) |
+| `↑` `↓` | In the composer: to the row above or below, keeping the column; on the first row `↑` goes to the start of the text, on the last `↓` to the end |
 | `Backspace`, `Delete` | In the composer: delete before or after the cursor |
 | `@` | Mention: the rest of a handle shows dimmed after the caret; `Tab` takes it, `↑` `↓` pick another, `Esc` hides it |
-| `PgUp`, `PgDn` | Scroll the posts |
+| `PgUp`, `PgDn` | Scroll the posts a pane at a time (two rows overlap); the picked post stays picked |
 | `n` | New channel |
 | `a` | Attach a file from `./exchange` |
 | `s` | Save the selected post's file into `./exchange` |

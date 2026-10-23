@@ -1584,7 +1584,7 @@ mod behaviour {
         assert_eq!(app.input, "", "E no longer jumps to the composer");
         assert_eq!(app.toast, None);
         // A capital E without SHIFT (as some terminals send it) does the same.
-        feed(&mut app, [key(KeyCode::BackTab), ch('E')]);
+        feed(&mut app, [key(KeyCode::Tab), ch('E')]);
         assert_eq!(app.focus, Focus::Sidebar);
         assert_eq!(app.input, "");
     }
@@ -1675,32 +1675,186 @@ mod behaviour {
     }
 
     #[test]
-    fn tab_leaves_the_sidebar_for_the_composer_and_shift_tab_for_the_posts() {
+    fn tab_leaves_the_sidebar_for_the_posts_and_shift_tab_for_the_composer() {
+        // Dang (MJN7KXH6): Tab from the sidebar goes to the chat, not the
+        // input bar.
         let mut app = live_app();
-        feed(&mut app, [key(KeyCode::Tab), shift_e(), key(KeyCode::Tab)]);
-        assert_eq!(app.focus, Focus::Composer);
+        feed(&mut app, [key(KeyCode::Tab), shift_e()]);
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.selected_post = None;
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Posts);
         assert!(
             sidebar_drawn(&app),
             "the sidebar stays when focus leaves it"
         );
-
-        app.selected_post = None;
-        feed(
-            &mut app,
-            [key(KeyCode::Tab), shift_e(), key(KeyCode::BackTab)],
-        );
-        assert_eq!(app.focus, Focus::Posts);
-        assert!(sidebar_drawn(&app));
         assert_eq!(
             app.selected_post.as_deref(),
             Some(ulid(2).as_str()),
             "the newest post is selected, as on any way into the posts"
         );
+        let buf = screen(&app);
+        let y = row_of(&buf, "mac-juicebox");
+        let (x0, _) = main_pane(W);
+        assert_eq!(buf[(x0, y)].symbol(), "▍", "and drawn with its edge");
+
+        // Shift-Tab, as BackTab or as Tab with SHIFT, goes to the composer.
+        for shift_tab in [
+            key(KeyCode::BackTab),
+            chord(KeyCode::Tab, KeyModifiers::SHIFT),
+        ] {
+            app.update(shift_e());
+            assert_eq!(app.focus, Focus::Sidebar);
+            app.update(shift_tab);
+            assert_eq!(app.focus, Focus::Composer);
+            assert!(sidebar_drawn(&app));
+            // Back to the posts for the next round.
+            app.update(key(KeyCode::Tab));
+        }
 
         // Enter in the sidebar still writes in the channel.
         feed(&mut app, [shift_e(), key(KeyCode::Enter)]);
         assert_eq!(app.focus, Focus::Composer);
         assert!(sidebar_drawn(&app));
+    }
+
+    // ------------------------------- arrows: the sidebar's keys (R79KEKG2)
+
+    fn load(channel: &str) -> Cmd {
+        Cmd::LoadPosts {
+            channel: channel.to_string(),
+            before: None,
+        }
+    }
+
+    #[test]
+    fn arrows_in_the_posts_go_to_the_sidebar_and_step_there() {
+        // #general is on screen, between Announcements and #beacon.
+        let mut app = live_app();
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Posts);
+        assert_eq!(app.update(key(KeyCode::Down)), [load("beacon")]);
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(app.selected, Selection::Channel("beacon".to_string()));
+        // There they go on moving, as j and k do.
+        assert_eq!(app.update(key(KeyCode::Down)), [load("vllm")]);
+        assert_eq!(app.update(key(KeyCode::Up)), [load("beacon")]);
+        assert_eq!(app.update(ch('k')), [load("general")]);
+        assert_eq!(app.focus, Focus::Sidebar);
+
+        let mut app = live_app();
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.update(key(KeyCode::Up)), [Cmd::LoadAnnouncements]);
+        assert_eq!(
+            (app.focus, &app.selected),
+            (Focus::Sidebar, &Selection::Announcements)
+        );
+    }
+
+    #[test]
+    fn j_and_k_are_the_post_keys_in_the_posts() {
+        let mut app = live_app();
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.selected_post.as_deref(), Some(ulid(2).as_str()));
+        assert!(app.update(ch('k')).is_empty());
+        assert_eq!(
+            (app.focus, app.selected_post.as_deref()),
+            (Focus::Posts, Some(ulid(1).as_str()))
+        );
+        assert!(app.update(ch('j')).is_empty());
+        assert_eq!(
+            (app.focus, app.selected_post.as_deref()),
+            (Focus::Posts, Some(ulid(2).as_str()))
+        );
+        assert_eq!(app.selected, Selection::Channel("general".to_string()));
+    }
+
+    #[test]
+    fn with_the_sidebar_hidden_the_first_arrow_shows_it_and_goes_there() {
+        for (code, cmd) in [
+            (KeyCode::Down, load("beacon")),
+            (KeyCode::Up, Cmd::LoadAnnouncements),
+        ] {
+            let mut app = live_app();
+            feed(&mut app, [key(KeyCode::Tab), shift_e(), shift_e()]);
+            assert!(app.hide_sidebar);
+            app.update(key(KeyCode::Tab));
+            assert_eq!(app.focus, Focus::Posts);
+            assert_eq!(app.update(key(code)), [cmd], "{code:?}");
+            assert_eq!(
+                (app.focus, app.hide_sidebar),
+                (Focus::Sidebar, false),
+                "{code:?}"
+            );
+            assert!(sidebar_drawn(&app), "{code:?}");
+            assert!(screen_text(&app).contains("CHANNELS"), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn below_80_columns_the_arrows_work_the_switcher() {
+        let mut app = live_app();
+        app.update(Msg::Resize(79, 24));
+        let narrow = layout_of(&app);
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.update(key(KeyCode::Down)), [load("beacon")]);
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Sidebar, false));
+        assert_eq!(layout_of(&app), narrow, "nothing to show or hide");
+        let y = narrow.switcher_y.expect("the switcher row");
+        let switcher = row_text(&render(&app, TRUECOLOR, 79, 24), y);
+        assert!(switcher.contains("‹ # beacon ›"), "{switcher}");
+        assert_eq!(app.update(key(KeyCode::Up)), [load("general")]);
+        assert_eq!(app.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn below_80_columns_the_arrows_and_j_k_never_reach_an_agent_row() {
+        // The switcher shows channels only: an agent row the cursor sat on
+        // would be out of sight, and d would offer to forget it.
+        let mut app = app_with_agents();
+        app.update(Msg::Resize(79, 24));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Posts);
+        for _ in 0..5 {
+            app.update(key(KeyCode::Down));
+            assert_eq!(app.selected_agent, None);
+        }
+        for _ in 0..3 {
+            app.update(ch('j'));
+            assert_eq!(app.selected_agent, None);
+        }
+        assert_eq!(
+            app.selected,
+            Selection::Channel("vllm".to_string()),
+            "the last channel stays"
+        );
+        app.update(ch('d'));
+        match &app.dialog {
+            Some(Dialog::Confirm(confirm)) => assert_eq!(confirm.title, "Delete #vllm?"),
+            other => panic!("{other:?}"),
+        }
+        app.update(key(KeyCode::Esc));
+        // Wide again, the sidebar's agent rows are within reach once more.
+        app.update(Msg::Resize(W, H));
+        app.update(ch('j'));
+        assert_eq!(app.selected_agent.as_deref(), Some("pc-configs"));
+    }
+
+    #[test]
+    fn narrowing_below_80_columns_lets_go_of_the_agent_row() {
+        let mut app = app_with_agents();
+        feed(&mut app, [ch('j'), ch('j'), ch('j')]);
+        assert_eq!(app.selected_agent.as_deref(), Some("pc-configs"));
+        app.update(Msg::Resize(79, 24));
+        assert_eq!(
+            (app.focus, app.selected_agent.as_deref()),
+            (Focus::Sidebar, None)
+        );
+        app.update(ch('d'));
+        match &app.dialog {
+            Some(Dialog::Confirm(confirm)) => assert_eq!(confirm.title, "Delete #vllm?"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -1844,8 +1998,11 @@ mod behaviour {
         feed(&mut app, [key(KeyCode::Tab), shift_e(), shift_e()]);
         assert!(app.hide_sidebar);
         assert_ne!(layout_of(&app), before);
-        // Posts → shown, in the sidebar → the composer again.
-        feed(&mut app, [key(KeyCode::Tab), shift_e(), key(KeyCode::Tab)]);
+        // Posts → shown, in the sidebar → the composer again (shift-tab).
+        feed(
+            &mut app,
+            [key(KeyCode::Tab), shift_e(), key(KeyCode::BackTab)],
+        );
         assert_eq!((app.focus, app.hide_sidebar), (Focus::Composer, false));
         assert_eq!(layout_of(&app), before);
         let buf = render(&app, TRUECOLOR, 104, 33);
@@ -2159,16 +2316,28 @@ mod behaviour {
         assert!(!app.hide_sidebar);
         assert!(!footer(&app).contains(LEADER_HINT));
 
-        // From the sidebar, shift-tab goes to the posts as always.
+        // From the sidebar, tab goes to the posts.
         let mut app = in_the_posts();
         app.update(shift_e());
-        feed(&mut app, [space(), key(KeyCode::BackTab)]);
+        feed(&mut app, [space(), key(KeyCode::Tab)]);
         assert_eq!((app.focus, app.hide_sidebar), (Focus::Posts, false));
         assert!(!footer(&app).contains(LEADER_HINT));
         // The chord is over: e is a stray e again.
         app.update(ch('e'));
         assert_eq!((app.focus, app.input.as_str()), (Focus::Composer, "e"));
         assert!(!app.hide_sidebar);
+    }
+
+    #[test]
+    fn space_down_cancels_then_goes_to_the_sidebar() {
+        let mut app = in_the_posts();
+        assert_eq!(
+            feed(&mut app, [space(), key(KeyCode::Down)]),
+            [load("beacon")]
+        );
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Sidebar, false));
+        assert!(!app.leader);
+        assert!(!footer(&app).contains(LEADER_HINT));
     }
 
     #[test]
@@ -2603,10 +2772,10 @@ mod behaviour {
         assert!(app.update(ch('s')).is_empty());
         assert_eq!(
             app.toast.as_deref(),
-            Some("Select a post first: shift-tab to the posts, then j/k")
+            Some("Select a post first: tab to the posts, then j/k")
         );
 
-        app.update(key(KeyCode::BackTab));
+        app.update(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Posts);
         assert_eq!(app.selected_post.as_deref(), Some(ulid(3).as_str()));
         assert_eq!(
@@ -3042,7 +3211,7 @@ mod behaviour {
         let mut app = app_with_agents();
         feed(&mut app, [ch('j'), ch('j'), ch('j')]);
         assert_eq!(app.selected_agent.as_deref(), Some("pc-configs"));
-        app.update(key(KeyCode::BackTab));
+        app.update(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Posts);
         assert_eq!(app.selected_agent, None);
         // Back in the sidebar, the cursor starts from the channel on screen.
@@ -3051,8 +3220,8 @@ mod behaviour {
         assert_eq!(app.selected_agent, None);
         app.update(ch('j'));
         assert_eq!(app.selected_agent.as_deref(), Some("pc-configs"));
-        // Tab to the composer lets go too.
-        app.update(key(KeyCode::Tab));
+        // Shift-Tab to the composer lets go too.
+        app.update(key(KeyCode::BackTab));
         assert_eq!(app.focus, Focus::Composer);
         assert_eq!(app.selected_agent, None);
         app.focus = Focus::Sidebar;
@@ -4218,7 +4387,7 @@ mod behaviour {
             Some("Pick a channel to attach a file to: j/k")
         );
         // From the posts, the way to the channels is shift-e.
-        app.update(key(KeyCode::BackTab));
+        app.update(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Posts);
         app.update(ch('a'));
         assert_eq!(

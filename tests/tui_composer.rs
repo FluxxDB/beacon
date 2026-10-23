@@ -302,14 +302,14 @@ fn up_and_down_move_between_lines_keeping_the_column() {
     paste(&mut app, "abcdefgh\nab\nabcdefgh");
     app.set_cursor(6);
     assert_eq!(
-        stops(&mut app, KeyCode::Down, KeyModifiers::NONE, 3),
-        // The short line's end, then back out to column 6; nothing below.
-        [11, 18, 18]
+        stops(&mut app, KeyCode::Down, KeyModifiers::NONE, 2),
+        // The short line's end, then back out to column 6.
+        [11, 18]
     );
     assert_eq!(
-        stops(&mut app, KeyCode::Up, KeyModifiers::NONE, 3),
-        [11, 6, 6],
-        "and back; nothing above the top line"
+        stops(&mut app, KeyCode::Up, KeyModifiers::NONE, 2),
+        [11, 6],
+        "and back"
     );
     // Any other key forgets the column.
     app.set_cursor(18);
@@ -344,18 +344,58 @@ fn up_and_down_move_between_wrapped_rows() {
 }
 
 #[test]
-fn up_and_down_on_a_single_line_do_what_they_did() {
-    // In the composer they did nothing: no cursor move, no focus change.
+fn down_on_the_last_row_goes_to_the_end_and_up_on_the_first_to_the_start() {
+    // Dang (R79KEKG2), as a macOS text box does it. A one-row draft too:
+    // the keys stay in the composer.
     let mut app = composing();
     paste(&mut app, "hello");
     app.set_cursor(2);
-    for code in [KeyCode::Up, KeyCode::Down] {
-        assert!(press(&mut app, code).is_empty());
-    }
+    assert!(press(&mut app, KeyCode::Down).is_empty());
     assert_eq!(
         (app.input.as_str(), app.cursor(), app.focus),
-        ("hello", 2, Focus::Composer)
+        ("hello", 5, Focus::Composer)
     );
+    app.set_cursor(2);
+    assert!(press(&mut app, KeyCode::Up).is_empty());
+    assert_eq!(
+        (app.input.as_str(), app.cursor(), app.focus),
+        ("hello", 0, Focus::Composer)
+    );
+
+    // Lines: "abcdefgh" 0..8, "ab" 9..11, "abcdefgh" 12..20.
+    let mut app = composing();
+    paste(&mut app, "abcdefgh\nab\nabcdefgh");
+    app.set_cursor(14);
+    assert_eq!(
+        stops(&mut app, KeyCode::Down, KeyModifiers::NONE, 2),
+        [20, 20]
+    );
+    app.set_cursor(2);
+    assert_eq!(stops(&mut app, KeyCode::Up, KeyModifiers::NONE, 2), [0, 0]);
+
+    // The jump forgets the column: from the end (column 8) up, the rows
+    // aim for column 8, not the 6 the run started from.
+    app.set_cursor(6);
+    assert_eq!(
+        stops(&mut app, KeyCode::Down, KeyModifiers::NONE, 3),
+        [11, 18, 20]
+    );
+    assert_eq!(stops(&mut app, KeyCode::Up, KeyModifiers::NONE, 2), [11, 8]);
+
+    // Wrapped rows count as rows: the last one's ↓ goes to the end.
+    let mut app = composing();
+    let width = usize::from(composer(&app).width - 6);
+    // Row 0: width-1 a's (the space after them is dropped at the break);
+    // row 1: thirty b's.
+    let text = format!("{} {}", "a".repeat(width - 1), "b".repeat(30));
+    paste(&mut app, &text);
+    app.set_cursor(width + 5);
+    assert_eq!(
+        stops(&mut app, KeyCode::Down, KeyModifiers::NONE, 1),
+        [width + 30]
+    );
+    app.set_cursor(5);
+    assert_eq!(stops(&mut app, KeyCode::Up, KeyModifiers::NONE, 1), [0]);
 }
 
 // ----------------------------------------------------------------- editing
@@ -597,6 +637,26 @@ fn the_ghost_reads_the_text_before_the_cursor() {
     paste(&mut app, "hey @pc\nmore");
     presses(&mut app, KeyCode::Left, 5);
     assert!(app.ghost().is_some());
+}
+
+#[test]
+fn with_a_ghost_up_and_down_pick_a_match_and_leave_the_cursor() {
+    // On a one-row draft ↑ and ↓ would jump to its ends; with a ghost they
+    // are still the ghost's.
+    let mut app = composing();
+    let mut vllm = app.agents[0].clone();
+    vllm.handle = "pc-vllm".to_string();
+    app.agents.push(vllm);
+    paste(&mut app, "hey @pc and more");
+    presses(&mut app, KeyCode::Left, 9);
+    assert_eq!(app.cursor(), 7);
+    let index = |app: &App| app.ghost().expect("a ghost").index;
+    assert_eq!((index(&app), app.ghost().unwrap().count), (0, 2));
+    press(&mut app, KeyCode::Down);
+    assert_eq!((index(&app), app.cursor()), (1, 7));
+    press(&mut app, KeyCode::Up);
+    assert_eq!((index(&app), app.cursor()), (0, 7));
+    assert_eq!(app.input, "hey @pc and more");
 }
 
 #[test]
