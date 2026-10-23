@@ -1,7 +1,9 @@
 //! The posts viewport: posts bottom-anchored above the composer, one blank
 //! row apart, a centered day separator between days (and above the oldest
 //! post when it is not from today), the announcement and mention bands, tag
-//! badges, attachments, and the empty and server-down states.
+//! badges, attachments, the empty and server-down states, and quiet notes
+//! at the pane's edges: newer posts below while it is scrolled up, more of
+//! the selected post past an edge while it is taller than the pane.
 //!
 //! Columns of a post, from the pane's left edge:
 //!
@@ -43,6 +45,12 @@ const BODY_MARGIN: u16 = 4;
 const ELBOW: &str = "╭─";
 /// A reply's line when the post it names is not on this node.
 const NOT_HERE: &str = "reply to a post that isn't here";
+
+/// The notes at the pane's edges: under it while it is scrolled up, and
+/// at either edge while the selected post runs past it.
+const NEWER_BELOW: &str = "↓ newer posts below";
+const MORE_ABOVE: &str = "↑ more of this post";
+const MORE_BELOW: &str = "↓ more of this post";
 
 const SERVER_DOWN: &str =
     "Can't reach the beacon server. Start it with docker compose up -d. Retrying…";
@@ -119,6 +127,12 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
     // Lay out from the newest post up, only as far as the screen needs.
     let height = usize::from(area.height);
     let wanted = height.saturating_add(app.scroll);
+    let selected = app
+        .selected_post
+        .as_deref()
+        .filter(|_| app.focus == Focus::Posts);
+    // Where the selected post sits, once it is laid out.
+    let mut reading: Option<Span> = None;
     let mut lines_rev: Vec<Line> = Vec::new();
     for (i, post) in posts.iter().enumerate().rev() {
         if let Some(next) = posts.get(i + 1) {
@@ -128,7 +142,15 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
                 lines_rev.push(Line::blank());
             }
         }
-        lines_rev.extend(post_lines(post, app, area.width).into_iter().rev());
+        let rows = post_lines(post, app, area.width);
+        if selected == Some(post.id.as_str()) {
+            reading = Some(Span {
+                id: post.id.clone(),
+                bottom: lines_rev.len(),
+                height: rows.len(),
+            });
+        }
+        lines_rev.extend(rows.into_iter().rev());
         // The oldest post says its day when that is not today.
         if i == 0 && lead_rows(app) > 0 {
             lines_rev.push(Line::blank());
@@ -153,13 +175,26 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
         &shown,
     );
 
-    if scroll > 0 {
-        let notice = [(
-            "↓ newer posts below".to_string(),
-            Ink::new(role::QUIET, role::MAIN_BG),
-        )];
-        let right = layout.posts.right().saturating_sub(BADGE_MARGIN);
-        canvas.segs_right(right, layout.notice_y, &notice);
+    // Quiet notes at the pane's edges, where the badges end: a tall post
+    // being read says there is more of it past either edge (the row above
+    // the posts is blank otherwise); below, that note comes before the
+    // newer posts' one.
+    let past = reading.map_or_else(PastEdges::default, |s| s.past_edges(scroll, height));
+    let below = if past.below {
+        Some(MORE_BELOW)
+    } else {
+        (scroll > 0).then_some(NEWER_BELOW)
+    };
+    let notes = [
+        (past.above.then_some(MORE_ABOVE), area.y.saturating_sub(1)),
+        (below, layout.notice_y),
+    ];
+    let right = layout.posts.right().saturating_sub(BADGE_MARGIN);
+    for (text, y) in notes {
+        if let Some(text) = text {
+            let note = [(text.to_string(), Ink::new(role::QUIET, role::MAIN_BG))];
+            canvas.segs_right(right, y, &note);
+        }
     }
 }
 
@@ -255,6 +290,34 @@ pub struct Span {
     pub bottom: usize,
     /// The post's own rows: header, body and attachment.
     pub height: usize,
+}
+
+/// The edges of the pane a post runs past.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PastEdges {
+    /// More of it is above the top edge.
+    pub above: bool,
+    /// More of it is below the bottom edge.
+    pub below: bool,
+}
+
+impl Span {
+    /// The edges this post runs past in a pane `height` rows tall,
+    /// scrolled `scroll` rows up, when it is taller than the pane and some
+    /// of it is on screen: what `j` `k` read on through, and what the
+    /// pane's edges say. A post that fits, or is out of sight, runs past
+    /// neither.
+    pub fn past_edges(&self, scroll: usize, height: usize) -> PastEdges {
+        let top = self.bottom + self.height;
+        let on_screen = self.bottom < scroll + height && top > scroll;
+        if self.height <= height || !on_screen {
+            return PastEdges::default();
+        }
+        PastEdges {
+            above: top > scroll + height,
+            below: self.bottom < scroll,
+        }
+    }
 }
 
 /// The rows each shown post takes in a pane `width` cells wide, newest
