@@ -25,13 +25,15 @@
 //!   and the post they move on to, if tall too, starts at the end the
 //!   reading goes on from (its top going down, its bottom going up). Going
 //!   into the posts picks the newest post on screen unless the selected one
-//!   is in sight, and a tall one where it is; a re-wrap (the sidebar shown
-//!   or hidden, a resize) keeps the place in a tall one. The arrows are the
-//!   sidebar's (Dang, R79KEKG2): in it they move as `j`/`k` do; from the
-//!   posts they go there (showing it if it is hidden; below 80 columns, to
-//!   the switcher row, which steps through the channels only) and move one
-//!   step. `n` `a` `s` `d` `E` `/` `?` `q` are commands, `space` starts a
-//!   chord, and any other printable key jumps to the composer and types
+//!   is in sight, and a tall one where it is; so does `j`/`k` when paging
+//!   left the selected one out of sight, without moving the view. A
+//!   re-wrap (the sidebar shown or hidden, a resize) keeps the place in a
+//!   tall one being read, and otherwise leaves the view be. The arrows are
+//!   the sidebar's (Dang, R79KEKG2): in it they move as `j`/`k` do; from
+//!   the posts they go there (showing it if it is hidden; below 80 columns,
+//!   to the switcher row, which steps through the channels only) and move
+//!   one step. `n` `a` `s` `d` `E` `/` `?` `q` are commands, `space` starts
+//!   a chord, and any other printable key jumps to the composer and types
 //!   itself.
 //! * **`space` is a leader** there (Dang, XNPVKNHP): it types nothing and
 //!   the footer says `e sidebar · esc cancel` until the next key. `e` (or
@@ -421,6 +423,12 @@ impl App {
             self.pick_visible_post();
             return Vec::new();
         };
+        // Paged away from (PgUp, PgDn): a post on screen is picked, as on
+        // the way into the posts, and the view stays where it was paged to.
+        if !self.in_sight(&spans[at]) {
+            self.pick_visible_post();
+            return Vec::new();
+        }
         let down = delta > 0;
         if self.read_on(&spans[at], down) {
             return Vec::new();
@@ -466,14 +474,13 @@ impl App {
     /// top would lose its middle); any other is revealed.
     fn pick_visible_post(&mut self) {
         let spans = self.post_spans();
-        let height = self.viewport().map(|view| usize::from(view.height));
-        let in_sight = |span: &Span| height.is_none_or(|h| span.on_screen(self.scroll, h));
         if self
             .selected_index(&spans)
-            .is_some_and(|at| in_sight(&spans[at]))
+            .is_some_and(|at| self.in_sight(&spans[at]))
         {
             return;
         }
+        let height = self.viewport().map(|view| usize::from(view.height));
         let pick = spans
             .iter()
             .find(|s| s.bottom + s.height > self.scroll)
@@ -487,6 +494,13 @@ impl App {
                 self.reveal(&span);
             }
         }
+    }
+
+    /// Whether some of `span` is on screen (as far as is known: before the
+    /// terminal's size is, any post counts).
+    fn in_sight(&self, span: &Span) -> bool {
+        self.viewport()
+            .is_none_or(|view| span.on_screen(self.scroll, usize::from(view.height)))
     }
 
     /// Scrolls just enough to show all of `span` (its top, if it is taller
@@ -649,20 +663,28 @@ impl App {
     /// `change` gives the posts pane another width (the sidebar shown or
     /// hidden), so the posts wrap anew: the scroll stays in range and the
     /// selected post in view, a tall one being read at the same place in it.
+    /// A tall one on screen but not filling the pane is left where it is
+    /// (revealing it would scroll, say, the newest posts away).
     fn refit(&mut self, change: impl FnOnce(&mut App)) {
         if self.rewrap(change) {
             return;
         }
+        let Some(view) = self.viewport() else {
+            return;
+        };
         let spans = self.post_spans();
         if let Some(at) = self.selected_index(&spans) {
-            self.reveal(&spans[at]);
+            let span = &spans[at];
+            if span.past_edges(self.scroll, usize::from(view.height)) == PastEdges::default() {
+                self.reveal(span);
+            }
         }
     }
 
     /// Makes `change` to the posts pane's size (the sidebar shown or hidden,
     /// or the terminal resized, which is also what a font size change is),
     /// after which the posts wrap anew, and keeps the scroll in range. A
-    /// selected post taller than the pane with some of it on screen keeps
+    /// selected post being read (taller than the pane and filling it) keeps
     /// the reader's place: as far through it as before, from its last row
     /// on the bottom edge to its first on the top edge (or all of it, if it
     /// fits now). Whether there was such a post.
@@ -688,18 +710,21 @@ impl App {
     }
 
     /// How far through the selected post the view is, when that post is
-    /// taller than the pane and some of it is on screen: 0 with its last
-    /// row on the bottom edge, 1 with its first row on the top edge.
+    /// being read: taller than the pane and filling it, edge to edge. 0
+    /// with its last row on the bottom edge, 1 with its first row on the
+    /// top edge. A tall post with other posts in view (say a newer one
+    /// under it, at the bottom of the channel) is not: the view is the
+    /// channel's, and stays where it is.
     fn reading_place(&self) -> Option<f64> {
         let height = usize::from(self.viewport()?.height);
         let spans = self.post_spans();
         let span = &spans[self.selected_index(&spans)?];
-        if span.past_edges(self.scroll, height) == PastEdges::default() {
+        let top = span.bottom + span.height;
+        if span.height <= height || span.bottom > self.scroll || top < self.scroll + height {
             return None;
         }
         let travel = span.height - height;
-        let into = self.scroll.saturating_sub(span.bottom).min(travel);
-        Some(into as f64 / travel as f64)
+        Some((self.scroll - span.bottom) as f64 / travel as f64)
     }
 
     /// `Esc`: in a composer with text, arms a clear, or with one `armed`

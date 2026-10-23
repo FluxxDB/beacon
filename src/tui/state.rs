@@ -1295,12 +1295,14 @@ impl App {
     }
 
     /// Keeps the agent cursor true after a message: only while the sidebar
-    /// has the keys, and on a row that is there. A row that went away
-    /// (forgotten, or quiet for 2 hours) passes the cursor to the row now in
-    /// its place, `was_at`, or the one above; with no agents left it goes
-    /// back to the view on screen.
+    /// has the keys and is drawn (the switcher below 80 columns has no agent
+    /// rows), and on a row that is there. A row that went away (forgotten,
+    /// or quiet for 2 hours) passes the cursor to the row now in its place,
+    /// `was_at`, or the one above; with no agents left it goes back to the
+    /// view on screen.
     fn keep_agent_cursor(&mut self, was_at: Option<usize>) {
-        if self.focus != Focus::Sidebar {
+        let drawn = self.layout().is_some_and(|l| l.sidebar.is_some());
+        if self.focus != Focus::Sidebar || !drawn {
             self.selected_agent = None;
         }
         if self.selected_agent.is_none() || self.selected_agent_index().is_some() {

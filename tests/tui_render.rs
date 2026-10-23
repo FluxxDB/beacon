@@ -1841,6 +1841,23 @@ mod behaviour {
     }
 
     #[test]
+    fn narrowing_below_80_columns_lets_go_of_the_agent_row() {
+        let mut app = app_with_agents();
+        feed(&mut app, [ch('j'), ch('j'), ch('j')]);
+        assert_eq!(app.selected_agent.as_deref(), Some("pc-configs"));
+        app.update(Msg::Resize(79, 24));
+        assert_eq!(
+            (app.focus, app.selected_agent.as_deref()),
+            (Focus::Sidebar, None)
+        );
+        app.update(ch('d'));
+        match &app.dialog {
+            Some(Dialog::Confirm(confirm)) => assert_eq!(confirm.title, "Delete #vllm?"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn a_hidden_sidebar_gives_the_main_pane_the_full_width() {
         for (width, height) in [(80u16, 24u16), (94, 30), (104, 33)] {
             let label = format!("{width}x{height}");

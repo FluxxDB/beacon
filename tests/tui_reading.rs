@@ -612,6 +612,81 @@ fn a_resize_mid_read_keeps_the_place() {
     }
 }
 
+/// At the bottom, the tall post selected and running off the top, with a
+/// newer post under it: as after answering a long post.
+fn at_the_bottom_under_a_tall_post() -> App {
+    let mut app = board(
+        SMALL,
+        vec![api_post(1, "pc-early", "an older post"), tall(2, 3 * VIEW)],
+    );
+    app.update(key(KeyCode::Tab));
+    assert_eq!((selected(&app), app.scroll), (Some(2), 0));
+    app.update(Msg::Stream(StreamEvent::Post(api_post(
+        3,
+        "pc-late",
+        "a newer post",
+    ))));
+    assert_eq!((selected(&app), app.scroll), (Some(2), 0));
+    assert_at_the_bottom(&app, "before");
+    app
+}
+
+/// Still at the bottom: the newer post on screen, nothing below it, and a
+/// live post that comes now is read.
+fn assert_at_the_bottom(app: &App, label: &str) {
+    let text = screen_text(&screen(app));
+    assert_eq!(app.scroll, 0, "{label}\n{text}");
+    assert!(text.contains("a newer post"), "{label}\n{text}");
+    assert!(!text.contains(NEWER_BELOW), "{label}\n{text}");
+    let mut app = app.clone();
+    let cmds = app.update(Msg::Stream(StreamEvent::Post(api_post(
+        4,
+        "pc-late",
+        "and another",
+    ))));
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Cmd::MarkRead { arrival: 4, .. })),
+        "{label}: the next live post is read: {cmds:?}"
+    );
+}
+
+#[test]
+fn a_resize_or_space_e_at_the_bottom_stays_at_the_bottom() {
+    for size in [(100u16, 24u16), (120, 30), (60, 24), SMALL] {
+        let mut app = at_the_bottom_under_a_tall_post();
+        app.update(Msg::Resize(size.0, size.1));
+        assert_at_the_bottom(&app, &format!("{size:?}"));
+    }
+    let mut app = at_the_bottom_under_a_tall_post();
+    app.update(ch(' '));
+    app.update(ch('e'));
+    assert!(app.hide_sidebar);
+    assert_at_the_bottom(&app, "hidden");
+    app.update(ch(' '));
+    app.update(ch('e'));
+    assert!(!app.hide_sidebar);
+    assert_at_the_bottom(&app, "shown again");
+}
+
+#[test]
+fn a_same_size_resize_leaves_the_view_as_it_is() {
+    // At the bottom, mid-read, and with the tall post's top showing.
+    let mut cases = vec![at_the_bottom_under_a_tall_post(), mid_read()];
+    let mut top = tall_between(SMALL, 3 * VIEW);
+    for _ in 0..4 {
+        top.update(ch('k'));
+    }
+    assert_eq!(tall_rows(&top), range(0..=11));
+    top.update(key(KeyCode::PageUp));
+    cases.push(top);
+    for mut app in cases {
+        let before = (app.scroll, screen_text(&screen(&app)));
+        app.update(Msg::Resize(SMALL.0, SMALL.1));
+        assert_eq!((app.scroll, screen_text(&screen(&app))), before);
+    }
+}
+
 // --------------------------------------------------- the server down
 
 #[test]
@@ -772,7 +847,7 @@ fn no_hint_unless_the_selected_post_is_tall_and_the_posts_have_the_keys() {
 }
 
 #[test]
-fn a_tall_post_scrolled_out_of_sight_has_no_hint_and_is_not_read_on() {
+fn a_tall_post_scrolled_out_of_sight_has_no_hint_and_k_picks_from_the_screen() {
     // An older post, the tall one, then five short ones: 15 rows below it,
     // more than the pane shows.
     let mut posts = vec![api_post(1, "pc-early", "an older post"), tall(2, 3 * VIEW)];
@@ -796,9 +871,43 @@ fn a_tall_post_scrolled_out_of_sight_has_no_hint_and_is_not_read_on() {
         !text.contains(MORE_ABOVE) && !text.contains(MORE_BELOW),
         "{text}"
     );
-    // Nor do j and k read on through it out there: k moves on to the older
-    // post, as before.
+    // Nor do j and k read on through it out there, or jump back to it: k
+    // picks the newest post on screen, as going into the posts does, and
+    // the view stays.
     app.update(ch('k'));
-    assert_eq!(selected(&app), Some(1));
-    assert!(screen_text(&screen(&app)).contains("an older post"));
+    assert_eq!((selected(&app), app.scroll), (Some(7), 0));
+}
+
+#[test]
+fn after_paging_away_from_the_selection_k_picks_from_the_screen() {
+    // Thirty short posts, three rows apart: post n's last row is 3 × (30 -
+    // n) rows up. The newest selected, then two pages up: scroll 20, rows
+    // 20 to 31 on screen, and post 23 (rows 21-22) the newest there.
+    let posts = (1..=30)
+        .map(|n| api_post(n, "pc-configs", &format!("post {n}")))
+        .collect();
+    let mut app = board(SMALL, posts);
+    app.update(key(KeyCode::Tab));
+    assert_eq!((selected(&app), app.scroll), (Some(30), 0));
+    app.update(key(KeyCode::PageUp));
+    app.update(key(KeyCode::PageUp));
+    assert_eq!((selected(&app), app.scroll), (Some(30), 20));
+    assert!(app.update(ch('k')).is_empty());
+    assert_eq!((selected(&app), app.scroll), (Some(23), 20), "no jump back");
+    // From there, k moves on as ever.
+    app.update(ch('k'));
+    assert_eq!((selected(&app), app.scroll), (Some(22), 20));
+
+    // The same with j, after paging back down past the selection.
+    app.update(key(KeyCode::PageDown));
+    app.update(key(KeyCode::PageDown));
+    assert_eq!(app.scroll, 0);
+    app.update(key(KeyCode::PageUp));
+    app.update(key(KeyCode::PageUp));
+    app.update(key(KeyCode::PageUp));
+    // Scroll 30: rows 30 to 41, post 22 (rows 24-25) is below them.
+    assert_eq!(app.scroll, 30);
+    app.update(ch('j'));
+    // Post 20 (rows 30-31) is the newest on screen.
+    assert_eq!((selected(&app), app.scroll), (Some(20), 30));
 }
