@@ -5,11 +5,13 @@
 //! they move on to, when it is tall too, starts at the end that keeps the
 //! reading going. While the selected post is that tall, the pane's edges
 //! say there is more of it above or below, quietly. Short posts move one
-//! per press, as they always did.
+//! per press, as they always did. Going into the posts leaves a tall post
+//! where it is, and a re-wrap (the sidebar shown or hidden, a resize) keeps
+//! the place in it.
 
 use std::collections::BTreeSet;
 
-use beacon::api::{ChannelJson, ChannelsJson, PostJson, PostsResponse};
+use beacon::api::{ChannelJson, ChannelsJson, PostJson, PostsResponse, StreamEvent};
 use beacon::model::{parse_mentions, AuthorKind};
 use beacon::tui::state::{App, Cmd, Conn, Focus, Loaded, Msg, Selection, PAGE};
 use beacon::tui::theme::{palette, role, ColorMode, Rgb, Theme};
@@ -321,6 +323,65 @@ fn j_lands_on_a_tall_posts_top_and_reads_down_to_its_bottom() {
 }
 
 #[test]
+fn entering_the_posts_at_the_bottom_leaves_a_tall_newest_post_where_it_is() {
+    // Dang's case: at the bottom, the last rows of a long newest post on
+    // screen. Tab, or Esc from an empty composer, selects it without
+    // moving the view, and k reads up from there: nothing is skipped.
+    for enter in [KeyCode::Tab, KeyCode::Esc] {
+        let mut app = board(
+            SMALL,
+            vec![api_post(1, "pc-early", "an older post"), tall(2, 3 * VIEW)],
+        );
+        assert_eq!(tall_rows(&app), range(24..=35));
+        app.update(key(enter));
+        assert_eq!((app.focus, selected(&app)), (Focus::Posts, Some(2)));
+        assert_eq!(app.scroll, 0, "{enter:?}: the view stays");
+        let views = read_with(&mut app, 'k', 10);
+        assert_eq!(
+            views,
+            [range(24..=35), range(14..=25), range(4..=15), range(0..=11)],
+            "{enter:?}"
+        );
+        assert_read_whole(&views, 3 * VIEW, 2);
+        assert_eq!(selected(&app), Some(1));
+    }
+}
+
+#[test]
+fn entering_the_posts_picks_anew_when_the_selected_post_is_out_of_sight() {
+    // A post selected; then, while the composer has the keys, a long
+    // answer arrives below it and pushes it out of sight.
+    let mut app = board(
+        SMALL,
+        vec![
+            api_post(0, "pc-early", "an older post"),
+            api_post(1, "pc-late", "a question"),
+        ],
+    );
+    app.update(key(KeyCode::Tab));
+    assert_eq!(selected(&app), Some(1));
+    app.update(key(KeyCode::Tab));
+    assert_eq!(app.focus, Focus::Composer);
+    app.update(Msg::Stream(StreamEvent::Post(tall(2, 3 * VIEW))));
+    assert_eq!((app.scroll, tall_rows(&app)), (0, range(24..=35)));
+    // Tab in: the answer on screen is picked, where it is, and read.
+    app.update(key(KeyCode::Tab));
+    assert_eq!((selected(&app), app.scroll), (Some(2), 0));
+    let views = read_with(&mut app, 'k', 10);
+    assert_read_whole(&views, 3 * VIEW, 2);
+    assert_eq!(selected(&app), Some(1), "then the question");
+
+    // A selected post still partly in sight stays selected.
+    let mut app = tall_between(SMALL, 3 * VIEW);
+    app.update(ch('k'));
+    app.update(ch('k'));
+    let scroll = app.scroll;
+    app.update(key(KeyCode::Tab));
+    app.update(key(KeyCode::Tab));
+    assert_eq!((selected(&app), app.scroll), (Some(2), scroll));
+}
+
+#[test]
 fn a_tall_newest_post_is_read_down_to_the_bottom_then_j_stays() {
     let mut app = board(
         SMALL,
@@ -328,7 +389,10 @@ fn a_tall_newest_post_is_read_down_to_the_bottom_then_j_stays() {
     );
     app.update(key(KeyCode::Tab));
     assert_eq!(selected(&app), Some(2));
-    // Entering the posts shows its top, as it always has.
+    // Up to its top first.
+    for _ in 0..3 {
+        app.update(ch('k'));
+    }
     assert_eq!(tall_rows(&app), range(0..=11));
     for want in [range(10..=21), range(20..=31), range(24..=35)] {
         assert!(app.update(ch('j')).is_empty());
@@ -476,6 +540,102 @@ fn a_reply_line_is_read_as_the_top_row_of_a_tall_post() {
     let top = row_text(&buf, TOP_Y);
     assert!(top.contains("╭─ pc-early  the plan"), "{top}");
     assert!(row_text(&buf, TOP_Y + 1).contains(TALL_AUTHOR));
+}
+
+// --------------------------------------------------- a re-wrap mid-read
+
+/// `count` numbered words, `w001 w002`...: a body that wraps to fewer rows
+/// in a wider pane.
+fn words(count: usize) -> String {
+    (1..=count)
+        .map(|i| format!("w{i:03}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A post of 400 words, `w001` to `w400` (51 rows beside the sidebar at
+/// 80 columns, 35 across the full width), between two short ones, read up
+/// to its middle.
+fn mid_read() -> App {
+    let mut app = board(
+        SMALL,
+        vec![
+            api_post(1, "pc-early", "an older post"),
+            api_post(2, TALL_AUTHOR, &words(400)),
+            api_post(3, "pc-late", "a newer post"),
+        ],
+    );
+    app.update(key(KeyCode::Tab));
+    for _ in 0..3 {
+        app.update(ch('k'));
+    }
+    assert_eq!(selected(&app), Some(2));
+    assert_mid_read(&app, "before");
+    app
+}
+
+/// The post's middle word is on screen, and neither of its ends.
+fn assert_mid_read(app: &App, label: &str) {
+    let text = screen_text(&screen(app));
+    assert!(text.contains("w200"), "{label}: its middle\n{text}");
+    assert!(
+        !text.contains(TALL_AUTHOR) && !text.contains("w400"),
+        "{label}: neither end\n{text}"
+    );
+}
+
+#[test]
+fn hiding_and_showing_the_sidebar_mid_read_keeps_the_place() {
+    let mut app = mid_read();
+    // space e from the posts: hidden, and the post wraps to fewer rows.
+    app.update(ch(' '));
+    app.update(ch('e'));
+    assert_eq!((app.hide_sidebar, app.focus), (true, Focus::Posts));
+    assert_mid_read(&app, "hidden");
+    // space e again: shown, and focused.
+    app.update(ch(' '));
+    app.update(ch('e'));
+    assert_eq!((app.hide_sidebar, app.focus), (false, Focus::Sidebar));
+    assert_mid_read(&app, "shown");
+}
+
+#[test]
+fn a_resize_mid_read_keeps_the_place() {
+    // Wider, as when the Mac's font gets smaller; wider and taller; below
+    // 80 columns; and back.
+    for size in [(120u16, 24u16), (100, 33), (60, 24)] {
+        let mut app = mid_read();
+        app.update(Msg::Resize(size.0, size.1));
+        assert_mid_read(&app, &format!("{size:?}"));
+        app.update(Msg::Resize(SMALL.0, SMALL.1));
+        assert_mid_read(&app, &format!("{size:?} and back"));
+    }
+}
+
+// --------------------------------------------------- the server down
+
+#[test]
+fn with_the_server_down_the_hint_sits_under_its_band_and_k_reads_on() {
+    let mut app = tall_between(SMALL, 3 * VIEW);
+    app.update(Msg::Connection(Conn::Down { since_ms: NOW }));
+    assert!(app.update(ch('k')).is_empty());
+    let buf = screen(&app);
+    let band_end = (0..SMALL.1)
+        .rfind(|&y| row_text(&buf, y).contains("Retrying"))
+        .expect("the server-down band");
+    assert!(row_text(&buf, TOP_Y).contains("Can't reach the beacon server"));
+    // Right above the first row of posts, as without the band: under it,
+    // a blank row apart.
+    let first = (0..SMALL.1)
+        .find(|&y| row_text(&buf, y).contains("line "))
+        .expect("the post's rows");
+    assert_eq!(first - 1, band_end + 2, "{}", screen_text(&buf));
+    let above = hint_cells(&app, &buf, first - 1, MORE_ABOVE);
+    assert_quiet(&buf, &above);
+    let views = read_with(&mut app, 'k', 10);
+    assert!(views[0].len() < VIEW, "the band takes rows: {views:?}");
+    assert_eq!(views[0].last(), Some(&35), "landed on its bottom");
+    assert_read_whole(&views, 3 * VIEW, 2);
 }
 
 // -------------------------------------------------------- PgUp and PgDn

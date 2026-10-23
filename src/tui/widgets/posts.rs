@@ -302,19 +302,23 @@ pub struct PastEdges {
 }
 
 impl Span {
+    /// Whether any of this post's rows is on screen in a pane `height`
+    /// rows tall, scrolled `scroll` rows up.
+    pub fn on_screen(&self, scroll: usize, height: usize) -> bool {
+        self.bottom < scroll + height && self.bottom + self.height > scroll
+    }
+
     /// The edges this post runs past in a pane `height` rows tall,
     /// scrolled `scroll` rows up, when it is taller than the pane and some
     /// of it is on screen: what `j` `k` read on through, and what the
     /// pane's edges say. A post that fits, or is out of sight, runs past
     /// neither.
     pub fn past_edges(&self, scroll: usize, height: usize) -> PastEdges {
-        let top = self.bottom + self.height;
-        let on_screen = self.bottom < scroll + height && top > scroll;
-        if self.height <= height || !on_screen {
+        if self.height <= height || !self.on_screen(scroll, height) {
             return PastEdges::default();
         }
         PastEdges {
-            above: top > scroll + height,
+            above: self.bottom + self.height > scroll + height,
             below: self.bottom < scroll,
         }
     }

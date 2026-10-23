@@ -574,9 +574,9 @@ impl App {
             Msg::Key(key) => self.on_key(key),
             Msg::Paste(text) => self.on_paste(&text),
             Msg::Resize(width, height) => {
-                self.size = (width, height);
                 self.leader = false;
-                self.clamp_scroll();
+                // The posts wrap anew; a tall one being read keeps its place.
+                self.rewrap(|app| app.size = (width, height));
                 self.leave_hidden_sidebar();
                 Vec::new()
             }

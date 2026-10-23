@@ -1808,6 +1808,39 @@ mod behaviour {
     }
 
     #[test]
+    fn below_80_columns_the_arrows_and_j_k_never_reach_an_agent_row() {
+        // The switcher shows channels only: an agent row the cursor sat on
+        // would be out of sight, and d would offer to forget it.
+        let mut app = app_with_agents();
+        app.update(Msg::Resize(79, 24));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Posts);
+        for _ in 0..5 {
+            app.update(key(KeyCode::Down));
+            assert_eq!(app.selected_agent, None);
+        }
+        for _ in 0..3 {
+            app.update(ch('j'));
+            assert_eq!(app.selected_agent, None);
+        }
+        assert_eq!(
+            app.selected,
+            Selection::Channel("vllm".to_string()),
+            "the last channel stays"
+        );
+        app.update(ch('d'));
+        match &app.dialog {
+            Some(Dialog::Confirm(confirm)) => assert_eq!(confirm.title, "Delete #vllm?"),
+            other => panic!("{other:?}"),
+        }
+        app.update(key(KeyCode::Esc));
+        // Wide again, the sidebar's agent rows are within reach once more.
+        app.update(Msg::Resize(W, H));
+        app.update(ch('j'));
+        assert_eq!(app.selected_agent.as_deref(), Some("pc-configs"));
+    }
+
+    #[test]
     fn a_hidden_sidebar_gives_the_main_pane_the_full_width() {
         for (width, height) in [(80u16, 24u16), (94, 30), (104, 33)] {
             let label = format!("{width}x{height}");
@@ -2276,6 +2309,18 @@ mod behaviour {
         app.update(ch('e'));
         assert_eq!((app.focus, app.input.as_str()), (Focus::Composer, "e"));
         assert!(!app.hide_sidebar);
+    }
+
+    #[test]
+    fn space_down_cancels_then_goes_to_the_sidebar() {
+        let mut app = in_the_posts();
+        assert_eq!(
+            feed(&mut app, [space(), key(KeyCode::Down)]),
+            [load("beacon")]
+        );
+        assert_eq!((app.focus, app.hide_sidebar), (Focus::Sidebar, false));
+        assert!(!app.leader);
+        assert!(!footer(&app).contains(LEADER_HINT));
     }
 
     #[test]

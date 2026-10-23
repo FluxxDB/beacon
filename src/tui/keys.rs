@@ -23,12 +23,16 @@
 //!   (Dang, MJN7KXH6): while more of it is past the edge they move toward,
 //!   they scroll a pane less two rows at a time, stopping at its far edge,
 //!   and the post they move on to, if tall too, starts at the end the
-//!   reading goes on from (its top going down, its bottom going up). The
-//!   arrows are the sidebar's (Dang, R79KEKG2): in it they move as `j`/`k`
-//!   do; from the posts they go there (showing it if it is hidden; below 80
-//!   columns, to the switcher row) and move one step. `n` `a` `s` `d` `E`
-//!   `/` `?` `q` are commands, `space` starts a chord, and any other
-//!   printable key jumps to the composer and types itself.
+//!   reading goes on from (its top going down, its bottom going up). Going
+//!   into the posts picks the newest post on screen unless the selected one
+//!   is in sight, and a tall one where it is; a re-wrap (the sidebar shown
+//!   or hidden, a resize) keeps the place in a tall one. The arrows are the
+//!   sidebar's (Dang, R79KEKG2): in it they move as `j`/`k` do; from the
+//!   posts they go there (showing it if it is hidden; below 80 columns, to
+//!   the switcher row, which steps through the channels only) and move one
+//!   step. `n` `a` `s` `d` `E` `/` `?` `q` are commands, `space` starts a
+//!   chord, and any other printable key jumps to the composer and types
+//!   itself.
 //! * **`space` is a leader** there (Dang, XNPVKNHP): it types nothing and
 //!   the footer says `e sidebar · esc cancel` until the next key. `e` (or
 //!   `E`) shows or hides the sidebar: from the posts, a hidden one is shown
@@ -64,7 +68,7 @@ use crate::tui::state::{
     Selection, CHANNEL_NAME_MAX, FILTER_MAX, NAME_RULE,
 };
 use crate::tui::view::SIDEBAR_MIN_WIDTH;
-use crate::tui::widgets::posts::{self, Span};
+use crate::tui::widgets::posts::{self, PastEdges, Span};
 
 /// What every key in the help overlay does, in its order.
 /// Each description fits the dialog at 80 columns, and the whole list fits
@@ -369,8 +373,9 @@ impl App {
 
     /// `j`/`↓` (+1) and `k`/`↑` (-1) in the sidebar: the next view, then on
     /// past the last channel into the agent rows (which leave the view on
-    /// screen as it is). `j` (+1) and `k` (-1) in the posts: the next newer
-    /// / older post, reading a tall one through first.
+    /// screen as it is), while the sidebar is drawn: the switcher row that
+    /// stands in for it shows channels only. `j` (+1) and `k` (-1) in the
+    /// posts: the next newer / older post, reading a tall one through first.
     fn move_by(&mut self, delta: i32) -> Vec<Cmd> {
         match self.focus {
             Focus::Sidebar => {
@@ -381,15 +386,18 @@ impl App {
                             .map(|c| Selection::Channel(c.name.clone())),
                     )
                     .collect();
+                let drawn = self.layout().is_some_and(|l| l.sidebar.is_some());
+                let agents = if drawn { self.agents.len() } else { 0 };
                 let at = match self.selected_agent_index() {
                     Some(agent) => views.len() + agent,
                     None => views.iter().position(|v| v == &self.selected).unwrap_or(0),
                 };
                 let next = if delta > 0 {
-                    (at + 1).min(views.len() + self.agents.len() - 1)
+                    at + 1
                 } else {
                     at.saturating_sub(1)
                 };
+                let next = next.min(views.len() + agents - 1);
                 if let Some(agent) = next.checked_sub(views.len()) {
                     self.selected_agent = Some(self.agents[agent].handle.clone());
                     return Vec::new();
@@ -450,11 +458,20 @@ impl App {
         posts::spans(self, width)
     }
 
-    /// Selects the newest post that is on screen, unless the selection
-    /// already is a shown post.
+    /// On the way into the posts: selects the newest post that is on
+    /// screen, unless the selection already is a shown post with some of it
+    /// in sight (one scrolled out of sight, say by a long answer arriving
+    /// below it, gives way). A post taller than the pane is selected where
+    /// it is, so reading it goes on from what is on screen (a jump to its
+    /// top would lose its middle); any other is revealed.
     fn pick_visible_post(&mut self) {
         let spans = self.post_spans();
-        if self.selected_index(&spans).is_some() {
+        let height = self.viewport().map(|view| usize::from(view.height));
+        let in_sight = |span: &Span| height.is_none_or(|h| span.on_screen(self.scroll, h));
+        if self
+            .selected_index(&spans)
+            .is_some_and(|at| in_sight(&spans[at]))
+        {
             return;
         }
         let pick = spans
@@ -464,7 +481,11 @@ impl App {
             .cloned();
         if let Some(span) = pick {
             self.selected_post = Some(span.id.clone());
-            self.reveal(&span);
+            let read_here =
+                height.is_some_and(|h| span.past_edges(self.scroll, h) != PastEdges::default());
+            if !read_here {
+                self.reveal(&span);
+            }
         }
     }
 
@@ -588,8 +609,7 @@ impl App {
         }
         self.focus = Focus::Composer;
         if self.size.0 >= SIDEBAR_MIN_WIDTH && !self.hide_sidebar {
-            self.hide_sidebar = true;
-            self.refit();
+            self.refit(|app| app.hide_sidebar = true);
         }
     }
 
@@ -598,8 +618,7 @@ impl App {
     fn enter_sidebar(&mut self) {
         self.focus = Focus::Sidebar;
         if self.size.0 >= SIDEBAR_MIN_WIDTH && self.hide_sidebar {
-            self.hide_sidebar = false;
-            self.refit();
+            self.refit(|app| app.hide_sidebar = false);
         }
     }
 
@@ -612,8 +631,7 @@ impl App {
     fn leader_sidebar(&mut self) {
         let shown = !self.hide_sidebar && self.size.0 >= SIDEBAR_MIN_WIDTH;
         if self.focus == Focus::Posts && shown {
-            self.hide_sidebar = true;
-            self.refit();
+            self.refit(|app| app.hide_sidebar = true);
         } else {
             self.toggle_sidebar();
         }
@@ -628,14 +646,60 @@ impl App {
         }
     }
 
-    /// The posts pane changed width, so the posts wrap anew: the scroll stays
-    /// in range and the selected post in view.
-    fn refit(&mut self) {
-        self.clamp_scroll();
+    /// `change` gives the posts pane another width (the sidebar shown or
+    /// hidden), so the posts wrap anew: the scroll stays in range and the
+    /// selected post in view, a tall one being read at the same place in it.
+    fn refit(&mut self, change: impl FnOnce(&mut App)) {
+        if self.rewrap(change) {
+            return;
+        }
         let spans = self.post_spans();
         if let Some(at) = self.selected_index(&spans) {
             self.reveal(&spans[at]);
         }
+    }
+
+    /// Makes `change` to the posts pane's size (the sidebar shown or hidden,
+    /// or the terminal resized, which is also what a font size change is),
+    /// after which the posts wrap anew, and keeps the scroll in range. A
+    /// selected post taller than the pane with some of it on screen keeps
+    /// the reader's place: as far through it as before, from its last row
+    /// on the bottom edge to its first on the top edge (or all of it, if it
+    /// fits now). Whether there was such a post.
+    pub(crate) fn rewrap(&mut self, change: impl FnOnce(&mut App)) -> bool {
+        let place = self.reading_place();
+        change(self);
+        self.clamp_scroll();
+        let Some(through) = place else {
+            return false;
+        };
+        let spans = self.post_spans();
+        let (Some(view), Some(at)) = (self.viewport(), self.selected_index(&spans)) else {
+            return true;
+        };
+        let span = &spans[at];
+        match span.height.checked_sub(usize::from(view.height)) {
+            Some(travel) if travel > 0 => {
+                self.scroll = span.bottom + (through * travel as f64).round() as usize;
+            }
+            _ => self.reveal(span),
+        }
+        true
+    }
+
+    /// How far through the selected post the view is, when that post is
+    /// taller than the pane and some of it is on screen: 0 with its last
+    /// row on the bottom edge, 1 with its first row on the top edge.
+    fn reading_place(&self) -> Option<f64> {
+        let height = usize::from(self.viewport()?.height);
+        let spans = self.post_spans();
+        let span = &spans[self.selected_index(&spans)?];
+        if span.past_edges(self.scroll, height) == PastEdges::default() {
+            return None;
+        }
+        let travel = span.height - height;
+        let into = self.scroll.saturating_sub(span.bottom).min(travel);
+        Some(into as f64 / travel as f64)
     }
 
     /// `Esc`: in a composer with text, arms a clear, or with one `armed`

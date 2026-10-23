@@ -64,7 +64,8 @@ impl App {
 
     /// `↑` (up) and `↓`: the same column on the row above or below, or as
     /// near it as that row goes; a run of them keeps aiming for the column
-    /// they started from. With no row there, to `past_the_edge`.
+    /// they started from. With no row there, to the end of the text (`↓`)
+    /// or its start (`↑`).
     fn move_row(&mut self, down: bool) {
         let width = self.composer_text_width();
         let text = composer::shown(&self.input);
@@ -76,25 +77,16 @@ impl App {
             row.checked_sub(1)
         };
         let Some(target) = target.and_then(|r| rows.get(r)) else {
-            // A jump forgets the column.
-            self.set_cursor(self.past_the_edge(down));
+            // Past the last row, the end of the text; past the first, its
+            // start, as in a macOS text box (Dang, R79KEKG2). The jump
+            // forgets the column.
+            self.set_cursor(if down { self.input.len() } else { 0 });
             return;
         };
         let goal = self.cursor_goal.unwrap_or(col);
         let to = composer::at_column(&text, target, goal);
         self.set_cursor(to);
         self.cursor_goal = Some(goal);
-    }
-
-    /// Where `↓` on the last row (`down`) and `↑` on the first take the
-    /// cursor: the end and the start of the text, as in a macOS text box
-    /// (Dang, R79KEKG2).
-    fn past_the_edge(&self, down: bool) -> usize {
-        if down {
-            self.input.len()
-        } else {
-            0
-        }
     }
 
     /// Puts `text` in at the cursor, which ends up after it.
