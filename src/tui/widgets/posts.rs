@@ -3,7 +3,9 @@
 //! post when it is not from today), the announcement and mention bands, tag
 //! badges, attachments, the empty and server-down states, and quiet notes
 //! at the pane's edges: newer posts below while it is scrolled up, more of
-//! the selected post past an edge while it is taller than the pane.
+//! the selected post past an edge while it is taller than the pane. The
+//! blank row above the first post Dang hasn't read holds the unread line
+//! (Dang, 2026-10-28; see [`line_post`]).
 //!
 //! Columns of a post, from the pane's left edge:
 //!
@@ -133,10 +135,16 @@ pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
         .filter(|_| app.focus == Focus::Posts);
     // Where the selected post sits, once it is laid out.
     let mut reading: Option<Span> = None;
+    let first_new = line_post(app).map(|p| p.id.as_str());
     let mut lines_rev: Vec<Line> = Vec::new();
     for (i, post) in posts.iter().enumerate().rev() {
         if let Some(next) = posts.get(i + 1) {
-            lines_rev.push(Line::blank());
+            // The row directly above the first new post is the line's.
+            lines_rev.push(if first_new == Some(next.id.as_str()) {
+                unread_line(area.width)
+            } else {
+                Line::blank()
+            });
             if !same_day(post.ts_ms, next.ts_ms, app) {
                 lines_rev.push(day_separator(next.ts_ms, app, area.width));
                 lines_rev.push(Line::blank());
@@ -392,6 +400,35 @@ fn same_day(a_ms: i64, b_ms: i64, app: &App) -> bool {
             .map(|t| t.to_zoned(app.tz.clone()).date())
     };
     date(a_ms) == date(b_ms)
+}
+
+/// The first shown post Dang hasn't read, when the unread line goes above
+/// it (Dang, 2026-10-28). A post is read when it arrived at or before
+/// [`App::line_point`], when Dang wrote it, or when it isn't known to be
+/// new (no arrival). The line goes right below the newest read post, in
+/// display order, and only when a new post follows it: a late-synced old
+/// post sorted up among the read ones doesn't pull it up. None without a
+/// read point, a read post, or a new post after the newest read one.
+pub fn line_post(app: &App) -> Option<&PostItem> {
+    let point = app.line_point?;
+    let read = |post: &PostItem| {
+        post.author.eq_ignore_ascii_case(&app.me)
+            || app.extras.get(&post.id).is_none_or(|e| e.arrival <= point)
+    };
+    let posts = shown(app);
+    let newest_read = posts.iter().rposition(|p| read(p))?;
+    // Everything after the newest read post is new.
+    posts.get(newest_read + 1).copied()
+}
+
+/// The unread line: `─` from the clock column to where badges end, in the
+/// accent.
+fn unread_line(width: u16) -> Line {
+    let run = "─".repeat(usize::from(width.saturating_sub(TIME + BADGE_MARGIN)));
+    Line {
+        band: None,
+        segs: vec![(TIME, (run, Ink::new(role::ACCENT, role::MAIN_BG)))],
+    }
 }
 
 /// `── Today ──`, centered.

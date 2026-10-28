@@ -25,7 +25,8 @@ pub mod palette {
     pub const MIST: Rgb = Rgb(0xd0, 0xd6, 0xe0);
     pub const PAPER: Rgb = Rgb(0xff, 0xff, 0xff);
     /// The one accent. Only on: the active channel's edge, the composer
-    /// prompt and caret, an announcement's edge rule, a dialog's primary action.
+    /// prompt and caret, an announcement's edge rule, a dialog's primary action,
+    /// the unread line (Dang, 2026-10-28).
     /// A blue standing in for the mockup's acid lime #e4f222 (Dang, 2026-10-22):
     /// 6.2:1 on obsidian, 6.85:1 under void text, its own xterm-256 index (69),
     /// and clear of iris, lavender and teal.

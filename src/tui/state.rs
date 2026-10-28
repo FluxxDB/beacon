@@ -71,6 +71,11 @@ pub struct App {
     pub posts: Vec<PostItem>,
     /// How many lines the posts are scrolled up from the newest (0 = bottom).
     pub scroll: usize,
+    /// The read point the unread line is placed by (Dang, 2026-10-28): the
+    /// open channel's `read_to` when it was opened, raised as posts are
+    /// read only while no line shows. `None` means no line: Announcements,
+    /// or a channel with no read point yet. See [`posts::line_post`].
+    pub line_point: Option<i64>,
     /// Agents in the sidebar, in display order.
     pub agents: Vec<AgentItem>,
     /// The agent row the sidebar's cursor is on (`j` past the last channel),
@@ -184,6 +189,7 @@ impl App {
             selected: Selection::Announcements,
             posts: Vec::new(),
             scroll: 0,
+            line_point: None,
             agents: Vec::new(),
             selected_agent: None,
             hide_sidebar: false,
@@ -748,6 +754,17 @@ impl App {
             return Vec::new();
         }
         self.view_chosen = true;
+        // The line is placed afresh from where Dang had read the channel
+        // to; none in Announcements, or before he has read it anywhere.
+        self.line_point = match &view {
+            Selection::Channel(name) => self
+                .channels
+                .iter()
+                .find(|c| &c.name == name)
+                .map(|c| c.read_to)
+                .filter(|&read_to| read_to > 0),
+            Selection::Announcements => None,
+        };
         self.selected = view;
         self.posts.clear();
         self.extras.clear();
@@ -817,10 +834,23 @@ impl App {
     }
 
     /// Every local `MarkRead` for `channel` passes here: its read point is
-    /// raised to `arrival` if that is higher.
+    /// raised to `arrival` if that is higher, and so is the line's when the
+    /// channel is on screen.
     fn note_read(&mut self, channel: &str, arrival: i64) {
         if let Some(c) = self.channels.iter_mut().find(|c| c.name == channel) {
             c.read_to = c.read_to.max(arrival);
+        }
+        if matches!(&self.selected, Selection::Channel(name) if name == channel) {
+            self.advance_line_point(arrival);
+        }
+    }
+
+    /// Raises the line's read point to `arrival` while no line shows. A
+    /// line that shows stays where it is once its posts are read, so Dang
+    /// can still see where he started (Dang, 2026-10-28).
+    fn advance_line_point(&mut self, arrival: i64) {
+        if posts::line_post(self).is_none() {
+            self.line_point = Some(self.line_point.map_or(arrival, |p| p.max(arrival)));
         }
     }
 
@@ -884,7 +914,16 @@ impl App {
     }
 
     fn on_channels(&mut self, list: &ChannelsJson) -> Vec<Cmd> {
-        self.channels = list.channels.iter().map(convert::channel_item).collect();
+        let mut channels: Vec<ChannelItem> =
+            list.channels.iter().map(convert::channel_item).collect();
+        // A list the server answered before it stored a `MarkRead` sent
+        // since must not lower the read point: the server's only rises.
+        for channel in &mut channels {
+            if let Some(known) = self.channels.iter().find(|c| c.name == channel.name) {
+                channel.read_to = channel.read_to.max(known.read_to);
+            }
+        }
+        self.channels = channels;
         self.announcements_unread = list.announcements_unread.unwrap_or(0);
         if !self.view_chosen {
             // The board opens on its first channel (`general` comes first).
@@ -1160,7 +1199,14 @@ impl App {
             self.clear_armed = false;
         }
         let item = convert::post_item(&created.post);
+        let on_screen = self.selected == Selection::Channel(item.channel.clone());
         self.add_to_view(item, convert::post_extra(&created.post));
+        // Dang posting in the channel takes its line away (Dang, 2026-10-28).
+        if on_screen {
+            if let Some(newest) = self.extras.values().map(|e| e.arrival).max() {
+                self.line_point = Some(newest);
+            }
+        }
         // Down to the newest, to see it; what came in meanwhile is seen too
         // (`update` marks it read).
         self.scroll = 0;
