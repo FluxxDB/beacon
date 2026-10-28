@@ -47,13 +47,16 @@ there. Once he has read his way up or down, he wants **one chord back to the new
   `src/store/unread.rs`) at the moment the line is set.
 - **Read and new posts.** A shown post is *read* if it arrived at or before the read point,
   or if Dang wrote it (case-insensitive, like `NEW_FROM_OTHERS`). Otherwise it is *new*.
-- **Where the line goes** (my call: "where he left off" is the newest post he had read,
-  in display order). Find the newest read post among the shown posts, in display order
-  `(ts, id)`. The line goes directly below it, above the next shown post, but only if that
-  next post is new.
-  - **Late-synced posts.** A post written on an offline device and synced later has an old
-    `ts` but a fresh arrival, so it sorts up among the read posts. It doesn't pull the line
-    up there. It still counts as unread, as today.
+- **Where the line goes** (Dang: "above the oldest post that I haven't yet read, below and
+  between the newest post that I have already read"). Find the newest read post among the
+  shown posts, in display order `(ts, id)`. The line goes directly below it, above the next
+  shown post, but only if that next post is new.
+  - Normally the posts after the newest read one are exactly the unread ones, so the line
+    sits between the last read post and the oldest unread one.
+  - **Late-synced posts** (Dang chose this, 2026-10-28). A post written on an offline device
+    and synced later has an old `ts` but a fresh arrival, so it sorts up among the read
+    posts. The line stays below his last read post; it doesn't jump back to the late post.
+    That post still counts as unread, as today.
 - **No line in these cases:**
   - Nothing new follows the newest read post.
   - No read post is loaded. This covers a channel he has never read, and the paging cap
