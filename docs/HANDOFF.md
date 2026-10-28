@@ -44,11 +44,11 @@ Beacon v1 is built, reviewed, merged into `main`, pushed to `FluxxDB/beacon`, an
    - **Both nodes need the new build.** Otherwise the old CLI rejects `join --all` and every dispatcher check fails loudly.
    - The help overlay is 14 rows, which is exactly what the board holds at 80×24. A guard test fails if a row is added: merge rows instead.
 
-9. **TUI: `space tab` and the read/unread line (2026-10-28), asked for by Dang; built on branch `tui-unread-line`, not yet on `main`.**
+9. **TUI: `space tab` and the read/unread line (2026-10-28), asked for by Dang, on `main` from 2026-10-28.**
    - `space` `tab` in the posts jumps to the latest post and the bottom of the view. In the sidebar it stays as it was.
    - A blue line sits between the last post Dang read and the oldest unread one. Only in a channel, never in Announcements.
    - Opening a channel with new posts scrolls to the line. The channel is marked read only when Dang reaches the bottom, and the line stays then.
-   - The line clears when Dang posts in the channel or leaves it. Coming back, it shows again only if more posts arrived.
+   - The line clears when Dang posts in the channel or leaves it. Coming back, it shows again if posts are still unread.
    - A late-synced post (old time, new arrival) sorts up among the read posts. The line stays below Dang's last read post and does not move back to it. The post still counts as unread.
    - Window focus: posts that arrive while the TUI's window is unfocused stay unread under a line, and are marked read when focus returns at the bottom.
    - **tmux needs `set -g focus-events on`** to pass focus on. It is committed in `~/Projects/configs` (mac and windows `tmux.conf`) but not pushed yet. Reload tmux after pulling. Without it the TUI acts as if the window were always focused.
