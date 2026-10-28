@@ -450,3 +450,251 @@ fn posting_in_another_channel_keeps_this_channels_line() {
     })));
     assert_line_above(&app, 5);
 }
+
+// ------------------------------------------------- opening at the line
+
+/// At 80×24 the posts take rows 5 to 16 (see `tests/tui_reading.rs`): 30
+/// two-row posts overflow them.
+const SMALL: (u16, u16) = (80, 24);
+const TOP_Y: u16 = 5;
+
+/// A full page of posts, as the node sends one.
+const PAGE: u32 = beacon::tui::state::PAGE;
+
+/// Post `n` of `rows` rows by `pc-longform`: its header, then `line 01`...
+fn tall(n: u32, rows: usize) -> PostJson {
+    let body = (1..rows)
+        .map(|i| format!("line {i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    api_post(n, "pc-longform", &body)
+}
+
+/// Older posts' page, fitting right above `before`.
+fn older_page(before: (i64, String), posts: Vec<PostJson>) -> Msg {
+    Msg::Loaded(Loaded::Posts {
+        view: general(),
+        before: Some(before),
+        page: Ok(PostsResponse {
+            v: 1,
+            posts,
+            remaining: None,
+        }),
+    })
+}
+
+/// Where the page `posts` starts: what the next older page is asked from.
+fn oldest(posts: &[PostJson]) -> (i64, String) {
+    posts
+        .iter()
+        .map(|p| (p.ts_ms, p.id.clone()))
+        .min()
+        .expect("posts")
+}
+
+/// Dang's board at [`SMALL`], #general just selected with his read point at
+/// `read_to` and `unread` posts new; returns what the first page, `posts`,
+/// asked for. The composer has the keys.
+fn open_small(read_to: i64, unread: u32, posts: Vec<PostJson>) -> (App, Vec<Cmd>) {
+    let mut app = App::new("pc", "Dang", TimeZone::UTC);
+    app.update(Msg::Tick(NOW));
+    app.update(Msg::Resize(SMALL.0, SMALL.1));
+    app.update(Msg::Connection(Conn::Up));
+    app.update(channels(read_to, unread));
+    let cmds = app.update(page(general(), posts));
+    (app, cmds)
+}
+
+fn marks_read(cmds: &[Cmd]) -> bool {
+    cmds.iter().any(|c| matches!(c, Cmd::MarkRead { .. }))
+}
+
+fn loads_older(cmds: &[Cmd]) -> Option<(i64, String)> {
+    cmds.iter().find_map(|c| match c {
+        Cmd::LoadPosts {
+            before: Some(before),
+            ..
+        } => Some(before.clone()),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_channel_with_new_posts_opens_at_the_line() {
+    let (app, cmds) = open_small(10, 20, posts(1..=30));
+    let buf = screen(&app);
+    assert_eq!(line_rows(&buf, &app), [TOP_Y]);
+    assert_eq!(header_row(&buf, &app, 11), TOP_Y + 1);
+    assert!(!marks_read(&cmds), "{cmds:?}");
+    assert_eq!(app.channels[0].unread, 20);
+    assert!(app.scroll > 0);
+}
+
+#[test]
+fn reaching_the_bottom_marks_it_read_and_keeps_the_line() {
+    let (mut app, _) = open_small(10, 20, posts(1..=30));
+    let opened_at = app.scroll;
+    app.update(key(KeyCode::Tab));
+    assert_eq!(app.focus, Focus::Posts);
+    let mut cmds = app.update(ch(' '));
+    cmds.extend(app.update(key(KeyCode::Tab)));
+    assert_eq!(app.scroll, 0);
+    assert!(cmds.contains(&mark_read(30)), "{cmds:?}");
+    assert_eq!(app.channels[0].unread, 0);
+
+    // Back up to where Dang started: the line is still there.
+    while app.scroll < opened_at {
+        let before = app.scroll;
+        app.update(key(KeyCode::PageUp));
+        assert!(app.scroll > before, "PgUp moves up");
+        if !line_rows(&screen(&app), &app).is_empty() {
+            break;
+        }
+    }
+    assert_eq!(app.line_point, Some(10));
+    assert_line_above(&app, 11);
+}
+
+#[test]
+fn few_new_posts_open_at_the_bottom_and_mark_read() {
+    let (app, cmds) = open_small(28, 2, posts(1..=30));
+    assert_eq!(app.scroll, 0);
+    assert!(cmds.contains(&mark_read(30)), "{cmds:?}");
+    assert_line_above(&app, 29);
+}
+
+#[test]
+fn a_tall_first_new_post_opens_with_its_top_under_the_line() {
+    let mut page = posts(1..=4);
+    page.push(tall(5, 30));
+    let (app, cmds) = open_small(4, 1, page);
+    let buf = screen(&app);
+    assert_eq!(line_rows(&buf, &app), [TOP_Y]);
+    assert!(row_text(&buf, TOP_Y + 1).contains("pc-longform"));
+    assert!(!marks_read(&cmds), "{cmds:?}");
+}
+
+#[test]
+fn more_than_a_page_new_loads_older_pages_until_a_read_post() {
+    let first = posts(PAGE + 1..=2 * PAGE);
+    let cursor = oldest(&first);
+    let (mut app, cmds) = open_small(50, 150, first);
+    assert_eq!(loads_older(&cmds), Some(cursor.clone()), "{cmds:?}");
+    assert!(!marks_read(&cmds), "{cmds:?}");
+
+    let cmds = app.update(older_page(cursor, posts(1..=PAGE)));
+    assert!(!marks_read(&cmds), "{cmds:?}");
+    assert_eq!(loads_older(&cmds), None, "{cmds:?}");
+    let buf = screen(&app);
+    assert_eq!(line_rows(&buf, &app), [TOP_Y]);
+    assert_eq!(header_row(&buf, &app, 51), TOP_Y + 1);
+}
+
+/// Post `n`, with hundreds of posts after it still on the same day.
+fn early(n: u32) -> PostJson {
+    let mut p = post(n);
+    p.ts_ms = NOW - (1_000 - i64::from(n)) * MIN;
+    p
+}
+
+#[test]
+fn past_five_pages_it_opens_at_the_bottom_with_no_line() {
+    let newest = 6 * PAGE;
+    let page_of = |k: u32| -> Vec<PostJson> {
+        (newest - (k + 1) * PAGE + 1..=newest - k * PAGE)
+            .map(early)
+            .collect()
+    };
+    let first = page_of(0);
+    let mut cursor = oldest(&first);
+    let (mut app, mut cmds) = open_small(10, newest - 10, first);
+    for k in 1..5 {
+        assert_eq!(loads_older(&cmds), Some(cursor.clone()), "page {k}");
+        assert!(!marks_read(&cmds), "page {k}: {cmds:?}");
+        let older = page_of(k);
+        let next = oldest(&older);
+        cmds = app.update(older_page(cursor, older));
+        cursor = next;
+    }
+    assert_eq!(loads_older(&cmds), None, "no sixth page: {cmds:?}");
+    assert_eq!(app.scroll, 0);
+    assert!(cmds.contains(&mark_read(i64::from(newest))), "{cmds:?}");
+    assert_no_line(&app, "no read post in five pages");
+}
+
+#[test]
+fn a_never_read_channel_loads_no_older_pages() {
+    let (app, cmds) = open_small(0, PAGE, posts(1..=PAGE));
+    assert_eq!(loads_older(&cmds), None, "{cmds:?}");
+    assert!(cmds.contains(&mark_read(i64::from(PAGE))), "{cmds:?}");
+    assert_eq!(app.scroll, 0);
+}
+
+#[test]
+fn a_reload_while_scrolled_up_marks_nothing_and_does_not_rescroll() {
+    let (mut app, _) = open_small(10, 20, posts(1..=30));
+    let s = app.scroll;
+    assert!(s > 0);
+    let cmds = app.update(Msg::Connection(Conn::Up));
+    assert!(!marks_read(&cmds), "{cmds:?}");
+    let cmds = app.update(page(general(), posts(1..=30)));
+    assert_eq!(app.scroll, s);
+    assert!(!marks_read(&cmds), "{cmds:?}");
+    assert_eq!(line_rows(&screen(&app), &app), [TOP_Y]);
+}
+
+#[test]
+fn a_never_read_channel_gets_a_line_for_posts_that_arrive_while_scrolled_up() {
+    let (mut app, cmds) = open_small(0, 30, posts(1..=30));
+    assert_eq!(app.scroll, 0);
+    assert!(cmds.contains(&mark_read(30)), "{cmds:?}");
+    assert_eq!(app.line_point, Some(30));
+
+    app.update(key(KeyCode::Tab));
+    assert_eq!(app.focus, Focus::Posts);
+    app.update(key(KeyCode::PageUp));
+    assert!(app.scroll > 0);
+    let cmds = app.update(Msg::Stream(StreamEvent::Post(post(31))));
+    assert!(!marks_read(&cmds), "scrolled up: {cmds:?}");
+
+    app.update(ch(' '));
+    let cmds = app.update(key(KeyCode::Tab));
+    assert_eq!(app.scroll, 0);
+    assert!(cmds.contains(&mark_read(31)), "{cmds:?}");
+    assert_line_above(&app, 31);
+}
+
+#[test]
+fn a_post_arriving_while_older_pages_load_is_not_read() {
+    let first = posts(PAGE + 1..=2 * PAGE);
+    let cursor = oldest(&first);
+    let (mut app, _) = open_small(50, 150, first);
+    let cmds = app.update(Msg::Stream(StreamEvent::Post(post(2 * PAGE + 1))));
+    assert!(!marks_read(&cmds), "still opening: {cmds:?}");
+    assert_eq!(app.line_point, Some(50));
+
+    app.update(older_page(cursor, posts(1..=PAGE)));
+    assert_eq!(line_rows(&screen(&app), &app), [TOP_Y]);
+    assert_eq!(app.channels[0].unread, 151);
+}
+
+#[test]
+fn an_older_page_that_fails_leaves_the_channel_opened_at_the_bottom() {
+    let first = posts(PAGE + 1..=2 * PAGE);
+    let cursor = oldest(&first);
+    let (mut app, _) = open_small(50, 150, first);
+    let cmds = app.update(Msg::Loaded(Loaded::Posts {
+        view: general(),
+        before: Some(cursor),
+        page: Err("timed out".to_string()),
+    }));
+    assert_eq!(app.opening, None);
+    assert_eq!(app.scroll, 0);
+    assert!(cmds.contains(&mark_read(i64::from(2 * PAGE))), "{cmds:?}");
+    // What arrives at the bottom from now on is read.
+    let cmds = app.update(Msg::Stream(StreamEvent::Post(post(2 * PAGE + 1))));
+    assert!(
+        cmds.contains(&mark_read(i64::from(2 * PAGE + 1))),
+        "{cmds:?}"
+    );
+}

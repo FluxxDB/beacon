@@ -31,6 +31,10 @@ use crate::tui::widgets::posts;
 
 /// Posts asked for at a time in a channel (the newest, then older pages).
 pub const PAGE: u32 = 100;
+/// Pages a channel opening loads at most, looking for a post Dang has read
+/// to open at the line below (Dang, 2026-10-28). Past them it opens at the
+/// bottom, with no line.
+pub const OPEN_PAGES: u8 = 5;
 /// Announcements asked for (the newest; that view has no older pages).
 pub const ANNOUNCEMENTS_LIMIT: u32 = 200;
 /// Longest filter, in characters (a tag or `@handle` is far shorter).
@@ -76,6 +80,11 @@ pub struct App {
     /// read only while no line shows. `None` means no line: Announcements,
     /// or a channel with no read point yet. See [`posts::line_post`].
     pub line_point: Option<i64>,
+    /// A channel just selected is still being placed: its first page, and
+    /// any older pages that needed, decide where it opens (at the line, or
+    /// at the bottom). Counts the pages asked for so far, the first being 1.
+    /// `None` once it is placed, and in Announcements.
+    pub opening: Option<u8>,
     /// Agents in the sidebar, in display order.
     pub agents: Vec<AgentItem>,
     /// The agent row the sidebar's cursor is on (`j` past the last channel),
@@ -190,6 +199,7 @@ impl App {
             posts: Vec::new(),
             scroll: 0,
             line_point: None,
+            opening: None,
             agents: Vec::new(),
             selected_agent: None,
             hide_sidebar: false,
@@ -747,8 +757,9 @@ impl App {
 
     // ------------------------------------------------------------- views
 
-    /// Shows `view` in the main pane and asks for its posts. A channel is
-    /// marked read for `me` once they arrive.
+    /// Shows `view` in the main pane and asks for its posts. A channel opens
+    /// at its unread line once they arrive, and is marked read for `me` if
+    /// that leaves the view at the bottom.
     pub(crate) fn select(&mut self, view: Selection) -> Vec<Cmd> {
         if self.view_chosen && self.selected == view {
             return Vec::new();
@@ -763,6 +774,10 @@ impl App {
                 .find(|c| &c.name == name)
                 .map(|c| c.read_to)
                 .filter(|&read_to| read_to > 0),
+            Selection::Announcements => None,
+        };
+        self.opening = match &view {
+            Selection::Channel(_) => Some(1),
             Selection::Announcements => None,
         };
         self.selected = view;
@@ -855,6 +870,57 @@ impl App {
     fn advance_line_point(&mut self, arrival: i64, line_held: bool) {
         if !line_held {
             self.line_point = Some(self.line_point.map_or(arrival, |p| p.max(arrival)));
+        }
+    }
+
+    /// Whether Dang is looking at the newest posts, so what arrives there is
+    /// read: the view is placed and at the bottom.
+    fn at_the_newest(&self) -> bool {
+        self.opening.is_none() && self.scroll == 0
+    }
+
+    /// Where a channel being opened is placed, once a page of it is in
+    /// (Dang, 2026-10-28). With a line to show, the line's row goes on the
+    /// pane's top edge, or as near it as the bottom allows. With none, and
+    /// no post Dang has read loaded, an older page is asked for, up to
+    /// [`OPEN_PAGES`]; that page places it in turn. Otherwise it stays at
+    /// the bottom. A channel left at the bottom is marked read. `line_held`
+    /// is whether the page left a line showing.
+    fn place_opening(&mut self, line_held: bool) -> Vec<Cmd> {
+        let Some(pages) = self.opening else {
+            return Vec::new();
+        };
+        let line_span = posts::line_post(self).and_then(|post| {
+            let view = self.viewport()?;
+            let span = posts::spans(self, view.width)
+                .into_iter()
+                .find(|s| s.id == post.id)?;
+            Some((span, usize::from(view.height)))
+        });
+        if let Some((span, height)) = line_span {
+            // The line is the row above the post's top.
+            self.scroll = (span.bottom + span.height + 1).saturating_sub(height);
+            self.clamp_scroll();
+        } else if self.line_point.is_some_and(|p| p > 0)
+            && !posts::shows_a_read_post(self)
+            && pages < OPEN_PAGES
+        {
+            let cmds = self.load_older();
+            if !cmds.is_empty() {
+                self.opening = Some(pages + 1);
+                return cmds;
+            }
+        }
+        self.opened(line_held)
+    }
+
+    /// The channel being opened is placed: read if that left it at the bottom.
+    fn opened(&mut self, line_held: bool) -> Vec<Cmd> {
+        self.opening = None;
+        if self.at_the_newest() {
+            self.mark_read(line_held)
+        } else {
+            Vec::new()
         }
     }
 
@@ -962,15 +1028,20 @@ impl App {
         let page = match page {
             Ok(page) => page,
             Err(e) => {
+                let mut cmds = Vec::new();
                 if older {
                     self.loading_older = false;
+                    // An opening that can't look further back stays where it is.
+                    if self.opening.is_some() {
+                        cmds = self.opened(posts::holds_line(self));
+                    }
                 } else {
                     self.loading = false;
                     self.load_failed = true;
                     self.arrivals = None;
                 }
                 self.error(format!("Couldn't load {}: {e}", view_name(&view)));
-                return Vec::new();
+                return cmds;
             }
         };
         let limit = match view {
@@ -978,10 +1049,10 @@ impl App {
             Selection::Announcements => ANNOUNCEMENTS_LIMIT,
         };
         let full = page.posts.len() >= limit as usize;
-        // Judged before the page changes the view. The first page after
-        // `select` (the view was empty while it loaded) counts as holding
-        // one: the server's read point placed that line, and it stays.
-        let line_held = self.loading || posts::holds_line(self);
+        // Judged before the page changes the view: posts a reload brings
+        // while Dang is at the bottom are seen as they come. A channel
+        // being opened judges by the page itself (see `place_opening`).
+        let line_held = posts::holds_line(self);
         for post in &page.posts {
             self.extras
                 .insert(post.id.clone(), convert::post_extra(post));
@@ -1017,7 +1088,8 @@ impl App {
                 }
             }
             sort_posts(&mut self.posts);
-            return Vec::new();
+            // A page an opening asked for places it in turn.
+            return self.place_opening(posts::holds_line(self));
         }
 
         let has_older = full && matches!(self.selected, Selection::Channel(_));
@@ -1065,8 +1137,16 @@ impl App {
         self.loading = false;
         self.has_older = has_older;
         self.clamp_scroll();
-        // A channel on screen is a channel read.
-        self.mark_read(line_held)
+        if self.opening.is_some() {
+            // The server's read point placed any line the page shows, and it stays.
+            return self.place_opening(posts::holds_line(self));
+        }
+        // A reload is read only where Dang is looking: at the bottom.
+        if self.at_the_newest() {
+            self.mark_read(line_held)
+        } else {
+            Vec::new()
+        }
     }
 
     // ------------------------------------------------------------ stream
@@ -1160,7 +1240,7 @@ impl App {
             return cmds;
         }
         // Read only if it is where Dang is looking: the bottom of the view.
-        if on_screen && placed && shown && self.scroll == 0 {
+        if on_screen && placed && shown && self.at_the_newest() {
             self.note_read(&channel, post.arrival, line_held);
             cmds.push(Cmd::MarkRead {
                 channel,

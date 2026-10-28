@@ -421,15 +421,24 @@ pub fn holds_line(app: &App) -> bool {
     first_new(app, &all).is_some()
 }
 
+/// Whether any shown post is read by [`line_post`]'s rule: if none is, a
+/// channel opening may page further back for one.
+pub fn shows_a_read_post(app: &App) -> bool {
+    app.line_point
+        .is_some_and(|point| shown(app).iter().any(|p| is_read(app, p, point)))
+}
+
+/// Whether `post` is read with the line's read point at `point`.
+fn is_read(app: &App, post: &PostItem, point: i64) -> bool {
+    post.author.eq_ignore_ascii_case(&app.me)
+        || app.extras.get(&post.id).is_none_or(|e| e.arrival <= point)
+}
+
 /// The post the unread line goes above among `posts` (in display order):
 /// the one right after the newest read post, if there is one.
 fn first_new<'a>(app: &App, posts: &[&'a PostItem]) -> Option<&'a PostItem> {
     let point = app.line_point?;
-    let read = |post: &PostItem| {
-        post.author.eq_ignore_ascii_case(&app.me)
-            || app.extras.get(&post.id).is_none_or(|e| e.arrival <= point)
-    };
-    let newest_read = posts.iter().rposition(|p| read(p))?;
+    let newest_read = posts.iter().rposition(|p| is_read(app, p, point))?;
     // Everything after the newest read post is new.
     posts.get(newest_read + 1).copied()
 }

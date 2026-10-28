@@ -567,7 +567,7 @@ impl App {
     }
 
     /// Asks for the page of posts before the oldest loaded, if there may be one.
-    fn load_older(&mut self) -> Vec<Cmd> {
+    pub(super) fn load_older(&mut self) -> Vec<Cmd> {
         let Selection::Channel(channel) = &self.selected else {
             return Vec::new();
         };
