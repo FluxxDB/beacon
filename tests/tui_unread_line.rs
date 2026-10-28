@@ -375,3 +375,78 @@ fn a_stale_channel_list_never_lowers_the_read_point() {
     app.update(channels(4, 0));
     assert_eq!(app.channels[0].read_to, 6);
 }
+
+// ------------------------------------------- what triggers a read (review)
+
+/// A `MarkRead` for #general up to `arrival`.
+fn mark_read(arrival: i64) -> Cmd {
+    Cmd::MarkRead {
+        channel: "general".to_string(),
+        arrival,
+    }
+}
+
+#[test]
+fn a_live_post_seen_at_the_bottom_draws_no_line() {
+    let mut app = board(6, 0, posts(1..=6));
+    assert_no_line(&app, "nothing new");
+    let cmds = app.update(Msg::Stream(StreamEvent::Post(post(7))));
+    assert!(cmds.contains(&mark_read(7)), "{cmds:?}");
+    assert_no_line(&app, "seen as it arrived");
+    assert_eq!(app.line_point, Some(7));
+}
+
+#[test]
+fn a_reloaded_page_seen_at_the_bottom_draws_no_line() {
+    let mut app = board(6, 0, posts(1..=6));
+    // The feed drops and comes back; the reload brings post 7.
+    app.update(Msg::Connection(Conn::Up));
+    let cmds = app.update(page(general(), posts(1..=7)));
+    assert!(cmds.contains(&mark_read(7)), "{cmds:?}");
+    assert_no_line(&app, "seen as it was reloaded");
+    assert_eq!(app.line_point, Some(7));
+}
+
+#[test]
+fn a_filter_hiding_the_read_posts_does_not_move_a_showing_line() {
+    let mut page = posts(1..=6);
+    for p in &mut page[4..] {
+        p.tags.push("y".to_string());
+    }
+    let mut app = board(4, 2, page);
+    assert_line_above(&app, 5);
+
+    // Only new posts shown: no line drawn among them.
+    app.update(key(KeyCode::Tab));
+    for c in "/y".chars() {
+        app.update(ch(c));
+    }
+    app.update(key(KeyCode::Enter));
+    assert_eq!(app.filter.as_deref(), Some("y"));
+    assert_no_line(&app, "nothing shown is read");
+
+    // A post it shows arrives at the bottom and is read.
+    let mut seven = post(7);
+    seven.tags.push("y".to_string());
+    let cmds = app.update(Msg::Stream(StreamEvent::Post(seven)));
+    assert!(cmds.contains(&mark_read(7)), "{cmds:?}");
+
+    // The line Dang opened with is still where it was.
+    app.update(key(KeyCode::Esc));
+    assert_eq!(app.filter, None);
+    assert_line_above(&app, 5);
+}
+
+#[test]
+fn posting_in_another_channel_keeps_this_channels_line() {
+    let mut app = board(4, 2, posts(1..=6));
+    assert_line_above(&app, 5);
+    let mut elsewhere = dangs(7);
+    elsewhere.channel = "random".to_string();
+    app.update(Msg::Sent(Ok(PostCreated {
+        v: 1,
+        post: elsewhere,
+        delivery: Vec::new(),
+    })));
+    assert_line_above(&app, 5);
+}

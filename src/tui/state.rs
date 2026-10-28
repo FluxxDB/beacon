@@ -809,7 +809,9 @@ impl App {
     }
 
     /// Marks the channel on screen read up to the newest post loaded.
-    fn mark_read(&mut self) -> Vec<Cmd> {
+    /// `line_held`: the view held an unread line before whatever brought
+    /// these posts (see [`App::note_read`]).
+    fn mark_read(&mut self, line_held: bool) -> Vec<Cmd> {
         let Selection::Channel(name) = &self.selected else {
             return Vec::new();
         };
@@ -826,7 +828,7 @@ impl App {
         if let Some(channel) = self.channels.iter_mut().find(|c| c.name == name) {
             channel.unread = 0;
         }
-        self.note_read(&name, arrival);
+        self.note_read(&name, arrival, line_held);
         vec![Cmd::MarkRead {
             channel: name,
             arrival,
@@ -835,21 +837,23 @@ impl App {
 
     /// Every local `MarkRead` for `channel` passes here: its read point is
     /// raised to `arrival` if that is higher, and so is the line's when the
-    /// channel is on screen.
-    fn note_read(&mut self, channel: &str, arrival: i64) {
+    /// channel is on screen (see [`App::advance_line_point`]). `line_held`
+    /// says whether the view held a line before the change that brought
+    /// the posts being read: a post seen as it arrives is read, not new.
+    fn note_read(&mut self, channel: &str, arrival: i64, line_held: bool) {
         if let Some(c) = self.channels.iter_mut().find(|c| c.name == channel) {
             c.read_to = c.read_to.max(arrival);
         }
         if matches!(&self.selected, Selection::Channel(name) if name == channel) {
-            self.advance_line_point(arrival);
+            self.advance_line_point(arrival, line_held);
         }
     }
 
-    /// Raises the line's read point to `arrival` while no line shows. A
-    /// line that shows stays where it is once its posts are read, so Dang
-    /// can still see where he started (Dang, 2026-10-28).
-    fn advance_line_point(&mut self, arrival: i64) {
-        if posts::line_post(self).is_none() {
+    /// Raises the line's read point to `arrival` unless the view held a
+    /// line: one that shows stays where it is once its posts are read, so
+    /// Dang can still see where he started (Dang, 2026-10-28).
+    fn advance_line_point(&mut self, arrival: i64, line_held: bool) {
+        if !line_held {
             self.line_point = Some(self.line_point.map_or(arrival, |p| p.max(arrival)));
         }
     }
@@ -865,7 +869,8 @@ impl App {
             .iter()
             .any(|c| &c.name == name && c.unread > 0)
         {
-            self.mark_read()
+            // Nothing new came with getting here: the view as it is decides.
+            self.mark_read(posts::holds_line(self))
         } else {
             Vec::new()
         }
@@ -973,6 +978,10 @@ impl App {
             Selection::Announcements => ANNOUNCEMENTS_LIMIT,
         };
         let full = page.posts.len() >= limit as usize;
+        // Judged before the page changes the view. The first page after
+        // `select` (the view was empty while it loaded) counts as holding
+        // one: the server's read point placed that line, and it stays.
+        let line_held = self.loading || posts::holds_line(self);
         for post in &page.posts {
             self.extras
                 .insert(post.id.clone(), convert::post_extra(post));
@@ -1057,7 +1066,7 @@ impl App {
         self.has_older = has_older;
         self.clamp_scroll();
         // A channel on screen is a channel read.
-        self.mark_read()
+        self.mark_read(line_held)
     }
 
     // ------------------------------------------------------------ stream
@@ -1144,13 +1153,15 @@ impl App {
         let announcement = item.announcement;
         let channel = item.channel.clone();
         let shown = posts::is_shown(self, &item);
+        // Judged before the post joins the view: seen as it arrives, it is read.
+        let line_held = posts::holds_line(self);
         let placed = self.add_to_view(item, convert::post_extra(post));
         if mine {
             return cmds;
         }
         // Read only if it is where Dang is looking: the bottom of the view.
         if on_screen && placed && shown && self.scroll == 0 {
-            self.note_read(&channel, post.arrival);
+            self.note_read(&channel, post.arrival, line_held);
             cmds.push(Cmd::MarkRead {
                 channel,
                 arrival: post.arrival,

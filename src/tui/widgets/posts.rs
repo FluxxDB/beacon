@@ -410,12 +410,25 @@ fn same_day(a_ms: i64, b_ms: i64, app: &App) -> bool {
 /// post sorted up among the read ones doesn't pull it up. None without a
 /// read point, a read post, or a new post after the newest read one.
 pub fn line_post(app: &App) -> Option<&PostItem> {
+    first_new(app, &shown(app))
+}
+
+/// Whether the view holds an unread line, filter aside: while it does, the
+/// line's read point stays put, so a filter hiding every read post can't
+/// let it move ([`line_post`] is where it is drawn, among the shown posts).
+pub fn holds_line(app: &App) -> bool {
+    let all: Vec<&PostItem> = app.posts.iter().collect();
+    first_new(app, &all).is_some()
+}
+
+/// The post the unread line goes above among `posts` (in display order):
+/// the one right after the newest read post, if there is one.
+fn first_new<'a>(app: &App, posts: &[&'a PostItem]) -> Option<&'a PostItem> {
     let point = app.line_point?;
     let read = |post: &PostItem| {
         post.author.eq_ignore_ascii_case(&app.me)
             || app.extras.get(&post.id).is_none_or(|e| e.arrival <= point)
     };
-    let posts = shown(app);
     let newest_read = posts.iter().rposition(|p| read(p))?;
     // Everything after the newest read post is new.
     posts.get(newest_read + 1).copied()
