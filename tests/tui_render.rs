@@ -2100,7 +2100,7 @@ mod behaviour {
     // ------------------------------------------- space: the leader (XNPVKNHP)
 
     /// What the footer says while `space` waits for the chord's next key.
-    const LEADER_HINT: &str = "e sidebar · esc cancel";
+    const LEADER_HINT: &str = "e sidebar · tab latest · esc cancel";
 
     fn space() -> Msg {
         ch(' ')
@@ -2152,6 +2152,17 @@ mod behaviour {
         app.update(space());
         assert_eq!((app.focus, app.input.as_str()), (Focus::Posts, ""));
         assert!(footer(&app).contains(LEADER_HINT));
+    }
+
+    #[test]
+    fn the_armed_footer_lists_tab_latest() {
+        let mut app = in_the_posts();
+        app.update(space());
+        let foot = footer(&app);
+        assert!(
+            foot.contains("e sidebar · tab latest · esc cancel"),
+            "|{foot}|"
+        );
     }
 
     #[test]
@@ -2310,13 +2321,15 @@ mod behaviour {
 
     #[test]
     fn space_tab_cancels_then_moves_focus() {
+        // From the posts, space tab is the chord: the focus stays (Dang,
+        // 2026-10-28; the jump itself is tested in tui_reading).
         let mut app = in_the_posts();
         feed(&mut app, [space(), key(KeyCode::Tab)]);
-        assert_eq!((app.focus, app.input.as_str()), (Focus::Composer, ""));
+        assert_eq!((app.focus, app.input.as_str()), (Focus::Posts, ""));
         assert!(!app.hide_sidebar);
         assert!(!footer(&app).contains(LEADER_HINT));
 
-        // From the sidebar, tab goes to the posts.
+        // From the sidebar, the chord cancels and tab goes to the posts.
         let mut app = in_the_posts();
         app.update(shift_e());
         feed(&mut app, [space(), key(KeyCode::Tab)]);
@@ -2848,6 +2861,12 @@ mod behaviour {
         app.update(ch('x'));
         assert_eq!(app.dialog, None, "any key closes it");
         assert_eq!(app.input, "", "and does nothing else");
+    }
+
+    #[test]
+    fn help_lists_space_tab() {
+        let all: Vec<String> = HELP.iter().map(|(k, w)| format!("{k} {w}")).collect();
+        assert!(all.join("\n").contains("space tab"), "{all:?}");
     }
 
     /// The help is its rows plus six: the borders, the title, a blank row

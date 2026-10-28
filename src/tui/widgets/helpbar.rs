@@ -22,7 +22,7 @@ const GAP: &str = "   ";
 /// Shown while `/` is being typed.
 pub const FILTER_HINT: &str = "a tag or @handle · enter keep · esc clear";
 /// Shown while `space` waits for the rest of its chord.
-pub const LEADER_HINT: &str = "e sidebar · esc cancel";
+pub const LEADER_HINT: &str = "e sidebar · tab latest · esc cancel";
 
 pub fn render(canvas: &mut Canvas, app: &App, layout: &Layout) {
     let area = layout.area;

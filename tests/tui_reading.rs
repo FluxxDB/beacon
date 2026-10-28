@@ -470,6 +470,64 @@ fn short_posts_move_one_per_press_as_before() {
     assert_eq!((selected(&app), app.scroll), (Some(6), 0));
 }
 
+// ------------------------------------------------- space tab: the latest
+
+/// Twenty short posts, the posts focused on the newest, the view scrolled up
+/// two pages.
+fn scrolled_up_in_twenty() -> App {
+    let posts = (1..=20)
+        .map(|n| api_post(n, "pc-configs", &format!("post {n}")))
+        .collect();
+    let mut app = board(SMALL, posts);
+    app.update(key(KeyCode::Tab));
+    assert_eq!(app.focus, Focus::Posts);
+    app.update(key(KeyCode::PageUp));
+    app.update(key(KeyCode::PageUp));
+    assert!(app.scroll > 0);
+    app
+}
+
+#[test]
+fn space_tab_in_the_posts_jumps_to_the_latest_post() {
+    let mut app = scrolled_up_in_twenty();
+    app.selected_post = Some(ulid(3));
+    assert!(app.update(ch(' ')).is_empty());
+    assert!(app.leader);
+    app.update(key(KeyCode::Tab));
+    assert_eq!(app.scroll, 0);
+    assert_eq!(selected(&app), Some(20));
+    assert_eq!(app.focus, Focus::Posts, "Tab did not cycle the focus");
+    assert!(!app.leader);
+}
+
+#[test]
+fn space_tab_from_the_sidebar_still_goes_to_the_posts() {
+    let mut app = board(SMALL, vec![api_post(1, "pc-configs", "post 1")]);
+    app.update(key(KeyCode::Tab));
+    app.update(ch('E'));
+    assert_eq!(app.focus, Focus::Sidebar);
+    app.update(ch(' '));
+    app.update(key(KeyCode::Tab));
+    assert_eq!(app.focus, Focus::Posts, "the chord cancels; Tab goes on");
+    assert!(!app.leader);
+}
+
+#[test]
+fn space_tab_at_the_bottom_marks_the_channel_read() {
+    let mut app = scrolled_up_in_twenty();
+    app.channels[0].unread = 3;
+    assert!(app.update(ch(' ')).is_empty());
+    let cmds = app.update(key(KeyCode::Tab));
+    assert_eq!(
+        cmds,
+        [Cmd::MarkRead {
+            channel: "general".to_string(),
+            arrival: 20
+        }]
+    );
+    assert_eq!(app.channels[0].unread, 0);
+}
+
 // --------------------------------------------------- a pane of 1 or 2 rows
 
 #[test]
