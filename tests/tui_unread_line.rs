@@ -762,3 +762,110 @@ fn an_older_page_that_fails_leaves_the_channel_opened_at_the_bottom() {
         "{cmds:?}"
     );
 }
+
+// ------------------------------------------------ final review fixes
+
+#[test]
+fn opening_after_a_day_change_shows_the_day_label_above_the_line() {
+    // Posts 1 to 10 are from yesterday, the new ones from today.
+    let mut page = posts(1..=30);
+    for p in &mut page[..10] {
+        p.ts_ms -= 24 * 60 * MIN;
+    }
+    let (app, cmds) = open_small(10, 20, page);
+    assert!(!marks_read(&cmds), "{cmds:?}");
+    let buf = screen(&app);
+    // The gap reads blank, label, line: the label is in view just above
+    // the line, and the line still sits right above the first new post.
+    assert_eq!(line_rows(&buf, &app), [TOP_Y + 2]);
+    assert!(
+        row_text(&buf, TOP_Y + 1).contains("── Today ──"),
+        "{:?}",
+        row_text(&buf, TOP_Y + 1)
+    );
+    assert_eq!(header_row(&buf, &app, 11), TOP_Y + 3);
+}
+
+#[test]
+fn an_unfocused_resize_to_the_bottom_marks_nothing() {
+    let mut app = board(30, 0, posts(1..=30));
+    app.update(key(KeyCode::Tab));
+    app.update(key(KeyCode::PageUp));
+    assert!(app.scroll > 0, "PgUp scrolled");
+    app.update(Msg::Stream(StreamEvent::Post(post(31))));
+    app.update(Msg::WindowFocus(false));
+    // A window tall enough for every post: the scroll clamps to the bottom.
+    let cmds = app.update(Msg::Resize(104, 120));
+    assert_eq!(app.scroll, 0);
+    assert!(!marks_read(&cmds), "unfocused: {cmds:?}");
+    assert_eq!(app.channels[0].unread, 1);
+}
+
+#[test]
+fn clearing_the_filter_while_older_pages_load_keeps_the_opening() {
+    let first = posts(PAGE + 1..=2 * PAGE);
+    let cursor = oldest(&first);
+    let (mut app, cmds) = open_small(50, 150, first);
+    assert_eq!(loads_older(&cmds), Some(cursor.clone()), "{cmds:?}");
+    app.update(key(KeyCode::Tab));
+    for c in "/zz".chars() {
+        app.update(ch(c));
+    }
+    app.update(key(KeyCode::Enter));
+    assert_eq!(app.filter.as_deref(), Some("zz"));
+    let cmds = app.update(key(KeyCode::Esc));
+    assert_eq!(app.filter, None);
+    assert!(!marks_read(&cmds), "still opening: {cmds:?}");
+    assert_eq!(app.line_point, Some(50));
+
+    app.update(older_page(cursor, posts(1..=PAGE)));
+    assert_eq!(app.line_point, Some(50));
+    assert_eq!(line_rows(&screen(&app), &app), [TOP_Y]);
+}
+
+#[test]
+fn focus_back_while_opening_marks_nothing() {
+    let first = posts(PAGE + 1..=2 * PAGE);
+    let (mut app, _) = open_small(50, 150, first);
+    app.update(Msg::WindowFocus(false));
+    let cmds = app.update(Msg::WindowFocus(true));
+    assert!(!marks_read(&cmds), "still opening: {cmds:?}");
+    assert_eq!(app.line_point, Some(50));
+}
+
+#[test]
+fn a_filter_does_not_make_the_opening_page_back() {
+    let first = posts(PAGE + 1..=2 * PAGE);
+    let mut app = App::new("pc", "Dang", TimeZone::UTC);
+    app.update(Msg::Tick(NOW));
+    app.update(Msg::Resize(SMALL.0, SMALL.1));
+    app.update(Msg::Connection(Conn::Up));
+    // The filter hides every post, the read ones too; it survives a select.
+    app.filter = Some("zz".to_string());
+    app.update(channels(i64::from(PAGE) + 10, 100));
+    let cmds = app.update(page(general(), first));
+    // The page holds read posts: there is no need to look further back.
+    assert_eq!(loads_older(&cmds), None, "{cmds:?}");
+    assert_eq!(app.opening, None);
+}
+
+#[test]
+fn a_key_after_focus_out_counts_as_focus_back() {
+    let mut app = board(6, 0, posts(1..=6));
+    app.update(Msg::WindowFocus(false));
+    let cmds = app.update(Msg::Stream(StreamEvent::Post(post(7))));
+    assert!(!marks_read(&cmds), "unfocused: {cmds:?}");
+
+    // A key being let go says nothing about the window.
+    let mut release = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+    release.kind = crossterm::event::KeyEventKind::Release;
+    let cmds = app.update(Msg::Key(release));
+    assert!(!app.window_focused);
+    assert!(!marks_read(&cmds), "a release: {cmds:?}");
+
+    // The focus-in never came, but Dang is typing.
+    let cmds = app.update(ch('a'));
+    assert!(app.window_focused);
+    assert!(cmds.contains(&mark_read(7)), "{cmds:?}");
+    assert_eq!(app.channels[0].unread, 0);
+}

@@ -421,11 +421,11 @@ pub fn holds_line(app: &App) -> bool {
     first_new(app, &all).is_some()
 }
 
-/// Whether any shown post is read by [`line_post`]'s rule: if none is, a
-/// channel opening may page further back for one.
-pub fn shows_a_read_post(app: &App) -> bool {
+/// Whether any loaded post is read by [`line_post`]'s rule, filter aside: if
+/// none is, a channel opening may page further back for one.
+pub fn holds_a_read_post(app: &App) -> bool {
     app.line_point
-        .is_some_and(|point| shown(app).iter().any(|p| is_read(app, p, point)))
+        .is_some_and(|point| app.posts.iter().any(|p| is_read(app, p, point)))
 }
 
 /// Whether `post` is read with the line's read point at `point`.

@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, KeyEventKind};
 use jiff::tz::TimeZone;
 use ratatui::layout::Rect;
 
@@ -597,13 +597,25 @@ impl App {
 
     fn apply(&mut self, msg: Msg) -> Vec<Cmd> {
         match msg {
-            Msg::Key(key) => self.on_key(key),
-            Msg::Paste(text) => self.on_paste(&text),
+            Msg::Key(key) => {
+                // A key being let go says nothing about the window.
+                let mut cmds = if key.kind == KeyEventKind::Release {
+                    Vec::new()
+                } else {
+                    self.typing_means_focus()
+                };
+                cmds.extend(self.on_key(key));
+                cmds
+            }
+            Msg::Paste(text) => {
+                let mut cmds = self.typing_means_focus();
+                cmds.extend(self.on_paste(&text));
+                cmds
+            }
             Msg::WindowFocus(focused) => {
                 self.window_focused = focused;
-                // Back at the bottom, what came in while away is seen now.
-                if focused && self.opening.is_none() && self.scroll == 0 {
-                    self.caught_up()
+                if focused {
+                    self.back_in_focus()
                 } else {
                     Vec::new()
                 }
@@ -889,6 +901,26 @@ impl App {
         }
     }
 
+    /// Back at the bottom with the window in focus, what came in while away
+    /// is seen now.
+    fn back_in_focus(&mut self) -> Vec<Cmd> {
+        if self.scroll == 0 {
+            self.caught_up()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// A key press or a paste means Dang is at the window, even if the
+    /// terminal or tmux dropped its focus-in (Dang, 2026-10-28).
+    fn typing_means_focus(&mut self) -> Vec<Cmd> {
+        if self.window_focused {
+            return Vec::new();
+        }
+        self.window_focused = true;
+        self.back_in_focus()
+    }
+
     /// Whether Dang is looking at the newest posts, so what arrives there is
     /// read: the view is placed and at the bottom, and the window has focus.
     fn at_the_newest(&self) -> bool {
@@ -911,14 +943,20 @@ impl App {
             let span = posts::spans(self, view.width)
                 .into_iter()
                 .find(|s| s.id == post.id)?;
-            Some((span, usize::from(view.height)))
+            // The gap above the post: the line's row, and the day's label
+            // when the day changes there.
+            let shown = posts::shown(self);
+            let at = shown.iter().position(|p| p.id == post.id)?;
+            let gap = posts::gap_rows(shown[at.checked_sub(1)?], post, self);
+            Some((span, gap, usize::from(view.height)))
         });
-        if let Some((span, height)) = line_span {
-            // The line is the row above the post's top.
-            self.scroll = (span.bottom + span.height + 1).saturating_sub(height);
+        if let Some((span, gap, height)) = line_span {
+            // The whole gap goes in view, so the day label shows above the
+            // line (Dang, 2026-10-28).
+            self.scroll = (span.bottom + span.height + gap).saturating_sub(height);
             self.clamp_scroll();
         } else if self.line_point.is_some_and(|p| p > 0)
-            && !posts::shows_a_read_post(self)
+            && !posts::holds_a_read_post(self)
             && pages < OPEN_PAGES
         {
             let cmds = self.load_older();
@@ -941,8 +979,12 @@ impl App {
     }
 
     /// The view is back at the newest post: if posts came in while it was
-    /// scrolled up, they have now been seen.
+    /// scrolled up, they have now been seen. Nothing is seen while the
+    /// window is unfocused or the channel is still being opened.
     fn caught_up(&mut self) -> Vec<Cmd> {
+        if !self.window_focused || self.opening.is_some() {
+            return Vec::new();
+        }
         let Selection::Channel(name) = &self.selected else {
             return Vec::new();
         };
