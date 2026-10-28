@@ -61,6 +61,9 @@
 //!   `Tab` takes it, `↑`/`↓` pick another match and `Esc` puts it away (that
 //!   `Esc` neither arms nor fires a clear); without one those keys do what
 //!   they always do.
+//! * The terminal window's focus is not a key (`Msg::WindowFocus`): while it
+//!   is lost nothing counts as seen, and getting it back at the bottom
+//!   marks what came in read (Dang, 2026-10-28).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;

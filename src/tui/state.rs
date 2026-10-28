@@ -85,6 +85,10 @@ pub struct App {
     /// at the bottom). Counts the pages asked for so far, the first being 1.
     /// `None` once it is placed, and in Announcements.
     pub opening: Option<u8>,
+    /// Whether the terminal window has focus (Dang, 2026-10-28). Starts true
+    /// and stays true where the terminal never reports focus. What comes in
+    /// while it is false is not read: Dang is not looking.
+    pub window_focused: bool,
     /// Agents in the sidebar, in display order.
     pub agents: Vec<AgentItem>,
     /// The agent row the sidebar's cursor is on (`j` past the last channel),
@@ -200,6 +204,7 @@ impl App {
             scroll: 0,
             line_point: None,
             opening: None,
+            window_focused: true,
             agents: Vec::new(),
             selected_agent: None,
             hide_sidebar: false,
@@ -281,6 +286,8 @@ pub enum Msg {
     /// Text pasted into the terminal (bracketed paste), all at once.
     Paste(String),
     Resize(u16, u16),
+    /// The terminal window gained (`true`) or lost (`false`) focus.
+    WindowFocus(bool),
     /// Once a second, with the time (epoch ms): ages, toasts, heartbeats.
     Tick(i64),
     /// An event from the live feed.
@@ -592,6 +599,15 @@ impl App {
         match msg {
             Msg::Key(key) => self.on_key(key),
             Msg::Paste(text) => self.on_paste(&text),
+            Msg::WindowFocus(focused) => {
+                self.window_focused = focused;
+                // Back at the bottom, what came in while away is seen now.
+                if focused && self.opening.is_none() && self.scroll == 0 {
+                    self.caught_up()
+                } else {
+                    Vec::new()
+                }
+            }
             Msg::Resize(width, height) => {
                 self.leader = false;
                 // The posts wrap anew; a tall one being read keeps its place.
@@ -874,9 +890,9 @@ impl App {
     }
 
     /// Whether Dang is looking at the newest posts, so what arrives there is
-    /// read: the view is placed and at the bottom.
+    /// read: the view is placed and at the bottom, and the window has focus.
     fn at_the_newest(&self) -> bool {
-        self.opening.is_none() && self.scroll == 0
+        self.opening.is_none() && self.scroll == 0 && self.window_focused
     }
 
     /// Where a channel being opened is placed, once a page of it is in

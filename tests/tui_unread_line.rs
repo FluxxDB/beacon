@@ -408,6 +408,70 @@ fn a_reloaded_page_seen_at_the_bottom_draws_no_line() {
 }
 
 #[test]
+fn an_unfocused_window_leaves_live_posts_unread_under_a_line() {
+    let mut app = board(6, 0, posts(1..=6));
+    app.update(Msg::WindowFocus(false));
+    let cmds = app.update(Msg::Stream(StreamEvent::Post(post(7))));
+    assert!(!marks_read(&cmds), "unfocused: {cmds:?}");
+    assert_eq!(app.channels[0].unread, 1);
+    assert_line_above(&app, 7);
+}
+
+#[test]
+fn focus_back_at_the_bottom_marks_read_and_keeps_the_line() {
+    let mut app = board(6, 0, posts(1..=6));
+    app.update(Msg::WindowFocus(false));
+    app.update(Msg::Stream(StreamEvent::Post(post(7))));
+    let cmds = app.update(Msg::WindowFocus(true));
+    assert!(cmds.contains(&mark_read(7)), "{cmds:?}");
+    assert_line_above(&app, 7);
+}
+
+#[test]
+fn a_focused_window_at_the_bottom_reads_live_posts_with_no_line() {
+    let mut app = board(6, 0, posts(1..=6));
+    let cmds = app.update(Msg::Stream(StreamEvent::Post(post(7))));
+    assert!(cmds.contains(&mark_read(7)), "{cmds:?}");
+    assert_no_line(&app, "focused at the bottom");
+}
+
+#[test]
+fn scrolled_up_live_posts_get_a_line() {
+    let mut app = board(30, 0, posts(1..=30));
+    app.update(key(KeyCode::Tab));
+    app.update(key(KeyCode::PageUp));
+    assert!(app.scroll > 0, "PgUp scrolled");
+    let cmds = app.update(Msg::Stream(StreamEvent::Post(post(31))));
+    assert!(!marks_read(&cmds), "scrolled up: {cmds:?}");
+    app.update(ch(' '));
+    let cmds = app.update(key(KeyCode::Tab));
+    assert!(cmds.contains(&mark_read(31)), "{cmds:?}");
+    assert_line_above(&app, 31);
+}
+
+#[test]
+fn focus_back_while_scrolled_up_marks_nothing() {
+    let mut app = board(30, 0, posts(1..=30));
+    app.update(Msg::WindowFocus(false));
+    app.update(Msg::Stream(StreamEvent::Post(post(31))));
+    app.update(key(KeyCode::Tab));
+    app.update(key(KeyCode::PageUp));
+    assert!(app.scroll > 0);
+    let cmds = app.update(Msg::WindowFocus(true));
+    assert!(!marks_read(&cmds), "scrolled up: {cmds:?}");
+}
+
+#[test]
+fn a_reload_while_unfocused_marks_nothing_and_draws_the_line() {
+    let mut app = board(6, 0, posts(1..=6));
+    app.update(Msg::WindowFocus(false));
+    app.update(Msg::Connection(Conn::Up));
+    let cmds = app.update(page(general(), posts(1..=7)));
+    assert!(!marks_read(&cmds), "unfocused: {cmds:?}");
+    assert_line_above(&app, 7);
+}
+
+#[test]
 fn a_filter_hiding_the_read_posts_does_not_move_a_showing_line() {
     let mut page = posts(1..=6);
     for p in &mut page[4..] {
