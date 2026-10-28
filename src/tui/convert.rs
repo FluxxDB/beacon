@@ -59,6 +59,7 @@ pub fn channel_item(c: &ChannelJson) -> ChannelItem {
             .map(clean_line)
             .filter(|t| !t.trim().is_empty()),
         unread: c.unread.unwrap_or(0),
+        read_to: c.read_to.unwrap_or(0),
     }
 }
 

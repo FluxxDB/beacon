@@ -420,6 +420,9 @@ pub struct ChannelItem {
     pub name: String,
     pub topic: Option<String>,
     pub unread: u32,
+    /// The arrival Dang has read this channel up to (0: no cursor). The server
+    /// sends it with the list; reading here raises it at once.
+    pub read_to: i64,
 }
 
 /// What the main pane shows.
@@ -806,10 +809,19 @@ impl App {
         if let Some(channel) = self.channels.iter_mut().find(|c| c.name == name) {
             channel.unread = 0;
         }
+        self.note_read(&name, arrival);
         vec![Cmd::MarkRead {
             channel: name,
             arrival,
         }]
+    }
+
+    /// Every local `MarkRead` for `channel` passes here: its read point is
+    /// raised to `arrival` if that is higher.
+    fn note_read(&mut self, channel: &str, arrival: i64) {
+        if let Some(c) = self.channels.iter_mut().find(|c| c.name == channel) {
+            c.read_to = c.read_to.max(arrival);
+        }
     }
 
     /// The view is back at the newest post: if posts came in while it was
@@ -1084,6 +1096,7 @@ impl App {
                 name: item.channel.clone(),
                 topic: None,
                 unread: 0,
+                read_to: 0,
             });
             cmds.push(Cmd::LoadChannels);
         }
@@ -1098,6 +1111,7 @@ impl App {
         }
         // Read only if it is where Dang is looking: the bottom of the view.
         if on_screen && placed && shown && self.scroll == 0 {
+            self.note_read(&channel, post.arrival);
             cmds.push(Cmd::MarkRead {
                 channel,
                 arrival: post.arrival,

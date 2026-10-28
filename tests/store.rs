@@ -1704,6 +1704,19 @@ fn unread_skips_deleted_posts_and_hidden_channels() {
 }
 
 #[test]
+fn cursors_lists_each_channel_read_point() {
+    let (mut a, _) = pair();
+    a.set_cursor("Dang", "general", 7).unwrap();
+    a.set_cursor("Dang", "beacon", 3).unwrap();
+    // The handle matches whatever its case, as cursors are stored.
+    assert_eq!(
+        a.cursors("dang").unwrap(),
+        [("beacon".to_string(), 3), ("general".to_string(), 7)].into()
+    );
+    assert!(a.cursors("nobody").unwrap().is_empty());
+}
+
+#[test]
 fn cursor_never_moves_backwards() {
     let (mut a, _) = pair();
     let me = "reader";
@@ -2261,7 +2274,7 @@ fn forget_converges_whatever_the_order() {
     let seen_by = |s: &mut Store, handle: &str, status: Option<&str>, ts: i64| {
         local(s, EventKind::AgentSeen(heartbeat(handle, status)), ts)
     };
-    let events = vec![
+    let events = [
         seen_by(&mut a, "pc-test", Some("e2e"), t0),
         seen_by(&mut b, "mac-test", None, t0 + 1),
         forget(&mut c, "pc-test", t0 + 10),

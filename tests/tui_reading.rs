@@ -103,6 +103,7 @@ fn board(size: (u16, u16), posts: Vec<PostJson>) -> App {
             name: "general".to_string(),
             topic: None,
             unread: Some(0),
+            read_to: None,
         }],
         announcements_unread: Some(0),
     })));

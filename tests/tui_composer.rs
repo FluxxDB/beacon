@@ -33,6 +33,7 @@ fn composing() -> App {
         name: "beacon".to_string(),
         topic: None,
         unread: 0,
+        read_to: 0,
     }];
     app.selected = Selection::Channel("beacon".to_string());
     app.view_chosen = true;

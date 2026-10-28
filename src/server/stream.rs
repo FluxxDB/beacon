@@ -548,7 +548,7 @@ fn describe(
             EventKind::ChannelCreated { name, .. } => {
                 if let Some(row) = store.channel(name)? {
                     out.push(StreamEvent::Channel {
-                        channel: ChannelJson::from_row(&row, None),
+                        channel: ChannelJson::from_row(&row, None, None),
                         deleted: false,
                     });
                 }
@@ -560,6 +560,7 @@ fn describe(
                             name: name.clone(),
                             topic: None,
                             unread: None,
+                            read_to: None,
                         },
                         deleted: true,
                     });

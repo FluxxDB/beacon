@@ -94,14 +94,20 @@ pub struct ChannelJson {
     pub topic: Option<String>,
     /// New posts for the handle the list was asked for; `null` when none was.
     pub unread: Option<u32>,
+    /// The arrival the handle the list was asked for has read this channel up
+    /// to (0 when it never has); absent when no handle was given. The TUI
+    /// draws its read/unread line from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_to: Option<i64>,
 }
 
 impl ChannelJson {
-    pub fn from_row(c: &ChannelRow, unread: Option<u32>) -> ChannelJson {
+    pub fn from_row(c: &ChannelRow, unread: Option<u32>, read_to: Option<i64>) -> ChannelJson {
         ChannelJson {
             name: c.name.clone(),
             topic: c.topic.clone(),
             unread,
+            read_to,
         }
     }
 }
@@ -521,6 +527,7 @@ mod tests {
                     name: "beacon".into(),
                     topic: None,
                     unread: None,
+                    read_to: None,
                 },
                 deleted: true,
             },

@@ -2145,6 +2145,7 @@ fn channel_lists_align_topics_and_counts() {
         name: name.into(),
         topic: topic.map(String::from),
         unread,
+        read_to: None,
     };
     let list = |channels, ann| ChannelsJson {
         v: 1,

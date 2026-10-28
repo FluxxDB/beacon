@@ -74,6 +74,7 @@ fn channel(name: &str, topic: Option<&str>, unread: u32) -> ChannelItem {
         name: name.to_string(),
         topic: topic.map(str::to_string),
         unread,
+        read_to: 0,
     }
 }
 
@@ -1305,6 +1306,7 @@ mod behaviour {
                     name: name.to_string(),
                     topic: Some(format!("about {name}")),
                     unread: Some(*unread),
+                    read_to: None,
                 })
                 .collect(),
             announcements_unread: Some(announcements_unread),
@@ -2459,6 +2461,7 @@ mod behaviour {
                 name: "gpu-jobs".to_string(),
                 topic: None,
                 unread: None,
+                read_to: None,
             },
         })));
         assert_eq!(app.focus, Focus::Composer);
@@ -2514,6 +2517,39 @@ mod behaviour {
     }
 
     // ------------------------------------------------------------ sidebar
+
+    #[test]
+    fn marking_read_raises_the_local_read_point() {
+        let mut app = App::new("pc", "Dang", new_york());
+        feed(
+            &mut app,
+            [
+                Msg::Tick(at(18, 40)),
+                Msg::Resize(W, H),
+                Msg::Connection(Conn::Up),
+            ],
+        );
+        let mut list = channels_json(&[("general", 3)], 0);
+        list.channels[0].read_to = Some(2);
+        app.update(Msg::Loaded(Loaded::Channels(list)));
+        assert_eq!(app.channels[0].read_to, 2, "the server's read point");
+
+        app.update(Msg::Loaded(page(
+            (1..=5)
+                .map(|n| api_post(n, "general", "mac-juicebox", "hi"))
+                .collect(),
+        )));
+        assert_eq!(app.channels[0].read_to, 5, "opening it read it all");
+
+        // A post that arrives at the bottom is read on the spot.
+        app.update(Msg::Stream(StreamEvent::Post(api_post(
+            6,
+            "general",
+            "mac-juicebox",
+            "six",
+        ))));
+        assert_eq!(app.channels[0].read_to, 6);
+    }
 
     #[test]
     fn selecting_channel_loads_and_marks_read() {
@@ -2641,6 +2677,7 @@ mod behaviour {
                 name: "gpu-jobs".to_string(),
                 topic: Some("long jobs".to_string()),
                 unread: None,
+                read_to: None,
             },
         })));
         assert_eq!(app.selected, Selection::Channel("gpu-jobs".to_string()));
@@ -3037,6 +3074,7 @@ mod behaviour {
                 name: "gpu-jobs".to_string(),
                 topic: Some("long jobs".to_string()),
                 unread: None,
+                read_to: None,
             },
             deleted: false,
         }));
@@ -3048,6 +3086,7 @@ mod behaviour {
                 name: "general".to_string(),
                 topic: None,
                 unread: None,
+                read_to: None,
             },
             deleted: true,
         }));
@@ -3587,6 +3626,7 @@ mod behaviour {
             name: "beacon".to_string(),
             topic: Some("  ".to_string()),
             unread: None,
+            read_to: None,
         });
         assert_eq!((ch.topic, ch.unread), (None, 0));
 
