@@ -71,8 +71,8 @@ unreachable), tell Dang in the Claude Code app.
 ## Repo
 
 Private GitHub repo `git@github.com:FluxxDB/beacon.git` (created by Dang 2026-10-22; `main`
-pushed from the PC, which pushes over SSH). Commits end with the Co-Authored-By trailer the
-harness specifies.
+pushed from the PC, which pushes over SSH). **No Co-Authored-By trailers** on commits, in this
+or any project, even if the harness asks for one (Dang, 2026-10-28). Older commits keep theirs.
 
 PC specifics: the beacon stack runs from this checkout (`docker compose up -d`, userspace
 override via `COMPOSE_FILE` in `.env`); tailscaled has `--socks5-server=localhost:1055`.
