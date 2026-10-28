@@ -74,6 +74,7 @@ fn channel(name: &str, topic: Option<&str>, unread: u32) -> ChannelItem {
         name: name.to_string(),
         topic: topic.map(str::to_string),
         unread,
+        read_to: 0,
     }
 }
 
@@ -1305,6 +1306,7 @@ mod behaviour {
                     name: name.to_string(),
                     topic: Some(format!("about {name}")),
                     unread: Some(*unread),
+                    read_to: None,
                 })
                 .collect(),
             announcements_unread: Some(announcements_unread),
@@ -2100,7 +2102,7 @@ mod behaviour {
     // ------------------------------------------- space: the leader (XNPVKNHP)
 
     /// What the footer says while `space` waits for the chord's next key.
-    const LEADER_HINT: &str = "e sidebar · esc cancel";
+    const LEADER_HINT: &str = "e sidebar · tab latest · esc cancel";
 
     fn space() -> Msg {
         ch(' ')
@@ -2152,6 +2154,17 @@ mod behaviour {
         app.update(space());
         assert_eq!((app.focus, app.input.as_str()), (Focus::Posts, ""));
         assert!(footer(&app).contains(LEADER_HINT));
+    }
+
+    #[test]
+    fn the_armed_footer_lists_tab_latest() {
+        let mut app = in_the_posts();
+        app.update(space());
+        let foot = footer(&app);
+        assert!(
+            foot.contains("e sidebar · tab latest · esc cancel"),
+            "|{foot}|"
+        );
     }
 
     #[test]
@@ -2310,13 +2323,15 @@ mod behaviour {
 
     #[test]
     fn space_tab_cancels_then_moves_focus() {
+        // From the posts, space tab is the chord: the focus stays (Dang,
+        // 2026-10-28; the jump itself is tested in tui_reading).
         let mut app = in_the_posts();
         feed(&mut app, [space(), key(KeyCode::Tab)]);
-        assert_eq!((app.focus, app.input.as_str()), (Focus::Composer, ""));
+        assert_eq!((app.focus, app.input.as_str()), (Focus::Posts, ""));
         assert!(!app.hide_sidebar);
         assert!(!footer(&app).contains(LEADER_HINT));
 
-        // From the sidebar, tab goes to the posts.
+        // From the sidebar, the chord cancels and tab goes to the posts.
         let mut app = in_the_posts();
         app.update(shift_e());
         feed(&mut app, [space(), key(KeyCode::Tab)]);
@@ -2446,6 +2461,7 @@ mod behaviour {
                 name: "gpu-jobs".to_string(),
                 topic: None,
                 unread: None,
+                read_to: None,
             },
         })));
         assert_eq!(app.focus, Focus::Composer);
@@ -2501,6 +2517,39 @@ mod behaviour {
     }
 
     // ------------------------------------------------------------ sidebar
+
+    #[test]
+    fn marking_read_raises_the_local_read_point() {
+        let mut app = App::new("pc", "Dang", new_york());
+        feed(
+            &mut app,
+            [
+                Msg::Tick(at(18, 40)),
+                Msg::Resize(W, H),
+                Msg::Connection(Conn::Up),
+            ],
+        );
+        let mut list = channels_json(&[("general", 3)], 0);
+        list.channels[0].read_to = Some(2);
+        app.update(Msg::Loaded(Loaded::Channels(list)));
+        assert_eq!(app.channels[0].read_to, 2, "the server's read point");
+
+        app.update(Msg::Loaded(page(
+            (1..=5)
+                .map(|n| api_post(n, "general", "mac-juicebox", "hi"))
+                .collect(),
+        )));
+        assert_eq!(app.channels[0].read_to, 5, "opening it read it all");
+
+        // A post that arrives at the bottom is read on the spot.
+        app.update(Msg::Stream(StreamEvent::Post(api_post(
+            6,
+            "general",
+            "mac-juicebox",
+            "six",
+        ))));
+        assert_eq!(app.channels[0].read_to, 6);
+    }
 
     #[test]
     fn selecting_channel_loads_and_marks_read() {
@@ -2628,6 +2677,7 @@ mod behaviour {
                 name: "gpu-jobs".to_string(),
                 topic: Some("long jobs".to_string()),
                 unread: None,
+                read_to: None,
             },
         })));
         assert_eq!(app.selected, Selection::Channel("gpu-jobs".to_string()));
@@ -2850,6 +2900,12 @@ mod behaviour {
         assert_eq!(app.input, "", "and does nothing else");
     }
 
+    #[test]
+    fn help_lists_space_tab() {
+        let all: Vec<String> = HELP.iter().map(|(k, w)| format!("{k} {w}")).collect();
+        assert!(all.join("\n").contains("space tab"), "{all:?}");
+    }
+
     /// The help is its rows plus six: the borders, the title, a blank row
     /// above and below the list, and `esc close`. At 80×24, the smallest
     /// supported terminal, that must fit between the top border and the
@@ -3018,6 +3074,7 @@ mod behaviour {
                 name: "gpu-jobs".to_string(),
                 topic: Some("long jobs".to_string()),
                 unread: None,
+                read_to: None,
             },
             deleted: false,
         }));
@@ -3029,6 +3086,7 @@ mod behaviour {
                 name: "general".to_string(),
                 topic: None,
                 unread: None,
+                read_to: None,
             },
             deleted: true,
         }));
@@ -3568,6 +3626,7 @@ mod behaviour {
             name: "beacon".to_string(),
             topic: Some("  ".to_string()),
             unread: None,
+            read_to: None,
         });
         assert_eq!((ch.topic, ch.unread), (None, 0));
 

@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, KeyEventKind};
 use jiff::tz::TimeZone;
 use ratatui::layout::Rect;
 
@@ -31,6 +31,10 @@ use crate::tui::widgets::posts;
 
 /// Posts asked for at a time in a channel (the newest, then older pages).
 pub const PAGE: u32 = 100;
+/// Pages a channel opening loads at most, looking for a post Dang has read
+/// to open at the line below (Dang, 2026-10-28). Past them it opens at the
+/// bottom, with no line.
+pub const OPEN_PAGES: u8 = 5;
 /// Announcements asked for (the newest; that view has no older pages).
 pub const ANNOUNCEMENTS_LIMIT: u32 = 200;
 /// Longest filter, in characters (a tag or `@handle` is far shorter).
@@ -71,6 +75,20 @@ pub struct App {
     pub posts: Vec<PostItem>,
     /// How many lines the posts are scrolled up from the newest (0 = bottom).
     pub scroll: usize,
+    /// The read point the unread line is placed by (Dang, 2026-10-28): the
+    /// open channel's `read_to` when it was opened, raised as posts are
+    /// read only while no line shows. `None` means no line: Announcements,
+    /// or a channel with no read point yet. See [`posts::line_post`].
+    pub line_point: Option<i64>,
+    /// A channel just selected is still being placed: its first page, and
+    /// any older pages that needed, decide where it opens (at the line, or
+    /// at the bottom). Counts the pages asked for so far, the first being 1.
+    /// `None` once it is placed, and in Announcements.
+    pub opening: Option<u8>,
+    /// Whether the terminal window has focus (Dang, 2026-10-28). Starts true
+    /// and stays true where the terminal never reports focus. What comes in
+    /// while it is false is not read: Dang is not looking.
+    pub window_focused: bool,
     /// Agents in the sidebar, in display order.
     pub agents: Vec<AgentItem>,
     /// The agent row the sidebar's cursor is on (`j` past the last channel),
@@ -184,6 +202,9 @@ impl App {
             selected: Selection::Announcements,
             posts: Vec::new(),
             scroll: 0,
+            line_point: None,
+            opening: None,
+            window_focused: true,
             agents: Vec::new(),
             selected_agent: None,
             hide_sidebar: false,
@@ -265,6 +286,8 @@ pub enum Msg {
     /// Text pasted into the terminal (bracketed paste), all at once.
     Paste(String),
     Resize(u16, u16),
+    /// The terminal window gained (`true`) or lost (`false`) focus.
+    WindowFocus(bool),
     /// Once a second, with the time (epoch ms): ages, toasts, heartbeats.
     Tick(i64),
     /// An event from the live feed.
@@ -420,6 +443,9 @@ pub struct ChannelItem {
     pub name: String,
     pub topic: Option<String>,
     pub unread: u32,
+    /// The arrival Dang has read this channel up to (0: no cursor). The server
+    /// sends it with the list; reading here raises it at once.
+    pub read_to: i64,
 }
 
 /// What the main pane shows.
@@ -571,8 +597,29 @@ impl App {
 
     fn apply(&mut self, msg: Msg) -> Vec<Cmd> {
         match msg {
-            Msg::Key(key) => self.on_key(key),
-            Msg::Paste(text) => self.on_paste(&text),
+            Msg::Key(key) => {
+                // A key being let go says nothing about the window.
+                let mut cmds = if key.kind == KeyEventKind::Release {
+                    Vec::new()
+                } else {
+                    self.typing_means_focus()
+                };
+                cmds.extend(self.on_key(key));
+                cmds
+            }
+            Msg::Paste(text) => {
+                let mut cmds = self.typing_means_focus();
+                cmds.extend(self.on_paste(&text));
+                cmds
+            }
+            Msg::WindowFocus(focused) => {
+                self.window_focused = focused;
+                if focused {
+                    self.back_in_focus()
+                } else {
+                    Vec::new()
+                }
+            }
             Msg::Resize(width, height) => {
                 self.leader = false;
                 // The posts wrap anew; a tall one being read keeps its place.
@@ -738,13 +785,29 @@ impl App {
 
     // ------------------------------------------------------------- views
 
-    /// Shows `view` in the main pane and asks for its posts. A channel is
-    /// marked read for `me` once they arrive.
+    /// Shows `view` in the main pane and asks for its posts. A channel opens
+    /// at its unread line once they arrive, and is marked read for `me` if
+    /// that leaves the view at the bottom.
     pub(crate) fn select(&mut self, view: Selection) -> Vec<Cmd> {
         if self.view_chosen && self.selected == view {
             return Vec::new();
         }
         self.view_chosen = true;
+        // The line is placed afresh from where Dang had read the channel
+        // to; none in Announcements, or before he has read it anywhere.
+        self.line_point = match &view {
+            Selection::Channel(name) => self
+                .channels
+                .iter()
+                .find(|c| &c.name == name)
+                .map(|c| c.read_to)
+                .filter(|&read_to| read_to > 0),
+            Selection::Announcements => None,
+        };
+        self.opening = match &view {
+            Selection::Channel(_) => Some(1),
+            Selection::Announcements => None,
+        };
         self.selected = view;
         self.posts.clear();
         self.extras.clear();
@@ -789,7 +852,9 @@ impl App {
     }
 
     /// Marks the channel on screen read up to the newest post loaded.
-    fn mark_read(&mut self) -> Vec<Cmd> {
+    /// `line_held`: the view held an unread line before whatever brought
+    /// these posts (see [`App::note_read`]).
+    fn mark_read(&mut self, line_held: bool) -> Vec<Cmd> {
         let Selection::Channel(name) = &self.selected else {
             return Vec::new();
         };
@@ -806,15 +871,120 @@ impl App {
         if let Some(channel) = self.channels.iter_mut().find(|c| c.name == name) {
             channel.unread = 0;
         }
+        self.note_read(&name, arrival, line_held);
         vec![Cmd::MarkRead {
             channel: name,
             arrival,
         }]
     }
 
+    /// Every local `MarkRead` for `channel` passes here: its read point is
+    /// raised to `arrival` if that is higher, and so is the line's when the
+    /// channel is on screen (see [`App::advance_line_point`]). `line_held`
+    /// says whether the view held a line before the change that brought
+    /// the posts being read: a post seen as it arrives is read, not new.
+    fn note_read(&mut self, channel: &str, arrival: i64, line_held: bool) {
+        if let Some(c) = self.channels.iter_mut().find(|c| c.name == channel) {
+            c.read_to = c.read_to.max(arrival);
+        }
+        if matches!(&self.selected, Selection::Channel(name) if name == channel) {
+            self.advance_line_point(arrival, line_held);
+        }
+    }
+
+    /// Raises the line's read point to `arrival` unless the view held a
+    /// line: one that shows stays where it is once its posts are read, so
+    /// Dang can still see where he started (Dang, 2026-10-28).
+    fn advance_line_point(&mut self, arrival: i64, line_held: bool) {
+        if !line_held {
+            self.line_point = Some(self.line_point.map_or(arrival, |p| p.max(arrival)));
+        }
+    }
+
+    /// Back at the bottom with the window in focus, what came in while away
+    /// is seen now.
+    fn back_in_focus(&mut self) -> Vec<Cmd> {
+        if self.scroll == 0 {
+            self.caught_up()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// A key press or a paste means Dang is at the window, even if the
+    /// terminal or tmux dropped its focus-in (Dang, 2026-10-28).
+    fn typing_means_focus(&mut self) -> Vec<Cmd> {
+        if self.window_focused {
+            return Vec::new();
+        }
+        self.window_focused = true;
+        self.back_in_focus()
+    }
+
+    /// Whether Dang is looking at the newest posts, so what arrives there is
+    /// read: the view is placed and at the bottom, and the window has focus.
+    fn at_the_newest(&self) -> bool {
+        self.opening.is_none() && self.scroll == 0 && self.window_focused
+    }
+
+    /// Where a channel being opened is placed, once a page of it is in
+    /// (Dang, 2026-10-28). With a line to show, the line's row goes on the
+    /// pane's top edge, or as near it as the bottom allows. With none, and
+    /// no post Dang has read loaded, an older page is asked for, up to
+    /// [`OPEN_PAGES`]; that page places it in turn. Otherwise it stays at
+    /// the bottom. A channel left at the bottom is marked read. `line_held`
+    /// is whether the page left a line showing.
+    fn place_opening(&mut self, line_held: bool) -> Vec<Cmd> {
+        let Some(pages) = self.opening else {
+            return Vec::new();
+        };
+        let line_span = posts::line_post(self).and_then(|post| {
+            let view = self.viewport()?;
+            let span = posts::spans(self, view.width)
+                .into_iter()
+                .find(|s| s.id == post.id)?;
+            // The gap above the post: the line's row, and the day's label
+            // when the day changes there.
+            let shown = posts::shown(self);
+            let at = shown.iter().position(|p| p.id == post.id)?;
+            let gap = posts::gap_rows(shown[at.checked_sub(1)?], post, self);
+            Some((span, gap, usize::from(view.height)))
+        });
+        if let Some((span, gap, height)) = line_span {
+            // The whole gap goes in view, so the day label shows above the
+            // line (Dang, 2026-10-28).
+            self.scroll = (span.bottom + span.height + gap).saturating_sub(height);
+            self.clamp_scroll();
+        } else if self.line_point.is_some_and(|p| p > 0)
+            && !posts::holds_a_read_post(self)
+            && pages < OPEN_PAGES
+        {
+            let cmds = self.load_older();
+            if !cmds.is_empty() {
+                self.opening = Some(pages + 1);
+                return cmds;
+            }
+        }
+        self.opened(line_held)
+    }
+
+    /// The channel being opened is placed: read if that left it at the bottom.
+    fn opened(&mut self, line_held: bool) -> Vec<Cmd> {
+        self.opening = None;
+        if self.at_the_newest() {
+            self.mark_read(line_held)
+        } else {
+            Vec::new()
+        }
+    }
+
     /// The view is back at the newest post: if posts came in while it was
-    /// scrolled up, they have now been seen.
+    /// scrolled up, they have now been seen. Nothing is seen while the
+    /// window is unfocused or the channel is still being opened.
     fn caught_up(&mut self) -> Vec<Cmd> {
+        if !self.window_focused || self.opening.is_some() {
+            return Vec::new();
+        }
         let Selection::Channel(name) = &self.selected else {
             return Vec::new();
         };
@@ -823,7 +993,8 @@ impl App {
             .iter()
             .any(|c| &c.name == name && c.unread > 0)
         {
-            self.mark_read()
+            // Nothing new came with getting here: the view as it is decides.
+            self.mark_read(posts::holds_line(self))
         } else {
             Vec::new()
         }
@@ -872,7 +1043,16 @@ impl App {
     }
 
     fn on_channels(&mut self, list: &ChannelsJson) -> Vec<Cmd> {
-        self.channels = list.channels.iter().map(convert::channel_item).collect();
+        let mut channels: Vec<ChannelItem> =
+            list.channels.iter().map(convert::channel_item).collect();
+        // A list the server answered before it stored a `MarkRead` sent
+        // since must not lower the read point: the server's only rises.
+        for channel in &mut channels {
+            if let Some(known) = self.channels.iter().find(|c| c.name == channel.name) {
+                channel.read_to = channel.read_to.max(known.read_to);
+            }
+        }
+        self.channels = channels;
         self.announcements_unread = list.announcements_unread.unwrap_or(0);
         if !self.view_chosen {
             // The board opens on its first channel (`general` comes first).
@@ -906,15 +1086,20 @@ impl App {
         let page = match page {
             Ok(page) => page,
             Err(e) => {
+                let mut cmds = Vec::new();
                 if older {
                     self.loading_older = false;
+                    // An opening that can't look further back stays where it is.
+                    if self.opening.is_some() {
+                        cmds = self.opened(posts::holds_line(self));
+                    }
                 } else {
                     self.loading = false;
                     self.load_failed = true;
                     self.arrivals = None;
                 }
                 self.error(format!("Couldn't load {}: {e}", view_name(&view)));
-                return Vec::new();
+                return cmds;
             }
         };
         let limit = match view {
@@ -922,6 +1107,10 @@ impl App {
             Selection::Announcements => ANNOUNCEMENTS_LIMIT,
         };
         let full = page.posts.len() >= limit as usize;
+        // Judged before the page changes the view: posts a reload brings
+        // while Dang is at the bottom are seen as they come. A channel
+        // being opened judges by the page itself (see `place_opening`).
+        let line_held = posts::holds_line(self);
         for post in &page.posts {
             self.extras
                 .insert(post.id.clone(), convert::post_extra(post));
@@ -957,7 +1146,8 @@ impl App {
                 }
             }
             sort_posts(&mut self.posts);
-            return Vec::new();
+            // A page an opening asked for places it in turn.
+            return self.place_opening(posts::holds_line(self));
         }
 
         let has_older = full && matches!(self.selected, Selection::Channel(_));
@@ -1005,8 +1195,16 @@ impl App {
         self.loading = false;
         self.has_older = has_older;
         self.clamp_scroll();
-        // A channel on screen is a channel read.
-        self.mark_read()
+        if self.opening.is_some() {
+            // The server's read point placed any line the page shows, and it stays.
+            return self.place_opening(posts::holds_line(self));
+        }
+        // A reload is read only where Dang is looking: at the bottom.
+        if self.at_the_newest() {
+            self.mark_read(line_held)
+        } else {
+            Vec::new()
+        }
     }
 
     // ------------------------------------------------------------ stream
@@ -1084,6 +1282,7 @@ impl App {
                 name: item.channel.clone(),
                 topic: None,
                 unread: 0,
+                read_to: 0,
             });
             cmds.push(Cmd::LoadChannels);
         }
@@ -1092,12 +1291,15 @@ impl App {
         let announcement = item.announcement;
         let channel = item.channel.clone();
         let shown = posts::is_shown(self, &item);
+        // Judged before the post joins the view: seen as it arrives, it is read.
+        let line_held = posts::holds_line(self);
         let placed = self.add_to_view(item, convert::post_extra(post));
         if mine {
             return cmds;
         }
         // Read only if it is where Dang is looking: the bottom of the view.
-        if on_screen && placed && shown && self.scroll == 0 {
+        if on_screen && placed && shown && self.at_the_newest() {
+            self.note_read(&channel, post.arrival, line_held);
             cmds.push(Cmd::MarkRead {
                 channel,
                 arrival: post.arrival,
@@ -1146,7 +1348,14 @@ impl App {
             self.clear_armed = false;
         }
         let item = convert::post_item(&created.post);
+        let on_screen = self.selected == Selection::Channel(item.channel.clone());
         self.add_to_view(item, convert::post_extra(&created.post));
+        // Dang posting in the channel takes its line away (Dang, 2026-10-28).
+        if on_screen {
+            if let Some(newest) = self.extras.values().map(|e| e.arrival).max() {
+                self.line_point = Some(newest);
+            }
+        }
         // Down to the newest, to see it; what came in meanwhile is seen too
         // (`update` marks it read).
         self.scroll = 0;

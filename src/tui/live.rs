@@ -26,8 +26,9 @@ use std::sync::Once;
 use std::time::Duration;
 
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event,
+    EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
@@ -192,6 +193,8 @@ fn input_msg(event: Event) -> Option<Msg> {
         Event::Key(key) => Some(Msg::Key(key)),
         Event::Paste(text) => Some(Msg::Paste(text)),
         Event::Resize(width, height) => Some(Msg::Resize(width, height)),
+        Event::FocusGained => Some(Msg::WindowFocus(true)),
+        Event::FocusLost => Some(Msg::WindowFocus(false)),
         _ => None,
     }
 }
@@ -204,6 +207,7 @@ fn enter_terminal() -> io::Result<()> {
         out,
         EnterAlternateScreen,
         EnableBracketedPaste,
+        EnableFocusChange,
         cursor::Hide
     )?;
     // Only where the terminal says it understands them (kitty protocol).
@@ -230,6 +234,7 @@ pub fn restore_terminal() {
     let _ = execute!(
         out,
         DisableBracketedPaste,
+        DisableFocusChange,
         LeaveAlternateScreen,
         cursor::Show
     );

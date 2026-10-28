@@ -36,12 +36,15 @@
 //!   a chord, and any other printable key jumps to the composer and types
 //!   itself.
 //! * **`space` is a leader** there (Dang, XNPVKNHP): it types nothing and
-//!   the footer says `e sidebar · esc cancel` until the next key. `e` (or
-//!   `E`) shows or hides the sidebar: from the posts, a hidden one is shown
-//!   and takes the keys, a shown one is hidden and the keys stay; from the
-//!   sidebar, it is hidden and the composer takes the keys. `Esc` only
-//!   cancels; any other key cancels and does what it does without the space
-//!   (`space x` types `x` in the composer). A paste, a resize or the focus
+//!   the footer says `e sidebar · tab latest · esc cancel` until the next
+//!   key. `e` (or `E`) shows or hides the sidebar: from the posts, a hidden
+//!   one is shown and takes the keys, a shown one is hidden and the keys
+//!   stay; from the sidebar, it is hidden and the composer takes the keys.
+//!   `Tab`, from the posts, jumps to the latest post (Dang, 2026-10-28): it
+//!   selects the newest and scrolls to the bottom, marking the channel read.
+//!   `Esc` only cancels; any other key cancels and does what it does without
+//!   the space (`space x` types `x` in the composer; `space tab` from the
+//!   sidebar goes to the posts). A paste, a resize or the focus
 //!   moving cancels it too. In the composer, a dialog or the `/` filter,
 //!   `space` never starts the chord and does what it always did there.
 //! * **`E` (shift-e)** is how you get into a shown sidebar: from the posts
@@ -58,6 +61,9 @@
 //!   `Tab` takes it, `↑`/`↓` pick another match and `Esc` puts it away (that
 //!   `Esc` neither arms nor fires a clear); without one those keys do what
 //!   they always do.
+//! * The terminal window's focus is not a key (`Msg::WindowFocus`): while it
+//!   is lost nothing counts as seen, and getting it back at the bottom
+//!   marks what came in read (Dang, 2026-10-28).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
@@ -83,7 +89,7 @@ pub const HELP: [(&str, &str); 14] = [
     ("j k  ↓ ↑", "j k posts; ↓ ↑ the sidebar"),
     ("enter", "send, or write in the channel"),
     ("shift-enter", "new line (or alt-enter, ctrl-j)"),
-    ("pgup pgdn", "scroll the posts"),
+    ("pgup pgdn", "scroll; space tab: to the latest"),
     ("n", "new channel"),
     ("a", "attach a file from ./exchange"),
     ("s", "save the post's file"),
@@ -126,6 +132,11 @@ impl App {
             }
             if matches!(printable(&key), Some('e' | 'E')) {
                 self.leader_sidebar();
+                return Vec::new();
+            }
+            // From the sidebar the chord cancels and `Tab` goes to the posts.
+            if key.code == KeyCode::Tab && self.focus == Focus::Posts {
+                self.jump_to_latest();
                 return Vec::new();
             }
             // Any other key does what it does without the space.
@@ -559,7 +570,7 @@ impl App {
     }
 
     /// Asks for the page of posts before the oldest loaded, if there may be one.
-    fn load_older(&mut self) -> Vec<Cmd> {
+    pub(super) fn load_older(&mut self) -> Vec<Cmd> {
         let Selection::Channel(channel) = &self.selected else {
             return Vec::new();
         };
@@ -609,6 +620,16 @@ impl App {
         if self.focus == Focus::Posts {
             self.pick_visible_post();
         }
+    }
+
+    /// `space tab` in the posts (Dang, 2026-10-28): selects the newest shown
+    /// post and scrolls to the bottom. `App::update` sees the view back at
+    /// the newest post and marks the channel read.
+    fn jump_to_latest(&mut self) {
+        if let Some(newest) = posts::shown(self).last() {
+            self.selected_post = Some(newest.id.clone());
+        }
+        self.scroll = 0;
     }
 
     /// `shift-e` in the posts or the sidebar: goes to the sidebar, showing it

@@ -1214,6 +1214,48 @@ async fn posts_carry_their_arrival_for_cursors() {
 }
 
 #[tokio::test]
+async fn channel_list_with_a_handle_carries_read_to() {
+    let node = spawn_node("pc", &[]).await;
+    new_channel(&node, "beacon").await;
+    let created = agent_post(&node, "general", "mac-juicebox", "hi", &[]).await;
+    let arrival = created["post"]["arrival"].as_i64().unwrap();
+    let resp = node
+        .put("/api/read-cursors/Dang")
+        .json(&json!({ "channel": "general", "arrival": arrival }))
+        .send()
+        .await
+        .unwrap();
+    ok(resp).await;
+
+    // The TUI asks with `handle=`; the cursor's handle is matched by case.
+    for handle in ["Dang", "dang"] {
+        let resp = node
+            .get(&format!("/api/channels?handle={handle}"))
+            .send()
+            .await
+            .unwrap();
+        let channels: ChannelsJson = serde_json::from_value(ok(resp).await).unwrap();
+        let read_to: HashMap<&str, Option<i64>> = channels
+            .channels
+            .iter()
+            .map(|c| (c.name.as_str(), c.read_to))
+            .collect();
+        assert_eq!(read_to["general"], Some(arrival), "{handle}");
+        // A channel he never read is read to 0, not missing.
+        assert_eq!(read_to["beacon"], Some(0), "{handle}");
+    }
+
+    // Without a handle the key is not there at all.
+    let resp = node.get("/api/channels").send().await.unwrap();
+    let body = ok(resp).await;
+    assert!(body["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|c| c.get("read_to").is_none()));
+}
+
+#[tokio::test]
 async fn channels_carry_unread_when_a_handle_is_given() {
     let node = spawn_node("pc", &[]).await;
     new_channel(&node, "beacon").await;
@@ -3194,7 +3236,8 @@ async fn sse_streams_each_kind_of_event() {
             channel: ChannelJson {
                 name: "builds".into(),
                 topic: None,
-                unread: None
+                unread: None,
+                read_to: None,
             },
             deleted: true
         }

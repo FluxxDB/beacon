@@ -190,7 +190,7 @@ async fn list_channels(
     if relevant && handle.is_none() {
         return Err(Error::Usage("relevant=1 needs a handle".into()).into());
     }
-    let (rows, unread) = app
+    let (rows, unread, cursors) = app
         .with_store(move |s| {
             let rows = s.channels()?;
             let unread = match &handle {
@@ -200,7 +200,8 @@ async fn list_channels(
                 Some(h) => Some((s.unread_counts(h)?, s.unread_announcements(h)?)),
                 None => None,
             };
-            Ok((rows, unread))
+            let cursors = handle.as_deref().map(|h| s.cursors(h)).transpose()?;
+            Ok((rows, unread, cursors))
         })
         .await?;
     let channels = rows
@@ -209,7 +210,10 @@ async fn list_channels(
             let n = unread
                 .as_ref()
                 .map(|(counts, _)| counts.get(&row.name).copied().unwrap_or(0));
-            ChannelJson::from_row(row, n)
+            let read_to = cursors
+                .as_ref()
+                .map(|c| c.get(&row.name).copied().unwrap_or(0));
+            ChannelJson::from_row(row, n, read_to)
         })
         .collect();
     Ok(Json(ChannelsJson {
@@ -253,7 +257,7 @@ async fn create_channel(
         v: V,
         ok: true,
         created: existing.is_none(),
-        channel: ChannelJson::from_row(&row, None),
+        channel: ChannelJson::from_row(&row, None, None),
     }))
 }
 

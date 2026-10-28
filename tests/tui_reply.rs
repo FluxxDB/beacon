@@ -81,6 +81,7 @@ fn channels() -> ChannelsJson {
                 name: name.to_string(),
                 topic: None,
                 unread: Some(0),
+                read_to: None,
             })
             .collect(),
         announcements_unread: Some(0),
@@ -569,6 +570,7 @@ fn a_target_in_a_deleted_channel_is_asked_for_again() {
             name: "beacon".to_string(),
             topic: None,
             unread: None,
+            read_to: None,
         },
         deleted: true,
     }));
@@ -1261,6 +1263,7 @@ fn a_target_whose_channel_is_deleted_below_a_scrolled_view_does_not_move_it() {
             name: "beacon".to_string(),
             topic: None,
             unread: None,
+            read_to: None,
         },
         deleted: true,
     }));
